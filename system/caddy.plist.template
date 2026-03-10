@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Caddy LaunchDaemon template for tiddly-winks.
+  Do not use this file directly — run install.sh to generate the real plist
+  with paths filled in for your machine.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bentley.tw-caddy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{CADDY_BIN}}</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>{{TW_DIR}}/Caddyfile</string>
+        <string>--adapter</string>
+        <string>caddyfile</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>StandardOutPath</key>
+    <string>{{TW_DIR}}/logs/caddy.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{TW_DIR}}/logs/caddy.log</string>
+</dict>
+</plist>

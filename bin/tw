@@ -1,0 +1,1258 @@
+#!/usr/bin/env bash
+# tw — tiddly-winks: Feature Space Manager
+# Manages named tmux sessions per feature with dynamic port allocation, Caddy routing,
+# git worktrees, isolated databases, and bead-backed persistent context.
+# See https://github.com/bentleycook/tiddly-winks for docs.
+
+set -euo pipefail
+
+TW_DIR="$HOME/.tiddly-winks"
+SESSIONS_FILE="$TW_DIR/sessions.json"
+CADDYFILE="$TW_DIR/Caddyfile"
+CADDY_ADMIN="http://localhost:2019"
+CADDY_BIN="/opt/homebrew/bin/caddy"
+
+# Source machine-local secrets (.env not checked in)
+[[ -f "$TW_DIR/.env" ]] && source "$TW_DIR/.env"
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+
+log()  { echo "[tw] $*" >&2; }
+die()  { echo "[tw] error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+# Read a top-level key from a YAML file
+yaml_get() {
+    local file="$1" key="$2" default="${3:-}"
+    python3 - "$file" "$key" "$default" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    val = d.get(sys.argv[2], sys.argv[3]) if d else sys.argv[3]
+    print(val if val is not None else sys.argv[3])
+except Exception:
+    print(sys.argv[3])
+EOF
+}
+
+# Read a nested key (dot-separated) from a YAML file
+yaml_get_nested() {
+    local file="$1" keypath="$2" default="${3:-}"
+    python3 - "$file" "$keypath" "$default" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    keys = sys.argv[2].split('.')
+    for k in keys:
+        d = d.get(k, None) if isinstance(d, dict) else None
+    print(d if d is not None else sys.argv[3])
+except Exception:
+    print(sys.argv[3])
+EOF
+}
+
+# Get all service names from a YAML file
+yaml_service_names() {
+    local file="$1"
+    python3 - "$file" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    services = d.get('services', {}) or {}
+    print('\n'.join(services.keys()))
+except Exception:
+    pass
+EOF
+}
+
+# Get a service attribute
+yaml_service_get() {
+    local file="$1" service="$2" attr="$3" default="${4:-}"
+    python3 - "$file" "$service" "$attr" "$default" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    s = (d.get('services', {}) or {}).get(sys.argv[2], {}) or {}
+    val = s.get(sys.argv[3], sys.argv[4])
+    print(val if val is not None else sys.argv[4])
+except Exception:
+    print(sys.argv[4])
+EOF
+}
+
+# Get proxy map as "subdomain:service\n..." pairs
+yaml_proxy_pairs() {
+    local file="$1"
+    python3 - "$file" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    proxy = d.get('proxy', {}) or {}
+    for subdomain, service in proxy.items():
+        print(f"{subdomain}:{service}")
+except Exception:
+    pass
+EOF
+}
+
+# Merge override YAML into base YAML (override wins for service paths)
+# Returns merged YAML file path (temp file)
+yaml_merge_override() {
+    local base="$1" override="$2"
+    python3 - "$base" "$override" <<'EOF'
+import yaml, sys, tempfile, os
+base = yaml.safe_load(open(sys.argv[1])) or {}
+try:
+    ov = yaml.safe_load(open(sys.argv[2])) or {}
+    # Merge services
+    for svc, attrs in (ov.get('services') or {}).items():
+        if svc in (base.get('services') or {}):
+            base['services'][svc].update(attrs)
+        else:
+            base.setdefault('services', {})[svc] = attrs
+except Exception:
+    pass
+f = tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False)
+yaml.dump(base, f)
+f.close()
+print(f.name)
+EOF
+}
+
+# JSON helpers
+json_get() { python3 -c "import json,sys; d=json.load(open('$SESSIONS_FILE')); print(d.get('$1', {}).get('$2', ''))" 2>/dev/null; }
+
+sessions_read() {
+    python3 -c "import json; print(json.dumps(json.load(open('$SESSIONS_FILE'))))" 2>/dev/null || echo '{}'
+}
+
+sessions_write() {
+    # Receives JSON on stdin
+    python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+with open('$SESSIONS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+sessions_get_key() {
+    local session_key="$1" field="$2"
+    python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+print(d.get('$session_key', {}).get('$field', ''))
+" 2>/dev/null
+}
+
+sessions_list_keys() {
+    python3 -c "import json; [print(k) for k in json.load(open('$SESSIONS_FILE')).keys()]" 2>/dev/null
+}
+
+# ─── Port Allocation ─────────────────────────────────────────────────────────
+
+# Track ports allocated in this run to avoid intra-session collisions
+ALLOCATED_THIS_RUN=()
+
+claimed_ports() {
+    python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+ports = set()
+for session in d.values():
+    for svc in session.get('services', {}).values():
+        p = svc.get('port')
+        if p: ports.add(int(p))
+print(' '.join(str(p) for p in ports))
+" 2>/dev/null
+}
+
+port_in_use() {
+    local port="$1"
+    lsof -i ":$port" -t >/dev/null 2>&1
+}
+
+allocate_port() {
+    local hint="$1"
+    local port=$hint
+    local claimed
+    claimed=$(claimed_ports)
+
+    while true; do
+        # Check not in sessions.json
+        if echo " $claimed " | grep -q " $port "; then
+            ((port++)); continue
+        fi
+        # Check not allocated this run
+        local found=0
+        for p in "${ALLOCATED_THIS_RUN[@]:-}"; do
+            [[ "$p" == "$port" ]] && { found=1; break; }
+        done
+        [[ $found -eq 1 ]] && { ((port++)); continue; }
+        # Check not in use by OS
+        if port_in_use "$port"; then
+            ((port++)); continue
+        fi
+        break
+    done
+
+    ALLOCATED_THIS_RUN+=("$port")
+    echo "$port"
+}
+
+# ─── Caddyfile Generation ────────────────────────────────────────────────────
+
+regen_caddyfile() {
+    python3 - "$SESSIONS_FILE" "$CADDYFILE" <<'EOF'
+import json, sys
+
+sessions = json.load(open(sys.argv[1]))
+lines = [
+    '{',
+    '    # Caddy admin API — needed for hot reload',
+    '    admin localhost:2019',
+    '}',
+    '',
+]
+
+for session_key, session in sessions.items():
+    project = session.get('project', '')
+    feature = session.get('feature', '')
+    services = session.get('services', {})
+    proxy_map = session.get('proxy_map', {})
+
+    # proxy_map: subdomain -> service name
+    for subdomain, svc_name in proxy_map.items():
+        svc = services.get(svc_name, {})
+        port = svc.get('port')
+        if not port:
+            continue
+        if subdomain == '':
+            host = f'{project}-{feature}.localhost'
+        else:
+            host = f'{project}-{feature}-{subdomain}.localhost'
+        lines.append(f'http://{host} {{')
+        lines.append(f'    reverse_proxy localhost:{port}')
+        lines.append('}')
+        lines.append('')
+
+with open(sys.argv[2], 'w') as f:
+    f.write('\n'.join(lines))
+EOF
+}
+
+caddy_reload() {
+    if curl -sf "$CADDY_ADMIN/config/" >/dev/null 2>&1; then
+        curl -sf -X POST "$CADDY_ADMIN/load" \
+            -H "Content-Type: text/caddyfile" \
+            --data-binary "@$CADDYFILE" >/dev/null 2>&1 \
+            && log "Caddy reloaded" \
+            || log "Caddy reload failed — check $TW_DIR/logs/caddy.log"
+    else
+        log "Caddy admin API not reachable (is Caddy running?)"
+    fi
+}
+
+# ─── Bead Integration ────────────────────────────────────────────────────────
+
+bead_find_open() {
+    local title="$1"
+    bd list --status=open 2>/dev/null | grep -F "$title" | head -1 | awk '{print $1}' | tr -d '#' || true
+}
+
+bead_create() {
+    local title="$1"
+    bd create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1 || true
+}
+
+bead_find_or_create() {
+    local title="$1"
+    local bead_id
+    bead_id=$(bead_find_open "$title")
+    if [[ -z "$bead_id" ]]; then
+        bead_id=$(bead_create "$title")
+        log "Created bead $bead_id: $title"
+    else
+        log "Reusing bead $bead_id: $title"
+    fi
+    echo "$bead_id"
+}
+
+bead_update_body() {
+    local bead_id="$1"
+    local body="$2"
+    bd update "$bead_id" --body="$body" 2>/dev/null || true
+}
+
+bead_mark_in_progress() {
+    local bead_id="$1"
+    bd update "$bead_id" --status=in_progress 2>/dev/null || true
+}
+
+bead_close() {
+    local bead_id="$1"
+    bd close "$bead_id" 2>/dev/null || true
+}
+
+bead_get_body() {
+    local bead_id="$1"
+    bd show "$bead_id" 2>/dev/null | python3 -c "
+import sys
+lines = sys.stdin.readlines()
+body_lines = []
+in_body = False
+for line in lines:
+    if line.startswith('Body:'):
+        in_body = True
+        rest = line[5:].strip()
+        if rest:
+            body_lines.append(rest)
+        continue
+    if in_body:
+        body_lines.append(line.rstrip())
+print('\n'.join(body_lines))
+" 2>/dev/null || true
+}
+
+build_bead_body() {
+    local feature="$1"
+    local project="$2"
+    local branch="$3"
+    local workspace="$4"
+    local mode="$5"
+    local started="$6"
+    local pm_display="$7"
+    local urls_block="$8"
+    local worktrees_block="${9:-}"
+    local db_name="${10:-}"
+
+    cat <<BODY
+## Feature Space
+- branch: $branch
+- workspace: $workspace
+- mode: $mode
+- started: $started
+${worktrees_block:+$worktrees_block
+}${db_name:+- db: $db_name
+}
+## URLs
+$urls_block
+
+## Issue Tracker
+$pm_display
+
+## PRs
+(none yet)
+
+## Session History
+BODY
+}
+
+# ─── PM Integration ──────────────────────────────────────────────────────────
+
+pm_linear_find_issue() {
+    local team="$1" feature="$2"
+    [[ -z "${LINEAR_API_KEY:-}" ]] && { echo ""; return; }
+
+    local result
+    result=$(curl -sf -X POST https://api.linear.app/graphql \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"query\": \"{ issues(filter: { team: { key: { eq: \\\"$team\\\" } }, title: { containsIgnoreCase: \\\"$feature\\\" }, state: { type: { neq: \\\"completed\\\" } } }, first: 1) { nodes { identifier url } } }\" }" \
+        2>/dev/null) || true
+
+    local id url
+    id=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); nodes=d.get('data',{}).get('issues',{}).get('nodes',[]); print(nodes[0]['identifier'] if nodes else '')" 2>/dev/null || true)
+    url=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); nodes=d.get('data',{}).get('issues',{}).get('nodes',[]); print(nodes[0]['url'] if nodes else '')" 2>/dev/null || true)
+
+    [[ -n "$id" ]] && echo "$id:$url" || echo ""
+}
+
+pm_linear_create_issue() {
+    local team="$1" feature="$2"
+    [[ -z "${LINEAR_API_KEY:-}" ]] && { log "LINEAR_API_KEY not set — skipping Linear issue creation"; echo ""; return; }
+
+    local team_result team_id
+    team_result=$(curl -sf -X POST https://api.linear.app/graphql \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"query\": \"{ teams(filter: { key: { eq: \\\"$team\\\" } }) { nodes { id } } }\" }" \
+        2>/dev/null) || true
+    team_id=$(echo "$team_result" | python3 -c "import json,sys; d=json.load(sys.stdin); nodes=d.get('data',{}).get('teams',{}).get('nodes',[]); print(nodes[0]['id'] if nodes else '')" 2>/dev/null || true)
+
+    [[ -z "$team_id" ]] && { log "Could not find Linear team '$team'"; echo ""; return; }
+
+    local create_result issue_id issue_url
+    create_result=$(curl -sf -X POST https://api.linear.app/graphql \
+        -H "Authorization: $LINEAR_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"query\": \"mutation { issueCreate(input: { teamId: \\\"$team_id\\\", title: \\\"$feature\\\" }) { issue { identifier url } } }\" }" \
+        2>/dev/null) || true
+    issue_id=$(echo "$create_result" | python3 -c "import json,sys; d=json.load(sys.stdin); i=d.get('data',{}).get('issueCreate',{}).get('issue',{}); print(i.get('identifier',''))" 2>/dev/null || true)
+    issue_url=$(echo "$create_result" | python3 -c "import json,sys; d=json.load(sys.stdin); i=d.get('data',{}).get('issueCreate',{}).get('issue',{}); print(i.get('url',''))" 2>/dev/null || true)
+
+    [[ -n "$issue_id" ]] && echo "$issue_id:$issue_url" || echo ""
+}
+
+pm_github_find_issue() {
+    local repo="$1" feature="$2"
+    local result
+    result=$(gh issue list --repo "$repo" --search "$feature" --json number,url --limit 1 2>/dev/null) || true
+    local num url
+    num=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')" 2>/dev/null || true)
+    url=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[0]['url'] if d else '')" 2>/dev/null || true)
+    [[ -n "$num" ]] && echo "$num:$url" || echo ""
+}
+
+pm_github_create_issue() {
+    local repo="$1" feature="$2"
+    local result
+    result=$(gh issue create --repo "$repo" --title "$feature" --body "Created by tw for local dev session." 2>/dev/null) || true
+    local url num
+    url=$(echo "$result" | grep -oE 'https://github.com/[^ ]+' | head -1 || true)
+    num=$(echo "$url" | grep -oE '[0-9]+$' || true)
+    [[ -n "$num" ]] && echo "$num:$url" || echo ""
+}
+
+pm_find_or_create() {
+    local config_file="$1" feature="$2"
+    local tracker_type
+    tracker_type=$(yaml_get_nested "$config_file" "issue_tracker.type" "none")
+
+    case "$tracker_type" in
+        linear)
+            local team
+            team=$(yaml_get_nested "$config_file" "issue_tracker.team" "")
+            local found
+            found=$(pm_linear_find_issue "$team" "$feature")
+            if [[ -z "$found" ]]; then
+                found=$(pm_linear_create_issue "$team" "$feature")
+                [[ -n "$found" ]] && log "Created Linear issue: ${found%%:*}"
+            else
+                log "Found Linear issue: ${found%%:*}"
+            fi
+            echo "$found"
+            ;;
+        github)
+            local repo
+            repo=$(yaml_get_nested "$config_file" "issue_tracker.repo" "")
+            local found
+            found=$(pm_github_find_issue "$repo" "$feature")
+            if [[ -z "$found" ]]; then
+                found=$(pm_github_create_issue "$repo" "$feature")
+                [[ -n "$found" ]] && log "Created GitHub issue: #${found%%:*}"
+            else
+                log "Found GitHub issue: #${found%%:*}"
+            fi
+            echo "$found"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+pm_format_for_bead() {
+    local tracker_type="$1" pm_issue="$2"
+    if [[ -z "$pm_issue" ]]; then
+        echo "- none"
+        return
+    fi
+    local id="${pm_issue%%:*}"
+    local url="${pm_issue##*:}"
+    case "$tracker_type" in
+        linear) echo "- linear: $id ($url)" ;;
+        github) echo "- github: #$id ($url)" ;;
+        *)      echo "- $id ($url)" ;;
+    esac
+}
+
+# ─── Find .tw.yml (or .devenv.yml for compatibility) ─────────────────────────
+
+find_config() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/.tw.yml" ]]; then
+            echo "$dir/.tw.yml"
+            return 0
+        fi
+        if [[ -f "$dir/.devenv.yml" ]]; then
+            echo "$dir/.devenv.yml"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# ─── Subcommands ─────────────────────────────────────────────────────────────
+
+cmd_start() {
+    local feature="" mode="local"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode) mode="$2"; shift 2 ;;
+            --mode=*) mode="${1#--mode=}"; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw start <feature> [--mode staging]"
+
+    # Find config
+    local config_file
+    config_file=$(find_config) || die "No .tw.yml found in $PWD or any parent directory"
+    local config_dir
+    config_dir="$(dirname "$config_file")"
+
+    # Merge override if present
+    local override_file="$config_dir/.tw.override.yml"
+    # Also check old name
+    [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
+    local effective_config="$config_file"
+    if [[ -f "$override_file" ]]; then
+        effective_config=$(yaml_merge_override "$config_file" "$override_file")
+        log "Merged override: $override_file"
+    fi
+
+    local project
+    project=$(yaml_get "$effective_config" "project" "") || true
+    [[ -z "$project" ]] && die ".tw.yml missing 'project' key"
+
+    local session_key="${project}-${feature}"
+
+    # Fail if tmux session already exists
+    if tmux has-session -t "$session_key" 2>/dev/null; then
+        die "tmux session '$session_key' already exists. Use: tmux attach -t $session_key"
+    fi
+
+    log "Starting session: $session_key (mode=$mode)"
+
+    # Bead
+    local bead_title="$feature ($project)"
+    local bead_id
+    bead_id=$(bead_find_or_create "$bead_title")
+
+    # PM issue
+    local pm_issue pm_display tracker_type
+    tracker_type=$(yaml_get_nested "$effective_config" "issue_tracker.type" "none")
+    pm_issue=$(pm_find_or_create "$effective_config" "$feature")
+    pm_display=$(pm_format_for_bead "$tracker_type" "$pm_issue")
+
+    # ─── Worktree Setup ───────────────────────────────────────────────────────
+    local worktrees_base branch_prefix
+    worktrees_base=$(yaml_get_nested "$effective_config" "worktrees.base" "")
+    branch_prefix=$(yaml_get_nested "$effective_config" "worktrees.branch_prefix" "")
+
+    # Associative arrays for worktree paths and db name
+    declare -A worktree_paths
+    local db_name=""
+
+    local service_names
+    mapfile -t service_names < <(yaml_service_names "$effective_config")
+
+    if [[ -n "$worktrees_base" ]]; then
+        log "Setting up worktrees under $worktrees_base/$feature/"
+        local branch="${branch_prefix}${feature}"
+
+        for svc in "${service_names[@]}"; do
+            local svc_path
+            svc_path=$(yaml_service_get "$effective_config" "$svc" "path" "")
+            [[ -z "$svc_path" ]] && continue
+
+            local repo_abs_path="$config_dir/$svc_path"
+            [[ ! -d "$repo_abs_path/.git" ]] && { log "No git repo at $repo_abs_path — skipping worktree for $svc"; continue; }
+
+            local worktree_path="$config_dir/$worktrees_base/$feature/$svc"
+
+            # Create branch from origin/staging if it doesn't exist
+            git -C "$repo_abs_path" fetch origin staging --quiet 2>/dev/null || true
+            git -C "$repo_abs_path" branch "$branch" origin/staging 2>/dev/null \
+                || log "Branch $branch already exists in $svc"
+
+            # Create worktree
+            mkdir -p "$(dirname "$worktree_path")"
+            if git -C "$repo_abs_path" worktree add "$worktree_path" "$branch" 2>/dev/null; then
+                log "Created worktree: $worktree_path"
+            else
+                log "Worktree already exists: $worktree_path"
+            fi
+
+            worktree_paths[$svc]="$worktree_path"
+
+            # Run db_setup if configured
+            local db_setup
+            db_setup=$(yaml_service_get "$effective_config" "$svc" "db_setup" "")
+            if [[ -n "$db_setup" ]]; then
+                log "Running db_setup for $svc: $db_setup"
+                (cd "$worktree_path" && eval "$db_setup") \
+                    || log "db_setup failed for $svc (continuing)"
+                # Try to read DB_NAME from resulting .env
+                local env_db
+                env_db=$(grep "^DB_NAME=" "$worktree_path/.env" 2>/dev/null | cut -d= -f2 || true)
+                [[ -n "$env_db" ]] && db_name="$env_db"
+            fi
+        done
+    fi
+
+    # Start tmux session
+    tmux new-session -d -s "$session_key" -n main
+
+    # Allocate ports and start services
+    declare -A service_data
+
+    for svc in "${service_names[@]}"; do
+        local port_hint command env_var window
+        port_hint=$(yaml_service_get "$effective_config" "$svc" "port_hint" "3000")
+        command=$(yaml_service_get "$effective_config" "$svc" "command" "")
+        env_var=$(yaml_service_get "$effective_config" "$svc" "env" "")
+        window=$(yaml_service_get "$effective_config" "$svc" "window" "$svc")
+
+        local port
+        port=$(allocate_port "$port_hint")
+        service_data[$svc]="$port"
+
+        # Substitute {port} in command and env
+        command="${command//\{port\}/$port}"
+        env_var="${env_var//\{port\}/$port}"
+
+        # Resolve service path: worktree takes precedence over config path
+        local svc_path abs_path
+        if [[ -n "${worktree_paths[$svc]:-}" ]]; then
+            abs_path="${worktree_paths[$svc]}"
+        else
+            svc_path=$(yaml_service_get "$effective_config" "$svc" "path" ".")
+            abs_path="$config_dir/$svc_path"
+        fi
+
+        # Build shell command
+        local shell_cmd="cd '$abs_path'"
+        [[ -n "$env_var" ]] && shell_cmd="$shell_cmd && export $env_var"
+        [[ -n "$command" ]] && shell_cmd="$shell_cmd && $command"
+
+        log "Service '$svc' on port $port (path: $abs_path)"
+        tmux new-window -t "$session_key" -n "$window" "bash -c \"$shell_cmd; exec bash\""
+    done
+
+    # Build proxy map and URLs
+    local urls_block="" primary_url=""
+    local proxy_pairs
+    mapfile -t proxy_pairs < <(yaml_proxy_pairs "$effective_config")
+
+    declare -A pm_map
+    for pair in "${proxy_pairs[@]}"; do
+        local subdomain="${pair%%:*}"
+        local svc_name="${pair##*:}"
+        pm_map[$subdomain]="$svc_name"
+
+        local host
+        if [[ "$subdomain" == "" ]]; then
+            host="http://${project}-${feature}.localhost"
+        else
+            host="http://${project}-${feature}-${subdomain}.localhost"
+        fi
+        urls_block+="- $svc_name: $host"$'\n'
+        [[ -z "$primary_url" ]] && primary_url="$host"
+    done
+
+    # Add claude window (the orchestrator seat)
+    tmux new-window -t "$session_key" -n claude
+    tmux send-keys -t "$session_key:claude" "cd '$config_dir' && claude" Enter
+
+    # Remove stale main window
+    tmux kill-window -t "$session_key:main" 2>/dev/null || true
+
+    # Build worktrees block for bead body
+    local worktrees_bead_block=""
+    if [[ ${#worktree_paths[@]} -gt 0 ]]; then
+        worktrees_bead_block="- worktrees:"
+        for svc in "${!worktree_paths[@]}"; do
+            worktrees_bead_block+=$'\n'"  - $svc: ${worktree_paths[$svc]}"
+        done
+    fi
+
+    # Build branch name
+    local branch="${branch_prefix:-bentley/}${feature}"
+
+    # Build sessions.json entry
+    local started
+    started=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    # Build service JSON
+    local services_json="{"
+    local first=1
+    for svc in "${service_names[@]}"; do
+        [[ $first -eq 0 ]] && services_json+=","
+        services_json+="\"$svc\": {\"port\": ${service_data[$svc]}}"
+        first=0
+    done
+    services_json+="}"
+
+    # Build proxy_map JSON
+    local proxy_json="{"
+    first=1
+    for subdomain in "${!pm_map[@]}"; do
+        [[ $first -eq 0 ]] && proxy_json+=","
+        proxy_json+="\"$subdomain\": \"${pm_map[$subdomain]}\""
+        first=0
+    done
+    proxy_json+="}"
+
+    # Build worktrees JSON
+    local worktrees_json="{"
+    first=1
+    for svc in "${!worktree_paths[@]}"; do
+        [[ $first -eq 0 ]] && worktrees_json+=","
+        worktrees_json+="\"$svc\": \"${worktree_paths[$svc]}\""
+        first=0
+    done
+    worktrees_json+="}"
+
+    local new_sessions
+    new_sessions=$(echo "$sessions_data" | python3 - \
+        "$session_key" "$project" "$feature" "$mode" "$started" \
+        "$services_json" "$proxy_json" "$bead_id" "$config_dir" \
+        "$worktrees_json" "$db_name" "$branch" <<'EOF'
+import json, sys
+data = json.loads(sys.stdin.read())
+key = sys.argv[1]
+data[key] = {
+    "project":    sys.argv[2],
+    "feature":    sys.argv[3],
+    "mode":       sys.argv[4],
+    "started":    sys.argv[5],
+    "services":   json.loads(sys.argv[6]),
+    "proxy_map":  json.loads(sys.argv[7]),
+    "bead_id":    sys.argv[8],
+    "workspace":  sys.argv[9],
+    "worktrees":  json.loads(sys.argv[10]),
+    "db_name":    sys.argv[11],
+    "branch":     sys.argv[12],
+}
+print(json.dumps(data, indent=2))
+EOF
+)
+    echo "$new_sessions" | sessions_write
+
+    # Regen Caddyfile and reload
+    regen_caddyfile
+    caddy_reload
+
+    # Update bead
+    if [[ -n "$bead_id" ]]; then
+        local bead_body
+        bead_body=$(build_bead_body \
+            "$feature" "$project" "$branch" "$config_dir" \
+            "$mode" "$started" "$pm_display" "$urls_block" \
+            "$worktrees_bead_block" "$db_name")
+        bead_update_body "$bead_id" "$bead_body"
+        bead_mark_in_progress "$bead_id"
+        bd sync 2>/dev/null || true
+    fi
+
+    # Print summary
+    echo ""
+    echo "  Session:  $session_key"
+    echo "  Mode:     $mode"
+    echo "  Branch:   $branch"
+    [[ -n "$bead_id" ]] && echo "  Bead:     $bead_id"
+    [[ -n "$db_name" ]] && echo "  DB:       $db_name"
+    if [[ -n "$pm_issue" ]]; then
+        local pm_id="${pm_issue%%:*}"
+        local pm_url="${pm_issue##*:}"
+        echo "  Issue:    $pm_id  $pm_url"
+    fi
+    if [[ ${#worktree_paths[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Worktrees:"
+        for svc in "${!worktree_paths[@]}"; do
+            echo "    $svc: ${worktree_paths[$svc]}"
+        done
+    fi
+    echo ""
+    echo "  URLs:"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && echo "    $line"
+    done <<< "$urls_block"
+    echo ""
+    echo "  Attach:   tmux attach -t $session_key"
+    echo "  Claude:   tw claude $feature"
+    echo ""
+
+    # Clean up temp file if created
+    [[ "$effective_config" != "$config_file" ]] && rm -f "$effective_config"
+}
+
+cmd_stop() {
+    local feature="" done_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --done) done_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw stop <feature> [--done]"
+
+    # Find session key — try config first, then search sessions.json
+    local session_key project config_dir
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    fi
+
+    local bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+    # Kill tmux session
+    if tmux has-session -t "$session_key" 2>/dev/null; then
+        tmux kill-session -t "$session_key"
+        log "Killed tmux session: $session_key"
+    else
+        log "tmux session '$session_key' not found (already stopped?)"
+    fi
+
+    # Tear down worktrees if --done
+    if [[ $done_flag -eq 1 ]]; then
+        local worktrees_json
+        worktrees_json=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+wt = d.get('$session_key', {}).get('worktrees', {})
+for svc, path in wt.items():
+    print(f'{svc}:{path}')
+" 2>/dev/null || true)
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local wt_svc="${line%%:*}"
+            local wt_path="${line#*:}"
+
+            # Find the original repo path
+            local svc_path repo_abs_path
+            if config_file=$(find_config 2>/dev/null); then
+                svc_path=$(yaml_service_get "$config_file" "$wt_svc" "path" "")
+                repo_abs_path="$config_dir/$svc_path"
+            fi
+
+            if [[ -n "${repo_abs_path:-}" && -d "$repo_abs_path/.git" ]]; then
+                git -C "$repo_abs_path" worktree remove "$wt_path" --force 2>/dev/null \
+                    && log "Removed worktree: $wt_path" \
+                    || log "Could not remove worktree: $wt_path (manual cleanup may be needed)"
+            fi
+        done <<< "$worktrees_json"
+
+        # Clean up empty worktrees/<feature>/ directory
+        local worktrees_base feature_wt_dir
+        if config_file=$(find_config 2>/dev/null); then
+            worktrees_base=$(yaml_get_nested "$config_file" "worktrees.base" "")
+            if [[ -n "$worktrees_base" ]]; then
+                feature_wt_dir="$config_dir/$worktrees_base/$feature"
+                [[ -d "$feature_wt_dir" ]] && rmdir "$feature_wt_dir" 2>/dev/null \
+                    && log "Removed worktree dir: $feature_wt_dir" || true
+            fi
+        fi
+    fi
+
+    # Remove from sessions.json
+    local sessions_data
+    sessions_data=$(sessions_read)
+    echo "$sessions_data" | python3 - "$session_key" <<'EOF' | sessions_write
+import json, sys
+data = json.loads(sys.stdin.read())
+data.pop(sys.argv[1], None)
+print(json.dumps(data, indent=2))
+EOF
+
+    # Regen Caddyfile
+    regen_caddyfile
+    caddy_reload
+
+    # Update bead
+    if [[ -n "$bead_id" ]]; then
+        if [[ $done_flag -eq 1 ]]; then
+            bead_close "$bead_id"
+            log "Closed bead $bead_id"
+        else
+            local stopped
+            stopped=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            local current_body
+            current_body=$(bead_get_body "$bead_id")
+            bd update "$bead_id" --body="${current_body}
+
+## Session Ended
+- stopped: $stopped
+- bead remains open (run: tw start $feature to resume)" 2>/dev/null || true
+            log "Updated bead $bead_id (still open — use --done to close)"
+        fi
+        bd sync 2>/dev/null || true
+    fi
+
+    echo "  Stopped: $session_key"
+    [[ $done_flag -eq 1 ]] && echo "  Bead $bead_id closed." || echo "  Bead $bead_id open (use --done to close)."
+}
+
+cmd_list() {
+    local filter_project=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project=*) filter_project="${1#--project=}"; shift ;;
+            --project) filter_project="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    python3 - "$sessions_data" "$filter_project" <<'EOF'
+import json, sys
+data = json.loads(sys.argv[1])
+filter_proj = sys.argv[2]
+
+if not data:
+    print("  No active sessions.")
+    sys.exit(0)
+
+print(f"  {'SESSION':<35} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
+print(f"  {'-'*35} {'-'*10} {'-'*12} {'-'*20}")
+for key, s in data.items():
+    if filter_proj and s.get('project') != filter_proj:
+        continue
+    bead = s.get('bead_id', '')
+    mode = s.get('mode', '')
+    started = s.get('started', '')[:16].replace('T', ' ')
+    print(f"  {key:<35} {mode:<10} {bead:<12} {started}")
+EOF
+}
+
+cmd_status() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw status <feature>"
+
+    local session_key project
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+    fi
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    python3 - "$sessions_data" "$session_key" <<'EOF'
+import json, sys, subprocess
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
+
+s = data.get(key)
+if not s:
+    print(f"  No session found: {key}")
+    sys.exit(1)
+
+# Check tmux alive
+try:
+    r = subprocess.run(['tmux', 'has-session', '-t', key], capture_output=True)
+    tmux_alive = r.returncode == 0
+except Exception:
+    tmux_alive = False
+
+print(f"\n  Session:   {key}")
+print(f"  tmux:      {'alive' if tmux_alive else 'DEAD (run: tw prune)'}")
+print(f"  Mode:      {s.get('mode', '')}")
+print(f"  Branch:    {s.get('branch', '')}")
+print(f"  Started:   {s.get('started', '')}")
+print(f"  Workspace: {s.get('workspace', '')}")
+print(f"  Bead:      {s.get('bead_id', 'none')}")
+db = s.get('db_name', '')
+if db:
+    print(f"  DB:        {db}")
+
+worktrees = s.get('worktrees', {})
+if worktrees:
+    print()
+    print("  Worktrees:")
+    for svc, path in worktrees.items():
+        print(f"    {svc:<20} {path}")
+
+print()
+print("  Services:")
+for svc, info in s.get('services', {}).items():
+    print(f"    {svc:<20} port {info.get('port', '?')}")
+print()
+print("  URLs:")
+for subdomain, svc_name in s.get('proxy_map', {}).items():
+    project = s.get('project', '')
+    feature = s.get('feature', '')
+    svc = s.get('services', {}).get(svc_name, {})
+    port = svc.get('port', '?')
+    if subdomain == '':
+        host = f'http://{project}-{feature}.localhost'
+    else:
+        host = f'http://{project}-{feature}-{subdomain}.localhost'
+    print(f"    {svc_name:<20} {host}  (→ :{port})")
+print()
+EOF
+}
+
+cmd_open() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw open <feature>"
+
+    local session_key project
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        feature=$(sessions_get_key "$session_key" "feature")
+    fi
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    local primary_url
+    primary_url=$(python3 - "$sessions_data" "$session_key" <<'EOF'
+import json, sys
+data = json.loads(sys.argv[1])
+s = data.get(sys.argv[2], {})
+project = s.get('project', '')
+feature = s.get('feature', '')
+for subdomain, svc_name in s.get('proxy_map', {}).items():
+    if subdomain == '':
+        print(f'http://{project}-{feature}.localhost')
+        break
+EOF
+)
+
+    [[ -z "$primary_url" ]] && die "No primary URL found for '$feature'"
+    log "Opening $primary_url"
+    open "$primary_url"
+}
+
+cmd_prune() {
+    local sessions_data removed=0
+    sessions_data=$(sessions_read)
+
+    local new_data
+    new_data=$(python3 - "$sessions_data" <<'EOF'
+import json, sys, subprocess
+data = json.loads(sys.argv[1])
+removed = []
+for key in list(data.keys()):
+    r = subprocess.run(['tmux', 'has-session', '-t', key], capture_output=True)
+    if r.returncode != 0:
+        removed.append(key)
+        del data[key]
+for k in removed:
+    print(f"REMOVED:{k}", file=sys.stderr)
+print(json.dumps(data, indent=2))
+EOF
+    )
+
+    echo "$new_data" | sessions_write
+    regen_caddyfile
+    caddy_reload
+
+    echo "  Prune complete."
+}
+
+cmd_claude() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw claude <feature>"
+
+    local session_key project config_dir
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'. Run: tw start $feature"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    fi
+
+    if ! tmux has-session -t "$session_key" 2>/dev/null; then
+        die "No tmux session '$session_key'. Run: tw start $feature"
+    fi
+
+    # Create claude window if it doesn't exist
+    if ! tmux list-windows -t "$session_key" -F "#{window_name}" 2>/dev/null | grep -q "^claude$"; then
+        log "Creating claude window in $session_key"
+        tmux new-window -t "$session_key" -n claude
+        tmux send-keys -t "$session_key:claude" "cd '$config_dir' && claude" Enter
+    fi
+
+    # Build context block for pasting as first Claude message
+    local bead_id sessions_data
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+    sessions_data=$(sessions_read)
+
+    local branch db_name
+    branch=$(sessions_get_key "$session_key" "branch")
+    db_name=$(sessions_get_key "$session_key" "db_name")
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Paste this as your first Claude message:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Resume work on $feature ($project)."
+    [[ -n "$bead_id" ]] && echo "Bead $bead_id has full context — run: bd show $bead_id"
+    [[ -n "$branch" ]] && echo "Branch: $branch"
+    echo ""
+
+    # Worktrees
+    local worktrees_output
+    worktrees_output=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+wt = d.get('$session_key', {}).get('worktrees', {})
+for svc, path in wt.items():
+    print(f'  {svc}: {path}')
+" 2>/dev/null || true)
+
+    if [[ -n "$worktrees_output" ]]; then
+        echo "Worktrees:"
+        echo "$worktrees_output"
+        echo ""
+    fi
+
+    [[ -n "$db_name" ]] && echo "DB: $db_name" && echo ""
+
+    echo "URLs:"
+    python3 - "$sessions_data" "$session_key" <<'EOF'
+import json, sys
+data = json.loads(sys.argv[1])
+s = data.get(sys.argv[2], {})
+project = s.get('project', '')
+feature = s.get('feature', '')
+for subdomain, svc_name in s.get('proxy_map', {}).items():
+    if subdomain == '':
+        print(f'  http://{project}-{feature}.localhost')
+    else:
+        print(f'  http://{project}-{feature}-{subdomain}.localhost')
+EOF
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Switch to claude window and attach
+    tmux select-window -t "$session_key:claude"
+    tmux attach-session -t "$session_key"
+}
+
+cmd_append() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw append <feature>   (reads from stdin)"
+
+    local session_key project
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+    fi
+
+    local bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+    # Also search open beads if not in sessions.json (session may be stopped)
+    if [[ -z "$bead_id" ]]; then
+        local config_file2
+        if config_file2=$(find_config 2>/dev/null); then
+            local proj2
+            proj2=$(yaml_get "$config_file2" "project" "")
+            bead_id=$(bead_find_open "$feature ($proj2)")
+        fi
+    fi
+
+    [[ -z "$bead_id" ]] && die "No bead found for '$feature'. Start a session first."
+
+    # Read from stdin
+    local appended_text
+    appended_text=$(cat)
+    [[ -z "$appended_text" ]] && die "No text provided (pipe text or paste + Ctrl-D)"
+
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%MZ")
+
+    # Get current bead body and append
+    local current_body
+    current_body=$(bead_get_body "$bead_id")
+
+    local new_body
+    new_body="${current_body}
+### Session — ${timestamp}
+${appended_text}"
+
+    bd update "$bead_id" --body="$new_body" 2>/dev/null \
+        || die "Failed to update bead $bead_id"
+    bd sync 2>/dev/null || true
+
+    log "Appended to bead $bead_id"
+    echo "  Bead $bead_id updated. Run: bd show $bead_id"
+}
+
+# ─── Dispatch ─────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+tw — tiddly-winks: feature space manager
+
+Usage:
+  tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
+  tw stop <feature> [--done]            Stop session (--done tears down worktrees + closes bead)
+  tw list [--project=X]                 List active sessions
+  tw status <feature>                   Show ports, URLs, worktrees, bead
+  tw open <feature>                     Open primary URL in browser
+  tw claude <feature>                   Open/attach to Claude orchestrator window
+  tw append <feature>                   Append wrap-up text to bead (reads from stdin)
+  tw prune                              Remove stale sessions after reboot
+
+Config file: .tw.yml (also accepts .devenv.yml for compatibility)
+URLs: http://{project}-{feature}.localhost (Chrome/Firefox only — not Safari)
+Docs: https://github.com/bentleycook/tiddly-winks
+EOF
+}
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+subcommand="$1"; shift
+case "$subcommand" in
+    start)  cmd_start "$@" ;;
+    stop)   cmd_stop "$@" ;;
+    list)   cmd_list "$@" ;;
+    status) cmd_status "$@" ;;
+    open)   cmd_open "$@" ;;
+    prune)  cmd_prune "$@" ;;
+    claude) cmd_claude "$@" ;;
+    append) cmd_append "$@" ;;
+    help|--help|-h) usage ;;
+    *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
+esac
