@@ -370,7 +370,7 @@ bead_find_open() {
 
 bead_create() {
     local title="$1" bd_dir="${2:-}"
-    bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1 || true
+    bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[a-zA-Z]+-[a-z0-9]+' | head -1 || true
 }
 
 bead_find_or_create() {
