@@ -293,6 +293,11 @@ with open(sys.argv[1], 'w') as f:
     tmux new-window -t "$tmux_session" -n "$wname"
     tmux send-keys -t "$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
+
+    # Trigger /login after startup — re-validates existing Claude Max token without browser.
+    # Workers inherit no auth state from the spawning process.
+    ( sleep 4; tmux send-keys -t "$tmux_session:$wname" "/login" Enter ) &
+
     log "Started worker: $wname (role: $wrole)"
 }
 
