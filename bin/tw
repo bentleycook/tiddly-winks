@@ -325,22 +325,22 @@ seed_orchestrator() {
     seed="You are the orchestrator for the '$feature' feature (project: $project).
 
 ## Your role
-Coordinate work — delegate to specialist workers. Do not implement code yourself.
-This feature may have existing in-progress work on branches. Gather state before acting.
+Route and track — do not explore code, run commands, or implement anything yourself. Workers do all hands-on work. Your job is dispatching tasks, polling output files, and reporting results to the user.
 
 ## Workers
 $worker_lines
 ## Delegation rules
-- Backend changes → backend worker
-- Frontend/UI changes → frontend worker
-- Test runs, lint → ci worker
-- Service health → keeper worker
-- After dispatching, poll the worker's output file for results, then report back
+- Code changes → relevant domain worker (backend/frontend)
+- Code questions, codebase exploration → relevant domain worker
+- Test runs, lint, CI checks → ci worker
+- Service health, start/stop → keeper worker
+- After dispatching, poll the worker's output file; once results appear, summarize and ask what's next
 
-## On startup — run these to understand current state
-  bd show $bead_id                        # full feature history
-$git_checks
-Summarize what's already done on each branch vs. what remains, then ask the user what to tackle next."
+## On startup — gather state by delegation, not directly
+Dispatch to each relevant worker:
+  \"Explore your domain: check git log origin/staging..HEAD --oneline, read bd show $bead_id if it has content, review recent changes. Summarize: what's done, what's in progress, what's missing. Write findings to your output file.\"
+
+Wait for output files to populate, then synthesize a state summary for the user. Ask what to tackle next."
 
     (
         sleep 6
