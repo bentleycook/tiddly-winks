@@ -1103,16 +1103,10 @@ if not data:
     print("  No active sessions.")
     sys.exit(0)
 
-# Cache which project sessions are alive
-alive_cache = {}
 def feature_alive(project, feature):
-    if project not in alive_cache:
-        r = subprocess.run(
-            ['tmux', 'list-windows', '-t', project, '-F', '#{window_name}'],
-            capture_output=True, text=True
-        )
-        alive_cache[project] = set(r.stdout.strip().split('\n')) if r.returncode == 0 else set()
-    return feature in alive_cache[project]
+    session_key = f'{project}-{feature}'
+    r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
+    return r.returncode == 0
 
 print(f"  {'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
 print(f"  {'-'*15} {'-'*25} {'-'*8} {'-'*10} {'-'*12} {'-'*20}")
@@ -1156,21 +1150,17 @@ if not s:
     print(f"  No session found: {key}")
     sys.exit(1)
 
-# Check tmux alive — look for the feature shell window in the project session
 project_name = s.get('project', '')
 feature_name = s.get('feature', '')
+session_key = f'{project_name}-{feature_name}'
 try:
-    r = subprocess.run(
-        ['tmux', 'list-windows', '-t', project_name, '-F', '#{window_name}'],
-        capture_output=True, text=True
-    )
-    window_names = r.stdout.strip().split('\n') if r.returncode == 0 else []
-    tmux_alive = feature_name in window_names
+    r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
+    tmux_alive = r.returncode == 0
 except Exception:
     tmux_alive = False
 
 print(f"\n  Feature:   {feature_name} ({project_name})")
-print(f"  tmux:      {'alive — attach: tmux attach -t ' + project_name if tmux_alive else 'DEAD (run: tw prune)'}")
+print(f"  tmux:      {'alive — attach: tmux attach -t ' + session_key if tmux_alive else 'DEAD (run: tw prune)'}")
 print(f"  Mode:      {s.get('mode', '')}")
 print(f"  Branch:    {s.get('branch', '')}")
 print(f"  Started:   {s.get('started', '')}")
@@ -1257,13 +1247,9 @@ removed = []
 for key, s in list(data.items()):
     project = s.get('project', '')
     feature = s.get('feature', '')
-    # Check if the feature shell window exists in the project session
-    r = subprocess.run(
-        ['tmux', 'list-windows', '-t', project, '-F', '#{window_name}'],
-        capture_output=True, text=True
-    )
-    window_names = r.stdout.strip().split('\n') if r.returncode == 0 else []
-    if feature not in window_names:
+    session_key = f'{project}-{feature}'
+    r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
+    if r.returncode != 0:
         removed.append(key)
         del data[key]
 for k in removed:
