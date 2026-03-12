@@ -80,6 +80,22 @@ except Exception:
 EOF
 }
 
+# Get workers as "name:role\n..." pairs
+yaml_worker_pairs() {
+    local file="$1"
+    python3 - "$file" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    workers = d.get('workers', {}) or {}
+    for name, info in workers.items():
+        role = (info or {}).get('role', name)
+        print(f"{name}:{role}")
+except Exception:
+    pass
+EOF
+}
+
 # Get proxy map as "subdomain:service\n..." pairs
 yaml_proxy_pairs() {
     local file="$1"
@@ -253,24 +269,116 @@ caddy_reload() {
     fi
 }
 
+# ─── Agent Communication ─────────────────────────────────────────────────────
+
+agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
+
+# Spawn a worker window and wire up hook-based context injection.
+# Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id]
+spawn_worker() {
+    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}"
+    local output_file
+    output_file="$(agents_dir "$session_key")/${wname}.md"
+
+    # Write hooked work file — consumed by the SessionStart hook (tw-prime.sh)
+    # to inject bead context + role + output file path at session open.
+    local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    mkdir -p "$hooked_dir"
+    python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({'bead_id': sys.argv[2], 'worker': sys.argv[3], 'role': sys.argv[4], 'output_file': sys.argv[5]}, f, indent=2)
+" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file"
+
+    tmux new-window -t "$tmux_session" -n "$wname"
+    tmux send-keys -t "$tmux_session:$wname" \
+        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
+    log "Started worker: $wname (role: $wrole)"
+}
+
+# Send the orchestrator seed to the claude window once agents are known.
+# Usage: seed_orchestrator <tmux_session> <session_key> <feature> <project> <bead_id> <branch> <worker_pairs_str> <worktrees_json>
+seed_orchestrator() {
+    local tmux_session="$1" session_key="$2" feature="$3" project="$4"
+    local bead_id="$5" branch="$6" workers_str="$7" worktrees_json="$8"
+    local agents_path
+    agents_path="$(agents_dir "$session_key")"
+
+    # Build worker dispatch lines
+    local worker_lines=""
+    while IFS= read -r wpair; do
+        [[ -z "$wpair" ]] && continue
+        local wn="${wpair%%:*}" wr="${wpair##*:}"
+        worker_lines+="- $wn ($wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+    done <<< "$workers_str"
+
+    # Build git state-check commands for each worktree
+    local git_checks=""
+    if [[ -n "$worktrees_json" ]]; then
+        while IFS=: read -r svc path; do
+            [[ -z "$svc" || -z "$path" ]] && continue
+            git_checks+="  git -C '$path' log origin/staging..HEAD --oneline  # $svc commits ahead of staging"$'\n'
+        done <<< "$worktrees_json"
+    fi
+
+    local seed
+    seed="You are the orchestrator for the '$feature' feature (project: $project).
+
+## Your role
+Coordinate work — delegate to specialist workers. Do not implement code yourself.
+This feature may have existing in-progress work on branches. Gather state before acting.
+
+## Workers
+$worker_lines
+## Delegation rules
+- Backend changes → backend worker
+- Frontend/UI changes → frontend worker
+- Test runs, lint → ci worker
+- Service health → keeper worker
+- After dispatching, poll the worker's output file for results, then report back
+
+## On startup — run these to understand current state
+  bd show $bead_id                        # full feature history
+$git_checks
+Summarize what's already done on each branch vs. what remains, then ask the user what to tackle next."
+
+    (
+        sleep 6
+        tmux send-keys -t "$tmux_session:claude" "$seed"
+        sleep 0.5
+        tmux send-keys -t "$tmux_session:claude" "" Enter
+    ) &
+}
+
 # ─── Bead Integration ────────────────────────────────────────────────────────
 
+# Run bd from a specific directory (for per-workspace bead stores).
+# bd_run <dir> <bd-args...>  — if dir is empty, runs bd in $PWD.
+bd_run() {
+    local dir="$1"; shift
+    if [[ -n "$dir" ]]; then
+        (cd "$dir" && bd "$@")
+    else
+        bd "$@"
+    fi
+}
+
 bead_find_open() {
-    local title="$1"
-    bd list --status=open 2>/dev/null | grep -F "$title" | head -1 | awk '{print $1}' | tr -d '#' || true
+    local title="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" list --status=open 2>/dev/null | grep -F "$title" | head -1 | awk '{print $2}' | tr -d '#' || true
 }
 
 bead_create() {
-    local title="$1"
-    bd create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1 || true
+    local title="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[A-Z]+-[0-9]+' | head -1 || true
 }
 
 bead_find_or_create() {
-    local title="$1"
+    local title="$1" bd_dir="${2:-}"
     local bead_id
-    bead_id=$(bead_find_open "$title")
+    bead_id=$(bead_find_open "$title" "$bd_dir")
     if [[ -z "$bead_id" ]]; then
-        bead_id=$(bead_create "$title")
+        bead_id=$(bead_create "$title" "$bd_dir")
         log "Created bead $bead_id: $title"
     else
         log "Reusing bead $bead_id: $title"
@@ -279,24 +387,23 @@ bead_find_or_create() {
 }
 
 bead_update_body() {
-    local bead_id="$1"
-    local body="$2"
-    bd update "$bead_id" --body="$body" 2>/dev/null || true
+    local bead_id="$1" body="$2" bd_dir="${3:-}"
+    bd_run "$bd_dir" update "$bead_id" --body="$body" 2>/dev/null || true
 }
 
 bead_mark_in_progress() {
-    local bead_id="$1"
-    bd update "$bead_id" --status=in_progress 2>/dev/null || true
+    local bead_id="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" update "$bead_id" --status=in_progress 2>/dev/null || true
 }
 
 bead_close() {
-    local bead_id="$1"
-    bd close "$bead_id" 2>/dev/null || true
+    local bead_id="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" close "$bead_id" 2>/dev/null || true
 }
 
 bead_get_body() {
-    local bead_id="$1"
-    bd show "$bead_id" 2>/dev/null | python3 -c "
+    local bead_id="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" show "$bead_id" 2>/dev/null | python3 -c "
 import sys
 lines = sys.stdin.readlines()
 body_lines = []
@@ -522,18 +629,31 @@ cmd_start() {
     [[ -z "$project" ]] && die ".tw.yml missing 'project' key"
 
     local session_key="${project}-${feature}"
+    local tmux_session="$session_key"
 
-    # Fail if tmux session already exists
-    if tmux has-session -t "$session_key" 2>/dev/null; then
-        die "tmux session '$session_key' already exists. Use: tmux attach -t $session_key"
+    # Fail if session already exists AND is registered in sessions.json
+    # If tmux exists but sessions.json is missing the entry, auto-clean and proceed
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+        if sessions_get_key "$session_key" "project" 2>/dev/null | grep -q .; then
+            die "Feature '$feature' already running. Use: tmux attach -t $tmux_session"
+        else
+            log "Found orphan tmux session '$tmux_session' (not in sessions.json) — killing and restarting"
+            tmux kill-session -t "$tmux_session" 2>/dev/null || true
+        fi
     fi
 
-    log "Starting session: $session_key (mode=$mode)"
+    log "Starting feature: $session_key (mode=$mode)"
+
+    # Init per-workspace bead store if needed
+    if [[ ! -d "$config_dir/.beads" ]]; then
+        (cd "$config_dir" && bd init --stealth --prefix "$project" --quiet 2>/dev/null) \
+            && log "Initialized bead store: $config_dir/.beads" || true
+    fi
 
     # Bead
     local bead_title="$feature ($project)"
     local bead_id
-    bead_id=$(bead_find_or_create "$bead_title")
+    bead_id=$(bead_find_or_create "$bead_title" "$config_dir")
 
     # PM issue
     local pm_issue pm_display tracker_type
@@ -594,21 +714,30 @@ cmd_start() {
                 env_db=$(grep "^DB_NAME=" "$worktree_path/.env" 2>/dev/null | cut -d= -f2 || true)
                 [[ -n "$env_db" ]] && db_name="$env_db"
             fi
+
+            # Run post_setup if configured (e.g. bun install, npm install)
+            local post_setup
+            post_setup=$(yaml_service_get "$effective_config" "$svc" "post_setup" "")
+            if [[ -n "$post_setup" ]]; then
+                log "Running post_setup for $svc: $post_setup"
+                (cd "$worktree_path" && eval "$post_setup") \
+                    || log "post_setup failed for $svc (continuing)"
+            fi
         done
     fi
 
-    # Start tmux session
-    tmux new-session -d -s "$session_key" -n main
+    # Start tmux session for this feature
+    tmux new-session -d -s "$tmux_session" -n "main"
+    tmux send-keys -t "$tmux_session:main" "cd '$config_dir'" Enter
 
     # Allocate ports and start services
     declare -A service_data
 
     for svc in "${service_names[@]}"; do
-        local port_hint command env_var window
+        local port_hint command env_var
         port_hint=$(yaml_service_get "$effective_config" "$svc" "port_hint" "3000")
         command=$(yaml_service_get "$effective_config" "$svc" "command" "")
         env_var=$(yaml_service_get "$effective_config" "$svc" "env" "")
-        window=$(yaml_service_get "$effective_config" "$svc" "window" "$svc")
 
         local port
         port=$(allocate_port "$port_hint")
@@ -633,19 +762,32 @@ cmd_start() {
         [[ -n "$command" ]] && shell_cmd="$shell_cmd && $command"
 
         log "Service '$svc' on port $port (path: $abs_path)"
-        tmux new-window -t "$session_key" -n "$window" "bash -c \"$shell_cmd; exec bash\""
+
+        # First service gets its own pane in the services window; rest split
+        if [[ "${services_window_created:-0}" -eq 0 ]]; then
+            tmux new-window -t "$tmux_session" -n "services" \
+                "bash -c \"$shell_cmd; exec bash\""
+            services_window_created=1
+        else
+            tmux split-window -t "$tmux_session:services" -v \
+                "bash -c \"$shell_cmd; exec bash\""
+        fi
     done
 
+    # Balance panes in the services window
+    if [[ "${services_window_created:-0}" -eq 1 ]]; then
+        tmux select-layout -t "$tmux_session:services" even-vertical 2>/dev/null || true
+    fi
+
     # Build proxy map and URLs
-    local urls_block="" primary_url=""
-    local proxy_pairs
+    local urls_block="" primary_url="" proxy_json="{"
+    local proxy_pairs proxy_first=1
     mapfile -t proxy_pairs < <(yaml_proxy_pairs "$effective_config")
 
-    declare -A pm_map
     for pair in "${proxy_pairs[@]}"; do
+        [[ -z "$pair" ]] && continue
         local subdomain="${pair%%:*}"
         local svc_name="${pair##*:}"
-        pm_map[$subdomain]="$svc_name"
 
         local host
         if [[ "$subdomain" == "" ]]; then
@@ -655,14 +797,47 @@ cmd_start() {
         fi
         urls_block+="- $svc_name: $host"$'\n'
         [[ -z "$primary_url" ]] && primary_url="$host"
+
+        [[ $proxy_first -eq 0 ]] && proxy_json+=","
+        proxy_json+="\"$subdomain\": \"$svc_name\""
+        proxy_first=0
     done
+    proxy_json+="}"
+
+    # Compute branch name early (needed for orchestrator seed)
+    local branch="${branch_prefix:-bentley/}${feature}"
 
     # Add claude window (the orchestrator seat)
-    tmux new-window -t "$session_key" -n claude
-    tmux send-keys -t "$session_key:claude" "cd '$config_dir' && claude" Enter
+    tmux new-window -t "$tmux_session" -n "claude"
+    tmux send-keys -t "$tmux_session:claude" "cd '$config_dir' && claude --dangerously-skip-permissions" Enter
 
-    # Remove stale main window
-    tmux kill-window -t "$session_key:main" 2>/dev/null || true
+    # Create agents output directory
+    mkdir -p "$(agents_dir "$session_key")"
+
+    # Add worker windows (persistent Claude agents with roles)
+    local worker_pairs
+    mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+
+    local workers_str=""
+    for wpair in "${worker_pairs[@]}"; do
+        [[ -z "$wpair" ]] && continue
+        spawn_worker "$tmux_session" "$session_key" "$config_dir" \
+            "${wpair%%:*}" "${wpair##*:}" "$bead_id"
+        workers_str+="$wpair"$'\n'
+    done
+
+    # Seed orchestrator with worker context + worktree paths
+    if [[ -n "$workers_str" ]]; then
+        local worktrees_kv=""
+        for svc in "${!worktree_paths[@]}"; do
+            worktrees_kv+="$svc:${worktree_paths[$svc]}"$'\n'
+        done
+        seed_orchestrator "$tmux_session" "$session_key" "$feature" "$project" \
+            "$bead_id" "$branch" "$workers_str" "$worktrees_kv"
+    fi
+
+    # Focus orchestrator window
+    tmux select-window -t "$tmux_session:claude"
 
     # Build worktrees block for bead body
     local worktrees_bead_block=""
@@ -672,9 +847,6 @@ cmd_start() {
             worktrees_bead_block+=$'\n'"  - $svc: ${worktree_paths[$svc]}"
         done
     fi
-
-    # Build branch name
-    local branch="${branch_prefix:-bentley/}${feature}"
 
     # Build sessions.json entry
     local started
@@ -693,16 +865,6 @@ cmd_start() {
     done
     services_json+="}"
 
-    # Build proxy_map JSON
-    local proxy_json="{"
-    first=1
-    for subdomain in "${!pm_map[@]}"; do
-        [[ $first -eq 0 ]] && proxy_json+=","
-        proxy_json+="\"$subdomain\": \"${pm_map[$subdomain]}\""
-        first=0
-    done
-    proxy_json+="}"
-
     # Build worktrees JSON
     local worktrees_json="{"
     first=1
@@ -714,25 +876,25 @@ cmd_start() {
     worktrees_json+="}"
 
     local new_sessions
-    new_sessions=$(echo "$sessions_data" | python3 - \
-        "$session_key" "$project" "$feature" "$mode" "$started" \
+    new_sessions=$(python3 - \
+        "$sessions_data" "$session_key" "$project" "$feature" "$mode" "$started" \
         "$services_json" "$proxy_json" "$bead_id" "$config_dir" \
         "$worktrees_json" "$db_name" "$branch" <<'EOF'
 import json, sys
-data = json.loads(sys.stdin.read())
-key = sys.argv[1]
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
 data[key] = {
-    "project":    sys.argv[2],
-    "feature":    sys.argv[3],
-    "mode":       sys.argv[4],
-    "started":    sys.argv[5],
-    "services":   json.loads(sys.argv[6]),
-    "proxy_map":  json.loads(sys.argv[7]),
-    "bead_id":    sys.argv[8],
-    "workspace":  sys.argv[9],
-    "worktrees":  json.loads(sys.argv[10]),
-    "db_name":    sys.argv[11],
-    "branch":     sys.argv[12],
+    "project":    sys.argv[3],
+    "feature":    sys.argv[4],
+    "mode":       sys.argv[5],
+    "started":    sys.argv[6],
+    "services":   json.loads(sys.argv[7]),
+    "proxy_map":  json.loads(sys.argv[8]),
+    "bead_id":    sys.argv[9],
+    "workspace":  sys.argv[10],
+    "worktrees":  json.loads(sys.argv[11]),
+    "db_name":    sys.argv[12],
+    "branch":     sys.argv[13],
 }
 print(json.dumps(data, indent=2))
 EOF
@@ -750,14 +912,14 @@ EOF
             "$feature" "$project" "$branch" "$config_dir" \
             "$mode" "$started" "$pm_display" "$urls_block" \
             "$worktrees_bead_block" "$db_name")
-        bead_update_body "$bead_id" "$bead_body"
-        bead_mark_in_progress "$bead_id"
-        bd sync 2>/dev/null || true
+        bead_update_body "$bead_id" "$bead_body" "$config_dir"
+        bead_mark_in_progress "$bead_id" "$config_dir"
+        bd_run "$config_dir" sync 2>/dev/null || true
     fi
 
     # Print summary
     echo ""
-    echo "  Session:  $session_key"
+    echo "  Feature:  $feature ($project)"
     echo "  Mode:     $mode"
     echo "  Branch:   $branch"
     [[ -n "$bead_id" ]] && echo "  Bead:     $bead_id"
@@ -779,8 +941,18 @@ EOF
     while IFS= read -r line; do
         [[ -n "$line" ]] && echo "    $line"
     done <<< "$urls_block"
+    if [[ ${#worker_pairs[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Workers:"
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}"
+            local wrole="${wpair##*:}"
+            echo "    $wname  (role: $wrole)"
+        done
+    fi
     echo ""
-    echo "  Attach:   tmux attach -t $session_key"
+    echo "  Attach:   tmux attach -t $tmux_session"
     echo "  Claude:   tw claude $feature"
     echo ""
 
@@ -802,7 +974,7 @@ cmd_stop() {
     [[ -z "$feature" ]] && die "Usage: tw stop <feature> [--done]"
 
     # Find session key — try config first, then search sessions.json
-    local session_key project config_dir
+    local session_key project config_dir tmux_session
     local config_file
     if config_file=$(find_config 2>/dev/null); then
         project=$(yaml_get "$config_file" "project" "")
@@ -814,16 +986,17 @@ cmd_stop() {
         project=$(sessions_get_key "$session_key" "project")
         config_dir=$(sessions_get_key "$session_key" "workspace")
     fi
+    tmux_session="$session_key"
 
     local bead_id
     bead_id=$(sessions_get_key "$session_key" "bead_id")
 
-    # Kill tmux session
-    if tmux has-session -t "$session_key" 2>/dev/null; then
-        tmux kill-session -t "$session_key"
-        log "Killed tmux session: $session_key"
+    # Kill the feature's tmux session
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+        tmux kill-session -t "$tmux_session" 2>/dev/null || true
+        log "Killed session: $tmux_session"
     else
-        log "tmux session '$session_key' not found (already stopped?)"
+        log "tmux session '$tmux_session' not found (already stopped?)"
     fi
 
     # Tear down worktrees if --done
@@ -871,10 +1044,10 @@ for svc, path in wt.items():
     # Remove from sessions.json
     local sessions_data
     sessions_data=$(sessions_read)
-    echo "$sessions_data" | python3 - "$session_key" <<'EOF' | sessions_write
+    python3 - "$sessions_data" "$session_key" <<'EOF' | sessions_write
 import json, sys
-data = json.loads(sys.stdin.read())
-data.pop(sys.argv[1], None)
+data = json.loads(sys.argv[1])
+data.pop(sys.argv[2], None)
 print(json.dumps(data, indent=2))
 EOF
 
@@ -885,24 +1058,24 @@ EOF
     # Update bead
     if [[ -n "$bead_id" ]]; then
         if [[ $done_flag -eq 1 ]]; then
-            bead_close "$bead_id"
+            bead_close "$bead_id" "$config_dir"
             log "Closed bead $bead_id"
         else
             local stopped
             stopped=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             local current_body
-            current_body=$(bead_get_body "$bead_id")
-            bd update "$bead_id" --body="${current_body}
+            current_body=$(bead_get_body "$bead_id" "$config_dir")
+            bd_run "$config_dir" update "$bead_id" --body="${current_body}
 
 ## Session Ended
 - stopped: $stopped
 - bead remains open (run: tw start $feature to resume)" 2>/dev/null || true
             log "Updated bead $bead_id (still open — use --done to close)"
         fi
-        bd sync 2>/dev/null || true
+        bd_run "$config_dir" sync 2>/dev/null || true
     fi
 
-    echo "  Stopped: $session_key"
+    echo "  Stopped: $feature ($project)"
     [[ $done_flag -eq 1 ]] && echo "  Bead $bead_id closed." || echo "  Bead $bead_id open (use --done to close)."
 }
 
@@ -921,7 +1094,8 @@ cmd_list() {
     sessions_data=$(sessions_read)
 
     python3 - "$sessions_data" "$filter_project" <<'EOF'
-import json, sys
+import json, sys, subprocess
+
 data = json.loads(sys.argv[1])
 filter_proj = sys.argv[2]
 
@@ -929,15 +1103,29 @@ if not data:
     print("  No active sessions.")
     sys.exit(0)
 
-print(f"  {'SESSION':<35} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
-print(f"  {'-'*35} {'-'*10} {'-'*12} {'-'*20}")
+# Cache which project sessions are alive
+alive_cache = {}
+def feature_alive(project, feature):
+    if project not in alive_cache:
+        r = subprocess.run(
+            ['tmux', 'list-windows', '-t', project, '-F', '#{window_name}'],
+            capture_output=True, text=True
+        )
+        alive_cache[project] = set(r.stdout.strip().split('\n')) if r.returncode == 0 else set()
+    return feature in alive_cache[project]
+
+print(f"  {'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
+print(f"  {'-'*15} {'-'*25} {'-'*8} {'-'*10} {'-'*12} {'-'*20}")
 for key, s in data.items():
-    if filter_proj and s.get('project') != filter_proj:
+    proj = s.get('project', '')
+    feat = s.get('feature', '')
+    if filter_proj and proj != filter_proj:
         continue
     bead = s.get('bead_id', '')
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
-    print(f"  {key:<35} {mode:<10} {bead:<12} {started}")
+    status = 'alive' if feature_alive(proj, feat) else 'dead'
+    print(f"  {proj:<15} {feat:<25} {status:<8} {mode:<10} {bead:<12} {started}")
 EOF
 }
 
@@ -968,15 +1156,21 @@ if not s:
     print(f"  No session found: {key}")
     sys.exit(1)
 
-# Check tmux alive
+# Check tmux alive — look for the feature shell window in the project session
+project_name = s.get('project', '')
+feature_name = s.get('feature', '')
 try:
-    r = subprocess.run(['tmux', 'has-session', '-t', key], capture_output=True)
-    tmux_alive = r.returncode == 0
+    r = subprocess.run(
+        ['tmux', 'list-windows', '-t', project_name, '-F', '#{window_name}'],
+        capture_output=True, text=True
+    )
+    window_names = r.stdout.strip().split('\n') if r.returncode == 0 else []
+    tmux_alive = feature_name in window_names
 except Exception:
     tmux_alive = False
 
-print(f"\n  Session:   {key}")
-print(f"  tmux:      {'alive' if tmux_alive else 'DEAD (run: tw prune)'}")
+print(f"\n  Feature:   {feature_name} ({project_name})")
+print(f"  tmux:      {'alive — attach: tmux attach -t ' + project_name if tmux_alive else 'DEAD (run: tw prune)'}")
 print(f"  Mode:      {s.get('mode', '')}")
 print(f"  Branch:    {s.get('branch', '')}")
 print(f"  Started:   {s.get('started', '')}")
@@ -1060,9 +1254,16 @@ cmd_prune() {
 import json, sys, subprocess
 data = json.loads(sys.argv[1])
 removed = []
-for key in list(data.keys()):
-    r = subprocess.run(['tmux', 'has-session', '-t', key], capture_output=True)
-    if r.returncode != 0:
+for key, s in list(data.items()):
+    project = s.get('project', '')
+    feature = s.get('feature', '')
+    # Check if the feature shell window exists in the project session
+    r = subprocess.run(
+        ['tmux', 'list-windows', '-t', project, '-F', '#{window_name}'],
+        capture_output=True, text=True
+    )
+    window_names = r.stdout.strip().split('\n') if r.returncode == 0 else []
+    if feature not in window_names:
         removed.append(key)
         del data[key]
 for k in removed:
@@ -1078,9 +1279,9 @@ EOF
     echo "  Prune complete."
 }
 
-cmd_claude() {
+cmd_editor() {
     local feature="${1:-}"
-    [[ -z "$feature" ]] && die "Usage: tw claude <feature>"
+    [[ -z "$feature" ]] && die "Usage: tw editor <feature>"
 
     local session_key project config_dir
     local config_file
@@ -1095,15 +1296,118 @@ cmd_claude() {
         config_dir=$(sessions_get_key "$session_key" "workspace")
     fi
 
-    if ! tmux has-session -t "$session_key" 2>/dev/null; then
-        die "No tmux session '$session_key'. Run: tw start $feature"
+    # Build folder list from session worktrees, falling back to service paths
+    local workspace_file
+    workspace_file="${config_dir}/worktrees/${feature}/${feature}.code-workspace"
+
+    local folders_json
+    folders_json=$(python3 - "$SESSIONS_FILE" "$session_key" "$config_dir" "$config_file" "$feature" <<'EOF'
+import json, os, sys
+
+sessions_file, session_key, config_dir, config_file, feature = sys.argv[1:]
+
+# Try worktrees from sessions.json first
+worktrees = {}
+try:
+    data = json.load(open(sessions_file))
+    worktrees = data.get(session_key, {}).get("worktrees", {})
+except Exception:
+    pass
+
+folders = []
+if worktrees:
+    for svc, path in worktrees.items():
+        rel = os.path.relpath(path, os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        # path is absolute; make it relative to the .code-workspace file location
+        ws_dir = os.path.join(config_dir, "worktrees", feature)
+        rel_path = os.path.relpath(path, ws_dir)
+        folders.append({"path": rel_path, "name": svc})
+else:
+    # No active session — fall back to main service paths so the file is still useful
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(config_file))
+        services = cfg.get("services", {}) or {}
+        for svc, info in services.items():
+            svc_path = (info or {}).get("path", "")
+            if svc_path:
+                abs_path = os.path.join(config_dir, svc_path)
+                ws_dir = os.path.join(config_dir, "worktrees", feature)
+                rel_path = os.path.relpath(abs_path, ws_dir)
+                folders.append({"path": rel_path, "name": svc})
+    except Exception:
+        pass
+
+print(json.dumps(folders))
+EOF
+    )
+
+    if [[ -z "$folders_json" || "$folders_json" == "[]" ]]; then
+        die "No worktrees or services found for '$feature'"
+    fi
+
+    # Write .code-workspace
+    local ws_dir
+    ws_dir="${config_dir}/worktrees/${feature}"
+    mkdir -p "$ws_dir"
+
+    python3 - "$workspace_file" "$folders_json" "$project" "$feature" <<'EOF'
+import json, sys
+
+outfile, folders_json, project, feature = sys.argv[1:]
+folders = json.loads(folders_json)
+workspace = {
+    "folders": folders,
+    "settings": {
+        "git.ignoreLimitWarning": True
+    }
+}
+with open(outfile, "w") as f:
+    json.dump(workspace, f, indent="\t")
+    f.write("\n")
+print(outfile)
+EOF
+
+    log "Wrote $workspace_file"
+
+    # Open in VS Code
+    if command -v code &>/dev/null; then
+        code "$workspace_file"
+        echo "  Opened: $workspace_file"
+    else
+        echo "  Workspace file: $workspace_file"
+        echo "  (install 'code' CLI to open automatically)"
+    fi
+}
+
+cmd_claude() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw claude <feature>"
+
+    local session_key project config_dir tmux_session
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'. Run: tw start $feature"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    fi
+    tmux_session="$session_key"
+
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        die "No tmux session '$tmux_session'. Run: tw start $feature"
     fi
 
     # Create claude window if it doesn't exist
-    if ! tmux list-windows -t "$session_key" -F "#{window_name}" 2>/dev/null | grep -q "^claude$"; then
-        log "Creating claude window in $session_key"
-        tmux new-window -t "$session_key" -n claude
-        tmux send-keys -t "$session_key:claude" "cd '$config_dir' && claude" Enter
+    local claude_window="claude"
+    if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
+        log "Creating claude window in $tmux_session"
+        tmux new-window -t "$tmux_session" -n "$claude_window"
+        tmux send-keys -t "$tmux_session:$claude_window" "cd '$config_dir' && claude --dangerously-skip-permissions" Enter
     fi
 
     # Build context block for pasting as first Claude message
@@ -1160,23 +1464,34 @@ EOF
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
+    # Set terminal window title = project, tab title = feature
+    if [[ -n "${TMUX:-}" ]]; then
+        printf '\033Ptmux;\033\033]2;%s\007\033\\' "$project"
+        printf '\033Ptmux;\033\033]1;%s\007\033\\' "$feature"
+    else
+        printf '\033]2;%s\007' "$project"
+        printf '\033]1;%s\007' "$feature"
+    fi
+
     # Switch to claude window and attach
-    tmux select-window -t "$session_key:claude"
-    tmux attach-session -t "$session_key"
+    tmux select-window -t "$tmux_session:$claude_window"
+    tmux attach-session -t "$tmux_session"
 }
 
 cmd_append() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw append <feature>   (reads from stdin)"
 
-    local session_key project
+    local session_key project config_dir
     local config_file
     if config_file=$(find_config 2>/dev/null); then
         project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
         session_key="${project}-${feature}"
     else
         session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
         [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        config_dir=$(sessions_get_key "$session_key" "workspace")
     fi
 
     local bead_id
@@ -1188,7 +1503,7 @@ cmd_append() {
         if config_file2=$(find_config 2>/dev/null); then
             local proj2
             proj2=$(yaml_get "$config_file2" "project" "")
-            bead_id=$(bead_find_open "$feature ($proj2)")
+            bead_id=$(bead_find_open "$feature ($proj2)" "$config_dir")
         fi
     fi
 
@@ -1204,19 +1519,373 @@ cmd_append() {
 
     # Get current bead body and append
     local current_body
-    current_body=$(bead_get_body "$bead_id")
+    current_body=$(bead_get_body "$bead_id" "$config_dir")
 
     local new_body
     new_body="${current_body}
 ### Session — ${timestamp}
 ${appended_text}"
 
-    bd update "$bead_id" --body="$new_body" 2>/dev/null \
+    bd_run "$config_dir" update "$bead_id" --body="$new_body" 2>/dev/null \
         || die "Failed to update bead $bead_id"
-    bd sync 2>/dev/null || true
+    bd_run "$config_dir" sync 2>/dev/null || true
 
     log "Appended to bead $bead_id"
     echo "  Bead $bead_id updated. Run: bd show $bead_id"
+}
+
+# ─── Init ─────────────────────────────────────────────────────────────────────
+
+cmd_init() {
+    local force=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) shift ;;
+        esac
+    done
+
+    # Check for existing config
+    if existing=$(find_config 2>/dev/null); then
+        [[ $force -eq 0 ]] && die ".tw.yml already exists at $existing. Use --force to overwrite."
+        log "Overwriting existing config (--force)"
+    fi
+
+    # Verify claude CLI is available
+    command -v claude >/dev/null 2>&1 || die "claude CLI not found — install Claude Code first"
+
+    local project_dir="$PWD"
+    local git_remote
+    git_remote=$(git remote get-url origin 2>/dev/null || true)
+
+    log "Analyzing project with Claude agent..."
+
+    local prompt
+    prompt=$(cat <<PROMPT
+You are analyzing a software project to generate a .tw.yml config for tiddly-winks, a feature space manager.
+
+## Your task
+
+Explore the project at: $project_dir
+
+Use your tools (Glob, Read) to:
+1. Map the top-level structure — identify if this is a monorepo, a single app, or a workspace with sub-repos
+2. Read package.json, pyproject.toml, docker-compose.yml, Makefile, vite.config.*, next.config.*, .env.example — whichever exist
+3. For any top-level subdirectory that looks like a sub-repo (has its own package.json or pyproject.toml), read that too
+4. Check for database setup scripts
+
+Git remote: ${git_remote:-none}
+
+## .tw.yml schema
+
+\`\`\`yaml
+project: myproject          # short slug, lowercase, hyphens OK — derive from git remote or dir name
+
+issue_tracker:
+  type: github              # github | linear | none
+  repo: owner/repo          # only for type: github (from git remote)
+  # team: FAI               # only for type: linear
+
+worktrees:                  # ONLY include if there are multiple sub-repos (separate git repos or
+  base: worktrees           # clearly separate frontend/backend app directories)
+  branch_prefix: bentley/   # omit this whole section for single-repo projects
+
+services:
+  frontend:
+    path: my-frontend       # path relative to workspace root (use . for single-repo)
+    command: "bun run dev -- --port {port}"   # use {port} placeholder
+    port_hint: 5173
+    window: frontend        # tmux window name
+
+  backend:
+    path: my-backend
+    command: "uvicorn main:app --port {port}"
+    port_hint: 8000
+    env: "PORT={port}"      # optional: env var to inject before the command
+    window: backend
+    db_setup: "./scripts/db.sh"   # optional: run once after worktree created
+    post_setup: "npm install"     # optional: run after worktree created (e.g. install deps)
+
+proxy:
+  "": frontend              # http://{project}-{feature}.localhost → frontend port
+  api: backend              # http://{project}-{feature}-api.localhost → backend port
+
+workers:
+  ci:
+    role: ci-watcher        # always include — runs tests/lint on demand
+  keeper:
+    role: services-keeper   # always include — monitors and restarts services
+  frontend:
+    role: frontend-dev      # include only if a frontend service is present
+  backend:
+    role: backend-dev       # include only if a backend service is present
+\`\`\`
+
+## Rules
+
+- project: lowercase slug from git remote repo name or directory name
+- issue_tracker: if remote is github.com, use type github + repo; otherwise none
+- worktrees: omit entirely for single-repo or pure tooling/script projects
+- services: one entry per runnable service. Prefer bun over npm if bun.lock exists.
+  For Python prefer uvicorn/gunicorn/flask run patterns. Check the actual start scripts.
+  Omit services section entirely if there are no runnable services (e.g. pure CLI tools).
+- db_setup: only include if you see a clear setup/reset script for a local database
+- proxy: map "" to the primary web-facing service, named subdomains to APIs/other services
+  Omit if no services.
+- workers: always include ci and keeper; add frontend if any frontend service exists,
+  backend if any backend service exists. Use exactly these role names — they map to
+  role files in ~/.claude/roles/. If multiple frontends exist, use a single frontend
+  worker (one agent covers all frontend codebases).
+
+## Output
+
+Output ONLY the raw YAML. No explanation, no markdown fences, no prose before or after.
+Start your response with "project:" and end with the last YAML line. Nothing else.
+PROMPT
+)
+
+    local yaml_out
+    yaml_out=$(claude -p "$prompt" 2>/dev/null) \
+        || die "Claude agent failed — check that 'claude' CLI is authenticated"
+
+    [[ -z "$yaml_out" ]] && die "Claude returned empty output"
+
+    # Extract YAML block — strip markdown fences and any surrounding prose
+    yaml_out=$(echo "$yaml_out" | python3 -c "
+import sys, re
+text = sys.stdin.read().strip()
+# Strip markdown fences
+text = re.sub(r'^\`\`\`[a-z]*\n', '', text)
+text = re.sub(r'\n\`\`\`\s*$', '', text)
+# If prose surrounds YAML, extract just the YAML block:
+# find first line that looks like a top-level YAML key (word: ...)
+# and last line that is YAML content (key, value, or blank)
+lines = text.splitlines()
+start = None
+end = None
+yaml_line = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*:|^\s+\S|^\s*$')
+top_key = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*:')
+for i, line in enumerate(lines):
+    if start is None and top_key.match(line):
+        start = i
+    if start is not None and yaml_line.match(line):
+        end = i
+if start is not None and end is not None:
+    text = '\n'.join(lines[start:end+1]).strip()
+print(text)
+")
+
+    # Validate YAML is parseable
+    if ! echo "$yaml_out" | python3 -c "import yaml, sys; yaml.safe_load(sys.stdin)" 2>/dev/null; then
+        log "Warning: generated output may not be valid YAML"
+    fi
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Generated .tw.yml:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "$yaml_out"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    local answer
+    read -r -p "Write .tw.yml to $project_dir? [Y/n] " answer
+    answer="${answer:-Y}"
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        echo "$yaml_out" > "$project_dir/.tw.yml"
+        log "Wrote $project_dir/.tw.yml"
+        echo ""
+        echo "  Done. Review and adjust as needed, then: tw start <feature>"
+    else
+        echo "  Aborted — nothing written."
+    fi
+}
+
+nudge_dir() { echo "$HOME/.tiddly-winks/nudge/$1/$2"; }
+
+# Enqueue a nudge message for a worker.
+# Usage: nudge_enqueue <session_key> <worker> <message> [ttl_minutes]
+nudge_enqueue() {
+    local session_key="$1" worker="$2" message="$3" ttl="${4:-30}"
+    local dir ts msg_file
+    dir="$(nudge_dir "$session_key" "$worker")"
+    mkdir -p "$dir"
+    ts=$(date +%s)
+    msg_file="${dir}/${ts}-${ttl}.msg"
+    printf '%s' "$message" > "$msg_file"
+}
+
+# Drain all non-expired nudge messages for a worker. Prints content and deletes files.
+# Usage: nudge_drain <session_key> <worker>
+nudge_drain() {
+    local session_key="$1" worker="$2"
+    local dir now
+    dir="$(nudge_dir "$session_key" "$worker")"
+    [[ -d "$dir" ]] || return 0
+    now=$(date +%s)
+    for msg_file in "$dir"/*.msg; do
+        [[ -f "$msg_file" ]] || continue
+        local base ts ttl expiry
+        base=$(basename "$msg_file" .msg)
+        ts="${base%%-*}"
+        ttl="${base##*-}"
+        expiry=$((ts + ttl * 60))
+        if [[ "$now" -gt "$expiry" ]]; then
+            rm -f "$msg_file"
+            continue
+        fi
+        cat "$msg_file"
+        printf '\n'
+        rm -f "$msg_file"
+    done
+}
+
+cmd_nudge() {
+    local subcmd="${1:-}"
+    [[ -z "$subcmd" ]] && die "Usage: tw nudge <enqueue|drain> <session_key> <worker> [message]"
+    shift
+
+    case "$subcmd" in
+        enqueue)
+            local session_key="${1:-}" worker="${2:-}" message="${3:-}" ttl="${4:-30}"
+            [[ -z "$session_key" || -z "$worker" || -z "$message" ]] \
+                && die "Usage: tw nudge enqueue <session_key> <worker> <message> [ttl_minutes]"
+            nudge_enqueue "$session_key" "$worker" "$message" "$ttl"
+            echo "  Queued nudge for $worker in session $session_key"
+            ;;
+        drain)
+            local session_key="${1:-}" worker="${2:-}"
+            [[ -z "$session_key" || -z "$worker" ]] \
+                && die "Usage: tw nudge drain <session_key> <worker>"
+            nudge_drain "$session_key" "$worker"
+            ;;
+        *)
+            die "Unknown nudge subcommand: $subcmd. Use enqueue or drain."
+            ;;
+    esac
+}
+
+cmd_send() {
+    local feature="" worker="" task="" urgent=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --urgent) urgent=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$worker" ]]; then worker="$1"
+                else task="$task $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    task="${task# }"
+    [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
+        && die 'Usage: tw send <feature> <worker> "<task>" [--urgent]'
+
+    local session_key project tmux_session
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+    fi
+    tmux_session="$session_key"
+
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session' — is the feature running?"
+    tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+        | grep -qx "$worker" \
+        || die "Worker window '$worker' not found — run: tw workers $feature"
+
+    local ttl=30
+    [[ "$urgent" -eq 1 ]] && ttl=120
+
+    nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
+
+    # Send a minimal wake signal so the worker's next turn drains the queue.
+    # A bare Enter is safe — if Claude is mid-tool-call it just buffers.
+    tmux send-keys -t "$tmux_session:$worker" "" Enter
+
+    local urgency_label=""
+    [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
+    echo "  Nudge queued for $worker${urgency_label}: $task"
+    echo "  Will be injected on next prompt turn via tw-mail-check hook."
+}
+
+cmd_workers() {
+    local feature=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw workers <feature>"
+
+    # Resolve session + config
+    local session_key project config_dir tmux_session effective_config
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+        config_file="$config_dir/.tw.yml"
+        [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
+    fi
+    tmux_session="$session_key"
+
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
+
+    effective_config=$(merge_config "$config_file" "$config_dir")
+
+    local worker_pairs
+    mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+
+    [[ ${#worker_pairs[@]} -eq 0 ]] && { echo "  No workers defined in .tw.yml"; exit 0; }
+
+    local bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+    mkdir -p "$(agents_dir "$session_key")"
+    local spawned=0 skipped=0
+
+    for wpair in "${worker_pairs[@]}"; do
+        [[ -z "$wpair" ]] && continue
+        local wname="${wpair%%:*}"
+        local wrole="${wpair##*:}"
+
+        # Skip if window already exists
+        if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+                | grep -qx "$wname"; then
+            log "Worker already running: $wname (skipping)"
+            (( skipped++ )) || true
+            continue
+        fi
+
+        spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id"
+        (( spawned++ )) || true
+    done
+
+    echo ""
+    echo "  Workers: $spawned spawned, $skipped already running"
+    echo "  Attach:  tmux attach -t $tmux_session"
 }
 
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
@@ -1226,11 +1895,17 @@ usage() {
 tw — tiddly-winks: feature space manager
 
 Usage:
+  tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
   tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
   tw stop <feature> [--done]            Stop session (--done tears down worktrees + closes bead)
+  tw workers <feature>                  Spawn missing worker windows into a running session
+  tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker (injected at next turn)
+  tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
+  tw nudge drain <session> <worker>     Drain and print all queued nudges
   tw list [--project=X]                 List active sessions
   tw status <feature>                   Show ports, URLs, worktrees, bead
   tw open <feature>                     Open primary URL in browser
+  tw editor <feature>                   Generate per-feature .code-workspace and open in VS Code
   tw claude <feature>                   Open/attach to Claude orchestrator window
   tw append <feature>                   Append wrap-up text to bead (reads from stdin)
   tw prune                              Remove stale sessions after reboot
@@ -1245,14 +1920,19 @@ EOF
 
 subcommand="$1"; shift
 case "$subcommand" in
-    start)  cmd_start "$@" ;;
-    stop)   cmd_stop "$@" ;;
-    list)   cmd_list "$@" ;;
-    status) cmd_status "$@" ;;
-    open)   cmd_open "$@" ;;
-    prune)  cmd_prune "$@" ;;
-    claude) cmd_claude "$@" ;;
-    append) cmd_append "$@" ;;
+    init)    cmd_init "$@" ;;
+    start)   cmd_start "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    list)    cmd_list "$@" ;;
+    status)  cmd_status "$@" ;;
+    open)    cmd_open "$@" ;;
+    editor)  cmd_editor "$@" ;;
+    prune)   cmd_prune "$@" ;;
+    claude)  cmd_claude "$@" ;;
+    append)  cmd_append "$@" ;;
+    workers) cmd_workers "$@" ;;
+    send)    cmd_send "$@" ;;
+    nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
 esac
