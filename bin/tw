@@ -165,6 +165,38 @@ sessions_list_keys() {
     python3 -c "import json; [print(k) for k in json.load(open('$SESSIONS_FILE')).keys()]" 2>/dev/null
 }
 
+# Add a dynamic worker to session state
+sessions_add_dynamic_worker() {
+    local session_key="$1" name="$2" role="$3"
+    python3 -c "
+import json, sys
+sk, name, role = sys.argv[1], sys.argv[2], sys.argv[3]
+with open('$SESSIONS_FILE') as f:
+    d = json.load(f)
+session = d.get(sk, {})
+dw = session.get('dynamic_workers', [])
+# Don't add duplicates
+if not any(w['name'] == name for w in dw):
+    dw.append({'name': name, 'role': role})
+session['dynamic_workers'] = dw
+d[sk] = session
+with open('$SESSIONS_FILE', 'w') as f:
+    json.dump(d, f, indent=2)
+" "$session_key" "$name" "$role"
+}
+
+# Get dynamic workers as name:role pairs (same format as yaml_worker_pairs)
+sessions_get_dynamic_workers() {
+    local session_key="$1"
+    python3 -c "
+import json, sys
+d = json.load(open('$SESSIONS_FILE'))
+dw = d.get(sys.argv[1], {}).get('dynamic_workers', [])
+for w in dw:
+    print(f\"{w['name']}:{w['role']}\")
+" "$session_key" 2>/dev/null
+}
+
 # ─── Port Allocation ─────────────────────────────────────────────────────────
 
 # Track ports allocated in this run to avoid intra-session collisions
@@ -351,6 +383,11 @@ $worker_lines
 - Test runs, lint, CI checks → ci worker
 - Service health, start/stop, worker health → keeper worker
 - After dispatching, poll the worker's output file; once results appear, summarize and ask what's next
+
+## Spawning new workers
+If no existing worker fits a task, spawn one dynamically:
+  tw spawn $feature <name> <role>
+Available roles: $(ls "$HOME/.claude/roles/" 2>/dev/null | sed 's/\.md$//' | tr '\n' ', ' | sed 's/, $//')
 
 ## Worker discoveries
 Workers may file new beads when they discover bugs or work items. Periodically check:
@@ -725,6 +762,7 @@ cmd_start() {
         local branch="${branch_prefix}${feature}"
 
         for svc in "${service_names[@]}"; do
+            [[ -z "$svc" ]] && continue
             local svc_path
             svc_path=$(yaml_service_get "$effective_config" "$svc" "path" "")
             [[ -z "$svc_path" ]] && continue
@@ -781,6 +819,7 @@ cmd_start() {
     declare -A service_data
 
     for svc in "${service_names[@]}"; do
+        [[ -z "$svc" ]] && continue
         local port_hint command env_var
         port_hint=$(yaml_service_get "$effective_config" "$svc" "port_hint" "3000")
         command=$(yaml_service_get "$effective_config" "$svc" "command" "")
@@ -910,6 +949,7 @@ cmd_start() {
     local services_json="{"
     local first=1
     for svc in "${service_names[@]}"; do
+        [[ -z "$svc" ]] && continue
         [[ $first -eq 0 ]] && services_json+=","
         services_json+="\"$svc\": {\"port\": ${service_data[$svc]}}"
         first=0
@@ -1159,19 +1199,98 @@ def feature_alive(project, feature):
     r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
     return r.returncode == 0
 
-print(f"  {'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
-print(f"  {'-'*15} {'-'*25} {'-'*8} {'-'*10} {'-'*12} {'-'*20}")
+print(f"  {'#':<4}{'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
+print(f"  {'─'*3} {'─'*15} {'─'*25} {'─'*8} {'─'*10} {'─'*12} {'─'*20}")
+idx = 0
 for key, s in data.items():
     proj = s.get('project', '')
     feat = s.get('feature', '')
     if filter_proj and proj != filter_proj:
         continue
+    idx += 1
     bead = s.get('bead_id', '')
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
     status = 'alive' if feature_alive(proj, feat) else 'dead'
-    print(f"  {proj:<15} {feat:<25} {status:<8} {mode:<10} {bead:<12} {started}")
+    print(f"  {idx:<4}{proj:<15} {feat:<25} {status:<8} {mode:<10} {bead:<12} {started}")
 EOF
+}
+
+cmd_attach() {
+    local target="" claude_flag=0 window=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --claude) claude_flag=1; shift ;;
+            --window=*) window="${1#--window=}"; shift ;;
+            --window) window="$2"; shift 2 ;;
+            *) target="$1"; shift ;;
+        esac
+    done
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    local session_key
+    if [[ -z "$target" ]]; then
+        # Auto-attach if exactly one alive session
+        session_key=$(python3 - "$sessions_data" <<'PYEOF'
+import json, sys, subprocess
+data = json.loads(sys.argv[1])
+alive = []
+for key, s in data.items():
+    sk = f"{s['project']}-{s['feature']}"
+    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    if r.returncode == 0:
+        alive.append(sk)
+if len(alive) == 1:
+    print(alive[0])
+PYEOF
+        )
+        if [[ -z "$session_key" ]]; then
+            echo "Multiple sessions — specify an index or name:"
+            echo ""
+            cmd_list
+            echo ""
+            echo "Usage: tw attach <N> or tw attach <project-feature>"
+            return 1
+        fi
+    elif [[ "$target" =~ ^[0-9]+$ ]]; then
+        # Index-based: pick Nth alive session (1-based)
+        session_key=$(python3 - "$sessions_data" "$target" <<'PYEOF'
+import json, sys, subprocess
+data = json.loads(sys.argv[1])
+idx = int(sys.argv[2])
+alive = []
+for key, s in data.items():
+    sk = f"{s['project']}-{s['feature']}"
+    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    if r.returncode == 0:
+        alive.append(sk)
+if 1 <= idx <= len(alive):
+    print(alive[idx - 1])
+PYEOF
+        )
+        [[ -z "$session_key" ]] && die "No session at index $target (have $(sessions_list_keys | wc -l | tr -d ' ') sessions)"
+    else
+        # Substring match against session keys
+        session_key=$(sessions_list_keys | grep -F "$target" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session matching '$target'"
+    fi
+
+    local tmux_session="$session_key"
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "tmux session '$tmux_session' is dead. Run: tw prune"
+
+    # Select target window
+    if [[ $claude_flag -eq 1 ]]; then
+        tmux select-window -t "$tmux_session:claude" 2>/dev/null \
+            || log "No claude window — attaching to default"
+    elif [[ -n "$window" ]]; then
+        tmux select-window -t "$tmux_session:$window" 2>/dev/null \
+            || log "No window '$window' — attaching to default"
+    fi
+
+    exec tmux attach-session -t "$tmux_session"
 }
 
 cmd_status() {
@@ -2141,6 +2260,10 @@ cmd_patrol() {
 
     local worker_pairs
     mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+    # Merge dynamic workers from session state
+    local dyn_pairs
+    mapfile -t dyn_pairs < <(sessions_get_dynamic_workers "$session_key")
+    worker_pairs+=("${dyn_pairs[@]}")
 
     local agents_path
     agents_path="$(agents_dir "$session_key")"
@@ -2346,6 +2469,75 @@ ${plugin_body}" 60
     echo ""
 }
 
+cmd_spawn() {
+    local feature="" name="" role=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$name" ]]; then name="$1"
+                elif [[ -z "$role" ]]; then role="$1"
+                else die "Too many arguments"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$feature" || -z "$name" || -z "$role" ]] \
+        && die "Usage: tw spawn <feature> <name> <role>"
+
+    # Resolve session + config
+    local session_key project config_dir tmux_session
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    fi
+    tmux_session="$session_key"
+
+    # Validate session is running
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
+
+    # Check no existing window with that name
+    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$name"; then
+        die "Worker window '$name' already exists in session '$tmux_session'"
+    fi
+
+    # Validate role file exists
+    local role_file="$HOME/.claude/roles/${role}.md"
+    [[ -f "$role_file" ]] || die "Role file not found: $role_file"
+
+    # Get bead_id from session state
+    local bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+    # Create worker identity bead
+    mkdir -p "$(agents_dir "$session_key")"
+    local worker_bead_id
+    worker_bead_id=$(worker_bead_find_or_create "$name" "$project" "$config_dir")
+
+    # Spawn the worker
+    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$name" "$role" "$bead_id" "$worker_bead_id"
+
+    # Persist to session state
+    sessions_add_dynamic_worker "$session_key" "$name" "$role"
+
+    echo ""
+    echo "  Spawned dynamic worker: $name (role: $role)"
+    echo "  Send work:  tw send $feature $name \"<task>\""
+    echo "  Health:     tw workers $feature --health"
+    echo ""
+}
+
 cmd_workers() {
     local feature="" health_flag=0 respawn_flag=0
 
@@ -2389,6 +2581,10 @@ cmd_workers() {
 
     local worker_pairs
     mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+    # Merge dynamic workers from session state
+    local dyn_pairs
+    mapfile -t dyn_pairs < <(sessions_get_dynamic_workers "$session_key")
+    worker_pairs+=("${dyn_pairs[@]}")
 
     [[ ${#worker_pairs[@]} -eq 0 ]] && { echo "  No workers defined in .tw.yml"; exit 0; }
 
@@ -2488,9 +2684,11 @@ Usage:
   tw workers <feature> --respawn        Respawn dead or missing workers with identity intact
   tw handoff <feature> <worker>        Cycle a worker's session (save context, restart fresh)
   tw patrol <feature>                  Health check: workers, services, stuck detection, auto-respawn
+  tw spawn <feature> <name> <role>   Dynamically spawn a new worker into a running session
   tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker (injected at next turn)
   tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
   tw nudge drain <session> <worker>     Drain and print all queued nudges
+  tw attach [<N>|<name>] [--claude]     Attach to a session's tmux
   tw list [--project=X]                 List active sessions
   tw status <feature>                   Show ports, URLs, worktrees, bead
   tw open <feature>                     Open primary URL in browser
@@ -2519,8 +2717,10 @@ case "$subcommand" in
     prune)   cmd_prune "$@" ;;
     claude)  cmd_claude "$@" ;;
     append)  cmd_append "$@" ;;
+    spawn)   cmd_spawn "$@" ;;
     workers) cmd_workers "$@" ;;
     handoff) cmd_handoff "$@" ;;
+    attach)  cmd_attach "$@" ;;
     patrol)  cmd_patrol "$@" ;;
     send)    cmd_send "$@" ;;
     nudge)   cmd_nudge "$@" ;;
