@@ -1171,12 +1171,13 @@ EOF
 }
 
 cmd_list() {
-    local filter_project=""
+    local filter_project="" json_flag=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project=*) filter_project="${1#--project=}"; shift ;;
             --project) filter_project="$2"; shift 2 ;;
+            --json) json_flag=1; shift ;;
             *) shift ;;
         esac
     done
@@ -1184,14 +1185,18 @@ cmd_list() {
     local sessions_data
     sessions_data=$(sessions_read)
 
-    python3 - "$sessions_data" "$filter_project" <<'EOF'
+    python3 - "$sessions_data" "$filter_project" "$json_flag" <<'EOF'
 import json, sys, subprocess
 
 data = json.loads(sys.argv[1])
 filter_proj = sys.argv[2]
+json_flag = sys.argv[3] == "1"
 
 if not data:
-    print("  No active sessions.")
+    if json_flag:
+        print("[]")
+    else:
+        print("  No active sessions.")
     sys.exit(0)
 
 def feature_alive(project, feature):
@@ -1199,8 +1204,7 @@ def feature_alive(project, feature):
     r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
     return r.returncode == 0
 
-print(f"  {'#':<4}{'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
-print(f"  {'─'*3} {'─'*15} {'─'*25} {'─'*8} {'─'*10} {'─'*12} {'─'*20}")
+rows = []
 idx = 0
 for key, s in data.items():
     proj = s.get('project', '')
@@ -1212,7 +1216,24 @@ for key, s in data.items():
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
     status = 'alive' if feature_alive(proj, feat) else 'dead'
-    print(f"  {idx:<4}{proj:<15} {feat:<25} {status:<8} {mode:<10} {bead:<12} {started}")
+    rows.append({
+        "index": idx,
+        "project": proj,
+        "feature": feat,
+        "status": status,
+        "mode": mode,
+        "bead": bead,
+        "started": started,
+        "session_key": key,
+    })
+
+if json_flag:
+    print(json.dumps(rows, indent=2))
+else:
+    print(f"  {'#':<4}{'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
+    print(f"  {'─'*3} {'─'*15} {'─'*25} {'─'*8} {'─'*10} {'─'*12} {'─'*20}")
+    for r in rows:
+        print(f"  {r['index']:<4}{r['project']:<15} {r['feature']:<25} {r['status']:<8} {r['mode']:<10} {r['bead']:<12} {r['started']}")
 EOF
 }
 
@@ -1294,8 +1315,17 @@ PYEOF
 }
 
 cmd_status() {
-    local feature="${1:-}"
-    [[ -z "$feature" ]] && die "Usage: tw status <feature>"
+    local feature="" json_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw status <feature> [--json]"
 
     local session_key project
     local config_file
@@ -1310,14 +1340,18 @@ cmd_status() {
     local sessions_data
     sessions_data=$(sessions_read)
 
-    python3 - "$sessions_data" "$session_key" <<'EOF'
+    python3 - "$sessions_data" "$session_key" "$json_flag" <<'EOF'
 import json, sys, subprocess
 data = json.loads(sys.argv[1])
 key = sys.argv[2]
+json_flag = sys.argv[3] == "1"
 
 s = data.get(key)
 if not s:
-    print(f"  No session found: {key}")
+    if json_flag:
+        print(json.dumps({"error": f"No session found: {key}"}))
+    else:
+        print(f"  No session found: {key}")
     sys.exit(1)
 
 project_name = s.get('project', '')
@@ -1329,41 +1363,51 @@ try:
 except Exception:
     tmux_alive = False
 
-print(f"\n  Feature:   {feature_name} ({project_name})")
-print(f"  tmux:      {'alive — attach: tmux attach -t ' + session_key if tmux_alive else 'DEAD (run: tw prune)'}")
-print(f"  Mode:      {s.get('mode', '')}")
-print(f"  Branch:    {s.get('branch', '')}")
-print(f"  Started:   {s.get('started', '')}")
-print(f"  Workspace: {s.get('workspace', '')}")
-print(f"  Bead:      {s.get('bead_id', 'none')}")
-db = s.get('db_name', '')
-if db:
-    print(f"  DB:        {db}")
-
-worktrees = s.get('worktrees', {})
-if worktrees:
-    print()
-    print("  Worktrees:")
-    for svc, path in worktrees.items():
-        print(f"    {svc:<20} {path}")
-
-print()
-print("  Services:")
-for svc, info in s.get('services', {}).items():
-    print(f"    {svc:<20} port {info.get('port', '?')}")
-print()
-print("  URLs:")
+# Build URLs map
+urls = {}
 for subdomain, svc_name in s.get('proxy_map', {}).items():
-    project = s.get('project', '')
-    feature = s.get('feature', '')
     svc = s.get('services', {}).get(svc_name, {})
     port = svc.get('port', '?')
     if subdomain == '':
-        host = f'http://{project}-{feature}.localhost'
+        host = f'http://{project_name}-{feature_name}.localhost'
     else:
-        host = f'http://{project}-{feature}-{subdomain}.localhost'
-    print(f"    {svc_name:<20} {host}  (→ :{port})")
-print()
+        host = f'http://{project_name}-{feature_name}-{subdomain}.localhost'
+    urls[svc_name] = {"url": host, "port": port}
+
+if json_flag:
+    out = dict(s)
+    out['session_key'] = key
+    out['status'] = 'alive' if tmux_alive else 'dead'
+    out['urls'] = urls
+    print(json.dumps(out, indent=2))
+else:
+    print(f"\n  Feature:   {feature_name} ({project_name})")
+    print(f"  tmux:      {'alive — attach: tmux attach -t ' + session_key if tmux_alive else 'DEAD (run: tw prune)'}")
+    print(f"  Mode:      {s.get('mode', '')}")
+    print(f"  Branch:    {s.get('branch', '')}")
+    print(f"  Started:   {s.get('started', '')}")
+    print(f"  Workspace: {s.get('workspace', '')}")
+    print(f"  Bead:      {s.get('bead_id', 'none')}")
+    db = s.get('db_name', '')
+    if db:
+        print(f"  DB:        {db}")
+
+    worktrees = s.get('worktrees', {})
+    if worktrees:
+        print()
+        print("  Worktrees:")
+        for svc, path in worktrees.items():
+            print(f"    {svc:<20} {path}")
+
+    print()
+    print("  Services:")
+    for svc, info in s.get('services', {}).items():
+        print(f"    {svc:<20} port {info.get('port', '?')}")
+    print()
+    print("  URLs:")
+    for svc_name, u in urls.items():
+        print(f"    {svc_name:<20} {u['url']}  (→ :{u['port']})")
+    print()
 EOF
 }
 
@@ -2541,12 +2585,13 @@ cmd_spawn() {
 }
 
 cmd_workers() {
-    local feature="" health_flag=0 respawn_flag=0
+    local feature="" health_flag=0 respawn_flag=0 json_flag=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --health) health_flag=1; shift ;;
             --respawn) respawn_flag=1; shift ;;
+            --json) json_flag=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
@@ -2597,9 +2642,8 @@ cmd_workers() {
 
     # --health: report worker status
     if [[ $health_flag -eq 1 ]]; then
-        echo ""
-        printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "ROLE"
-        printf "  %-20s %-12s %s\n" "--------------------" "------------" "--------------------"
+        # Collect worker status lines as "name:role:status"
+        local health_lines=()
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
@@ -2611,9 +2655,34 @@ cmd_workers() {
                     status="dead"
                 fi
             fi
-            printf "  %-20s %-12s %s\n" "$wname" "$status" "$wrole"
+            health_lines+=("${wname}:${wrole}:${status}")
         done
-        echo ""
+
+        if [[ $json_flag -eq 1 ]]; then
+            printf '%s\n' "${health_lines[@]}" | python3 -c "
+import json, sys
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    parts = line.split(':', 2)
+    rows.append({'name': parts[0], 'role': parts[1], 'status': parts[2], 'window': parts[0]})
+print(json.dumps(rows, indent=2))
+"
+        else
+            echo ""
+            printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "ROLE"
+            printf "  %-20s %-12s %s\n" "--------------------" "------------" "--------------------"
+            for hline in "${health_lines[@]}"; do
+                local wname="${hline%%:*}"
+                local rest="${hline#*:}"
+                local wrole="${rest%%:*}"
+                local status="${rest##*:}"
+                printf "  %-20s %-12s %s\n" "$wname" "$status" "$wrole"
+            done
+            echo ""
+        fi
         return 0
     fi
 
@@ -2671,33 +2740,465 @@ cmd_workers() {
     echo "  Attach:  tmux attach -t $tmux_session"
 }
 
+
+cmd_prime() {
+    # Dynamic AI context — always in sync with the CLI
+    # Intended to be injected via hooks at SessionStart and PreCompact
+
+    # Detect current session context
+    local current_session="" current_project="" current_feature="" current_bead=""
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        current_project=$(yaml_get "$config_file" "project" "")
+    fi
+
+    # Try to find active session from worktree path
+    if [[ -n "$current_project" ]]; then
+        local cwd_branch
+        cwd_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+        if [[ "$cwd_branch" == */* ]]; then
+            local candidate_feature="${cwd_branch##*/}"
+            local candidate_key="${current_project}-${candidate_feature}"
+            if sessions_list_keys | grep -qF "$candidate_key"; then
+                current_session="$candidate_key"
+                current_feature="$candidate_feature"
+                current_bead=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+s = d.get('$candidate_key', {})
+print(s.get('bead_id', ''))
+" 2>/dev/null || true)
+            fi
+        fi
+    fi
+
+    cat <<'PRIME'
+# tiddly-winks — Feature Space Manager
+
+> Run `tw prime` after compaction, clear, or new session to restore context.
+
+## Core Rules
+- **URLs**: Always use `http://{project}-{feature}.localhost`, NEVER raw `localhost:PORT`
+- **Browser**: Chrome/Firefox only — Safari does NOT resolve `*.localhost`
+- **Services**: Never start services manually — tw manages them via tmux
+- **Beads**: Use `bd` for all issue tracking. `tw start` creates beads automatically.
+- **Workers**: Don't run tasks yourself if a worker exists for it — use `tw send`
+- **Context**: Run `/pass` when context gets large — it saves to bead and opens fresh window
+
+## Essential Commands
+
+### Session Management
+```bash
+tw list                          # Numbered list of all sessions
+tw attach <N>                    # Attach by index from tw list
+tw attach <name> --claude        # Jump to Claude window
+tw status <feature>              # Ports, URLs, worktrees, bead, workers
+tw open <feature>                # Open primary URL in browser
+```
+
+### Feature Lifecycle
+```bash
+tw start <feature>               # Create feature space (branch, worktrees, services, bead)
+tw stop <feature>                # Pause session (bead stays open)
+tw stop <feature> --done         # Tear down everything, close bead
+tw prune                         # Clean up dead sessions after reboot
+```
+
+### Worker Management
+```bash
+tw workers <feature> --health    # Check worker liveness
+tw workers <feature> --respawn   # Respawn dead/missing workers
+tw send <feature> <worker> "task description"  # Queue task for a worker
+tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
+tw patrol <feature>              # Full health check + auto-respawn + plugins
+tw spawn <feature> <name> <role> # Add a worker to a running session
+```
+
+### Context Recovery
+```bash
+/pass                            # Preferred: auto-save + fresh window
+/wrap-up                         # Manual: copy output, then:
+tw append <feature>              # Paste wrap-up to bead (Ctrl-D to end)
+tw claude <feature>              # Start new Claude with context block
+bd show <bead-id>                # Load full session history
+```
+
+## Anti-patterns — DO NOT
+- Do NOT use `localhost:PORT` in URLs, docs, or beads — always use proxy URLs
+- Do NOT open *.localhost URLs in Safari — they will not resolve
+- Do NOT start services manually (npm run dev, etc.) — tw manages service lifecycle
+- Do NOT create markdown TODO files — use `bd create` for task tracking
+- Do NOT do worker tasks yourself — delegate via `tw send <feature> <worker> "task"`
+- Do NOT ignore context loss — run `/pass` proactively when context grows large
+- Do NOT use `bd edit` — it opens $EDITOR which blocks agents
+
+## Session Naming
+- tmux sessions: `{project}-{feature}`
+- URLs: `http://{project}-{feature}.localhost` (primary), `-api.localhost` (backend)
+- Branches: `bentley/{feature}`
+- Beads: `{feature} ({project})`
+PRIME
+
+    # Append dynamic context if we detected a session
+    if [[ -n "$current_session" ]]; then
+        echo ""
+        echo "## Current Session"
+        echo "- **Session**: $current_session"
+        echo "- **Project**: $current_project"
+        echo "- **Feature**: $current_feature"
+        [[ -n "$current_bead" ]] && echo "- **Bead**: $current_bead — run \`bd show $current_bead\` for full context"
+        echo "- **Status**: run \`tw status $current_feature\` for ports/URLs/workers"
+    fi
+
+    # List all active sessions
+    local sessions_data
+    sessions_data=$(sessions_read)
+    local session_count
+    session_count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$sessions_data" 2>/dev/null || echo 0)
+    if [[ "$session_count" -gt 0 ]]; then
+        echo ""
+        echo "## Active Sessions ($session_count)"
+        echo '```'
+        cmd_list 2>/dev/null
+        echo '```'
+    fi
+}
+
+cmd_onboard() {
+    # Generate a minimal AGENTS.md / CLAUDE.md snippet pointing to tw prime
+    cat <<'ONBOARD'
+### tiddly-winks (tw) — Feature Space Manager
+
+For full workflow context, run:
+```bash
+tw prime
+```
+
+Quick reference:
+```bash
+tw list                          # See active sessions
+tw attach <N>                    # Attach by index
+tw status <feature>              # Session details
+tw start <feature>               # New feature space
+tw stop <feature> [--done]       # Stop [and tear down]
+```
+
+> `tw prime` is auto-injected via hooks at session start. Run it manually
+> after compaction or context loss.
+ONBOARD
+}
+
+# ─── Doctor ───────────────────────────────────────────────────────────────────
+
+cmd_doctor() {
+    local errors=0 warnings=0
+
+    _ok()   { echo "  ✓ $*"; }
+    _warn() { echo "  ⚠ $*"; (( warnings++ )) || true; }
+    _fail() { echo "  ✗ $*"; (( errors++ )) || true; }
+    _hint() { echo "    → $*"; }
+
+    echo "tw doctor — checking environment"
+    echo
+
+    # 1. tmux
+    if command -v tmux &>/dev/null; then
+        local tmux_ver
+        tmux_ver=$(tmux -V 2>/dev/null | awk '{print $2}')
+        if tmux list-sessions &>/dev/null; then
+            _ok "tmux installed ($tmux_ver), server running"
+        else
+            _warn "tmux installed ($tmux_ver) but no server running"
+            _hint "A server starts automatically with: tw start <feature>"
+        fi
+    else
+        _fail "tmux not installed"
+        _hint "Install with: brew install tmux"
+    fi
+
+    # 2. Caddy daemon
+    if pgrep -qx caddy 2>/dev/null; then
+        _ok "Caddy daemon running"
+    else
+        _fail "Caddy daemon not running"
+        _hint "Start with: sudo launchctl kickstart -k system/com.bentley.tw-caddy"
+    fi
+
+    # 2b. Caddy admin API
+    if curl -sf "$CADDY_ADMIN/config/" &>/dev/null; then
+        _ok "Caddy admin API responding at $CADDY_ADMIN"
+    else
+        _warn "Caddy admin API not responding at $CADDY_ADMIN"
+        _hint "Check: curl -s $CADDY_ADMIN/config/"
+    fi
+
+    # 3. Python 3 + PyYAML
+    if command -v python3 &>/dev/null; then
+        local py_ver
+        py_ver=$(python3 --version 2>&1 | awk '{print $2}')
+        if python3 -c "import yaml" 2>/dev/null; then
+            _ok "Python 3 ($py_ver) with PyYAML"
+        else
+            _fail "Python 3 ($py_ver) found but PyYAML missing"
+            _hint "Install with: pip3 install pyyaml"
+        fi
+    else
+        _fail "Python 3 not installed"
+        _hint "Install with: brew install python3"
+    fi
+
+    # 4. bd CLI (beads)
+    if command -v bd &>/dev/null; then
+        _ok "bd CLI installed"
+    else
+        _fail "bd CLI (beads) not installed"
+        _hint "See beads installation docs"
+    fi
+
+    # 5. Sessions integrity
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        local session_count dead_count
+        session_count=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$SESSIONS_FILE'))
+    print(len(d))
+except Exception:
+    print('INVALID')
+" 2>/dev/null)
+
+        if [[ "$session_count" == "INVALID" ]]; then
+            _fail "sessions.json exists but is not valid JSON"
+            _hint "Inspect: cat $SESSIONS_FILE"
+        else
+            _ok "sessions.json valid ($session_count sessions)"
+
+            # Check for dead sessions (tmux session gone)
+            if [[ "$session_count" -gt 0 ]]; then
+                dead_count=$(python3 -c "
+import json, subprocess, sys
+d = json.load(open('$SESSIONS_FILE'))
+dead = 0
+for key, s in d.items():
+    sk = f\"{s.get('project','')}-{s.get('feature','')}\"
+    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    if r.returncode != 0:
+        dead += 1
+print(dead)
+" 2>/dev/null || echo 0)
+                if [[ "$dead_count" -gt 0 ]]; then
+                    _warn "$dead_count dead session(s) found"
+                    _hint "Run: tw prune"
+                fi
+            fi
+        fi
+    else
+        _warn "sessions.json does not exist (will be created on first tw start)"
+    fi
+
+    # 6. Hooks
+    local hooks_dir="$HOME/.claude/hooks"
+    local hook_names=("tw-prime.sh" "tw-mail-check.sh" "tw-notify.sh")
+    for hook in "${hook_names[@]}"; do
+        if [[ -f "$hooks_dir/$hook" ]]; then
+            _ok "Hook present: $hook"
+        else
+            _fail "Hook missing: $hook"
+            _hint "Install with: tw setup claude"
+        fi
+    done
+
+    # 7. Roles directory
+    local roles_dir="$HOME/.claude/roles"
+    if [[ -d "$roles_dir" ]]; then
+        local role_count
+        role_count=$(find "$roles_dir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
+        _ok "Roles directory exists ($role_count role files)"
+    else
+        _fail "Roles directory missing: $roles_dir"
+        _hint "Create with: mkdir -p $roles_dir"
+    fi
+
+    # 8. Caddyfile
+    if [[ -f "$CADDYFILE" ]]; then
+        _ok "Caddyfile exists"
+    else
+        _warn "Caddyfile missing: $CADDYFILE"
+        _hint "Will be generated on first tw start"
+    fi
+
+    # 9. PATH check
+    if echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+        _ok "~/.local/bin is in PATH"
+    else
+        _fail "~/.local/bin is not in PATH"
+        _hint "Add to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+
+    # Summary
+    echo
+    if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
+        echo "All checks passed."
+    else
+        [[ $errors -gt 0 ]] && echo "$errors error(s) found."
+        [[ $warnings -gt 0 ]] && echo "$warnings warning(s) found."
+    fi
+
+    return $errors
+}
+
+
+cmd_setup() {
+    local target="${1:-}"
+    [[ -z "$target" ]] && die "Usage: tw setup claude"
+
+    case "$target" in
+        claude) setup_claude ;;
+        *) die "Unknown setup target: $target. Available: claude" ;;
+    esac
+}
+
+setup_claude() {
+    local hooks_dir="$HOME/.claude/hooks"
+    local settings_file="$HOME/.claude/settings.json"
+    mkdir -p "$hooks_dir"
+
+    # 1. Create/update tw-context.sh — injects tw prime for non-worker sessions
+    cat > "$hooks_dir/tw-context.sh" << 'HOOKEOF'
+#!/usr/bin/env bash
+# tw-context: SessionStart hook — inject tw prime for any session in a tw project.
+# Skips if already in a tw worker session (tw-prime.sh handles those).
+
+# Skip if this is a worker session (tw-prime.sh handles it)
+[[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]] && exit 0
+
+# Check if we are in a tw-managed project
+config_file=""
+dir="$PWD"
+while [[ "$dir" != "/" ]]; do
+    [[ -f "$dir/.tw.yml" ]] && { config_file="$dir/.tw.yml"; break; }
+    [[ -f "$dir/.devenv.yml" ]] && { config_file="$dir/.devenv.yml"; break; }
+    dir="$(dirname "$dir")"
+done
+[[ -z "$config_file" ]] && exit 0
+
+tw prime 2>/dev/null
+HOOKEOF
+    chmod +x "$hooks_dir/tw-context.sh"
+    log "Wrote $hooks_dir/tw-context.sh"
+
+    # 2. Create/update tw-compact.sh — re-injects tw prime before compaction
+    cat > "$hooks_dir/tw-compact.sh" << 'HOOKEOF'
+#!/usr/bin/env bash
+# tw-compact: PreCompact hook — re-inject tw prime so context survives compaction.
+
+# For workers, re-inject their specialized context
+if [[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]]; then
+    ~/.claude/hooks/tw-prime.sh 2>/dev/null
+    exit 0
+fi
+
+# For non-workers in a tw project, re-inject tw prime
+config_file=""
+dir="$PWD"
+while [[ "$dir" != "/" ]]; do
+    [[ -f "$dir/.tw.yml" ]] && { config_file="$dir/.tw.yml"; break; }
+    [[ -f "$dir/.devenv.yml" ]] && { config_file="$dir/.devenv.yml"; break; }
+    dir="$(dirname "$dir")"
+done
+[[ -z "$config_file" ]] && exit 0
+
+tw prime 2>/dev/null
+HOOKEOF
+    chmod +x "$hooks_dir/tw-compact.sh"
+    log "Wrote $hooks_dir/tw-compact.sh"
+
+    # 3. Register hooks in settings.json
+    python3 - "$settings_file" "$hooks_dir" << 'PYEOF'
+import json, sys, os
+
+settings_file = sys.argv[1]
+hooks_dir = sys.argv[2]
+
+try:
+    with open(settings_file) as f:
+        settings = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    settings = {}
+
+hooks = settings.setdefault("hooks", {})
+
+def ensure_hook(event, command, timeout=30, status_msg=None):
+    entries = hooks.setdefault(event, [])
+    for entry in entries:
+        for h in entry.get("hooks", []):
+            if h.get("command", "").rstrip() == command:
+                return False
+    hook_def = {"type": "command", "command": command, "timeout": timeout}
+    if status_msg:
+        hook_def["statusMessage"] = status_msg
+    entries.append({"hooks": [hook_def]})
+    return True
+
+changes = []
+
+if ensure_hook("SessionStart",
+               hooks_dir + "/tw-context.sh", 30,
+               "Loading tw project context..."):
+    changes.append("SessionStart: tw-context.sh")
+
+if ensure_hook("PreCompact",
+               hooks_dir + "/tw-compact.sh", 30,
+               "Refreshing tw context..."):
+    changes.append("PreCompact: tw-compact.sh")
+
+if changes:
+    with open(settings_file, 'w') as f:
+        json.dump(settings, f, indent=2)
+    for c in changes:
+        print("  Registered hook: " + c)
+else:
+    print("  Hooks already registered")
+PYEOF
+
+    echo ""
+    echo "  Done. tw prime will now auto-inject at session start and before compaction."
+    echo "  Test with: claude (in a directory with .tw.yml)"
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 usage() {
     cat <<EOF
 tw — tiddly-winks: feature space manager
 
-Usage:
+Commands:
   tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
   tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
   tw stop <feature> [--done]            Stop session (--done tears down worktrees + closes bead)
+  tw list [--project=X] [--json]         List active sessions
+  tw attach [<N>|<name>] [--claude]     Attach to a session's tmux
+
+Agent commands (used by Claude workers):
   tw workers <feature>                  Spawn missing worker windows into a running session
-  tw workers <feature> --health         Check worker window liveness (alive/dead/missing)
+  tw workers <feature> --health [--json] Check worker window liveness (alive/dead/missing)
   tw workers <feature> --respawn        Respawn dead or missing workers with identity intact
-  tw handoff <feature> <worker>        Cycle a worker's session (save context, restart fresh)
-  tw patrol <feature>                  Health check: workers, services, stuck detection, auto-respawn
-  tw spawn <feature> <name> <role>   Dynamically spawn a new worker into a running session
-  tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker (injected at next turn)
+  tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
+  tw patrol <feature>                   Health check: workers, services, stuck detection, auto-respawn
+  tw spawn <feature> <name> <role>      Dynamically spawn a new worker into a running session
+  tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker
   tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
   tw nudge drain <session> <worker>     Drain and print all queued nudges
-  tw attach [<N>|<name>] [--claude]     Attach to a session's tmux
-  tw list [--project=X]                 List active sessions
-  tw status <feature>                   Show ports, URLs, worktrees, bead
+  tw status <feature> [--json]           Show ports, URLs, worktrees, bead
   tw open <feature>                     Open primary URL in browser
   tw editor <feature>                   Generate per-feature .code-workspace and open in VS Code
   tw claude <feature>                   Open/attach to Claude orchestrator window
   tw append <feature>                   Append wrap-up text to bead (reads from stdin)
+  tw setup claude                       Install hooks for auto-injecting tw prime
+  tw prime                              AI workflow context (inject via hooks)
+  tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
+  tw doctor                              Run health checks on tw environment
 
 Config file: .tw.yml (also accepts .devenv.yml for compatibility)
 URLs: http://{project}-{feature}.localhost (Chrome/Firefox only — not Safari)
@@ -2725,6 +3226,10 @@ case "$subcommand" in
     attach)  cmd_attach "$@" ;;
     patrol)  cmd_patrol "$@" ;;
     send)    cmd_send "$@" ;;
+    setup)   cmd_setup "$@" ;;
+    prime)   cmd_prime ;;
+    onboard) cmd_onboard ;;
+    doctor)  cmd_doctor "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
