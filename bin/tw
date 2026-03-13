@@ -1889,9 +1889,11 @@ workers:
 - proxy: map "" to the primary web-facing service, named subdomains to APIs/other services
   Omit if no services.
 - workers: always include ci and keeper; add frontend if any frontend service exists,
-  backend if any backend service exists. Use exactly these role names — they map to
-  role files in ~/.claude/roles/. If multiple frontends exist, use a single frontend
-  worker (one agent covers all frontend codebases).
+  backend if any backend service exists. For projects with no services (CLI tools, scripts,
+  libraries), include a generic dev worker with role: frontend-dev instead.
+  Use exactly these role names — they map to role files in ~/.claude/roles/.
+  If multiple frontends exist, use a single frontend worker (one agent covers all
+  frontend codebases).
 
 ## Output
 
