@@ -3,3 +3,9 @@ project: tiddly-winks
 issue_tracker:
   type: github
   repo: bentleycook/tiddly-winks
+
+workers:
+  ci:
+    role: ci-watcher
+  keeper:
+    role: services-keeper
