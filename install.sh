@@ -90,8 +90,20 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
 fi
 
 # ─── Caddy LaunchDaemon plist ─────────────────────────────────────────────────
-PLIST_DEST="$TW_DIR/com.bentley.tw-caddy.plist"
-CADDY_BIN="${CADDY_BIN:-/opt/homebrew/bin/caddy}"
+PLIST_DEST="$TW_DIR/com.tw.caddy.plist"
+# Find Caddy binary: env override > PATH > common locations
+if [[ -n "${CADDY_BIN:-}" ]]; then
+    : # user override via environment
+elif command -v caddy &>/dev/null; then
+    CADDY_BIN="$(command -v caddy)"
+elif [[ -x /opt/homebrew/bin/caddy ]]; then
+    CADDY_BIN="/opt/homebrew/bin/caddy"
+elif [[ -x /usr/local/bin/caddy ]]; then
+    CADDY_BIN="/usr/local/bin/caddy"
+else
+    warn "Caddy not found. Install it: brew install caddy"
+    CADDY_BIN="/opt/homebrew/bin/caddy"  # placeholder
+fi
 
 cat > "$PLIST_DEST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,7 +111,7 @@ cat > "$PLIST_DEST" <<EOF
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.bentley.tw-caddy</string>
+    <string>com.tw.caddy</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -130,20 +142,22 @@ cat > "$PLIST_DEST" <<EOF
 EOF
 ok "Generated plist: $PLIST_DEST"
 
-# Check if old devenv caddy plist is loaded
-if sudo launchctl list 2>/dev/null | grep -q "com.bentley.devenv-caddy"; then
-    warn "Old com.bentley.devenv-caddy plist is loaded"
-    warn "Run: sudo launchctl unload /Library/LaunchDaemons/com.bentley.devenv-caddy.plist"
-fi
+# Check if old plist variants are loaded
+for old_label in com.bentley.devenv-caddy com.bentley.tw-caddy; do
+    if sudo launchctl list 2>/dev/null | grep -q "$old_label"; then
+        warn "Old $old_label plist is loaded"
+        warn "Run: sudo launchctl unload /Library/LaunchDaemons/${old_label}.plist"
+    fi
+done
 
 # ─── Next steps ──────────────────────────────────────────────────────────────
 echo ""
 echo "Installation complete. To finish setup:"
 echo ""
-if ! sudo launchctl list 2>/dev/null | grep -q "com.bentley.tw-caddy"; then
+if ! sudo launchctl list 2>/dev/null | grep -q "com.tw.caddy"; then
     echo "  1. Install Caddy LaunchDaemon (runs Caddy as root for port 80):"
     echo "     sudo cp $PLIST_DEST /Library/LaunchDaemons/"
-    echo "     sudo launchctl load /Library/LaunchDaemons/com.bentley.tw-caddy.plist"
+    echo "     sudo launchctl load /Library/LaunchDaemons/com.tw.caddy.plist"
     echo ""
     echo "  2. Verify Caddy is running:"
     echo "     curl -s http://localhost:2019/config/"
@@ -155,9 +169,9 @@ else
     ok "Caddy LaunchDaemon already loaded"
     echo ""
     echo "  Update Caddy config (if plist changed):"
-    echo "    sudo launchctl unload /Library/LaunchDaemons/com.bentley.tw-caddy.plist"
+    echo "    sudo launchctl unload /Library/LaunchDaemons/com.tw.caddy.plist"
     echo "    sudo cp $PLIST_DEST /Library/LaunchDaemons/"
-    echo "    sudo launchctl load /Library/LaunchDaemons/com.bentley.tw-caddy.plist"
+    echo "    sudo launchctl load /Library/LaunchDaemons/com.tw.caddy.plist"
     echo ""
 fi
 echo "  Run 'tw help' to get started."

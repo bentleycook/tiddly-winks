@@ -10,7 +10,18 @@ TW_DIR="$HOME/.tiddly-winks"
 SESSIONS_FILE="$TW_DIR/sessions.json"
 CADDYFILE="$TW_DIR/Caddyfile"
 CADDY_ADMIN="http://localhost:2019"
-CADDY_BIN="/opt/homebrew/bin/caddy"
+# Find Caddy binary: environment override > PATH > common locations
+if [[ -n "${CADDY_BIN:-}" ]]; then
+    : # user override
+elif command -v caddy &>/dev/null; then
+    CADDY_BIN="$(command -v caddy)"
+elif [[ -x /opt/homebrew/bin/caddy ]]; then
+    CADDY_BIN="/opt/homebrew/bin/caddy"
+elif [[ -x /usr/local/bin/caddy ]]; then
+    CADDY_BIN="/usr/local/bin/caddy"
+else
+    CADDY_BIN="caddy"  # hope it's on PATH at runtime
+fi
 
 # Source machine-local secrets (.env not checked in)
 [[ -f "$TW_DIR/.env" ]] && source "$TW_DIR/.env"
@@ -1041,7 +1052,9 @@ cmd_start() {
     proxy_json+="}"
 
     # Compute branch name early (needed for orchestrator seed)
-    local branch="${branch_prefix:-bentley/}${feature}"
+    local default_prefix
+    default_prefix="$(whoami)/"
+    local branch="${branch_prefix:-$default_prefix}${feature}"
 
     # Create agents output directory
     mkdir -p "$(agents_dir "$session_key")"
@@ -1211,20 +1224,39 @@ cmd_stop() {
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw stop <feature> [--done]"
+    [[ -z "$feature" ]] && die "Usage: tw stop <feature|N> [--done]"
 
-    # Find session key — try config first, then search sessions.json
+    # Find session key — supports index (from tw list), name, or substring
     local session_key project config_dir tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+
+    if [[ "$feature" =~ ^[0-9]+$ ]]; then
+        # Index-based: resolve Nth session from tw list (1-based)
+        local sessions_data
+        sessions_data=$(sessions_read)
+        session_key=$(python3 - "$sessions_data" "$feature" <<'PYEOF'
+import json, sys
+data = json.loads(sys.argv[1])
+idx = int(sys.argv[2])
+keys = list(data.keys())
+if 1 <= idx <= len(keys):
+    print(keys[idx - 1])
+PYEOF
+        )
+        [[ -z "$session_key" ]] && die "No session at index $feature"
         project=$(sessions_get_key "$session_key" "project")
         config_dir=$(sessions_get_key "$session_key" "workspace")
+    else
+        local config_file
+        if config_file=$(find_config 2>/dev/null); then
+            project=$(yaml_get "$config_file" "project" "")
+            config_dir="$(dirname "$config_file")"
+            session_key="${project}-${feature}"
+        else
+            session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+            [[ -z "$session_key" ]] && die "No session found for '$feature'"
+            project=$(sessions_get_key "$session_key" "project")
+            config_dir=$(sessions_get_key "$session_key" "workspace")
+        fi
     fi
     tmux_session="$session_key"
 
@@ -2047,7 +2079,7 @@ issue_tracker:
 
 worktrees:                  # ONLY include if there are multiple sub-repos (separate git repos or
   base: worktrees           # clearly separate frontend/backend app directories)
-  branch_prefix: bentley/   # omit this whole section for single-repo projects
+  branch_prefix: yourname/  # defaults to $(whoami)/ if omitted
 
 services:
   frontend:
@@ -2313,15 +2345,98 @@ with open(f, 'w') as fh:
 " "$hooked_file" "$task" 2>/dev/null || true
     fi
 
-    # Send a prompt that triggers the mail-check hook AND tells Claude to act.
-    # The hook injects nudge content as additionalContext, but Claude needs
-    # an explicit user prompt to drive execution (not just context injection).
-    tmux send-keys -t "$tmux_session:$worker" "You have a new task from the orchestrator. Check your additional context and execute it now." Enter
+    # Wait for the worker to be idle before sending, so we don't inject text
+    # mid-output or mid-tool-call. If it doesn't become idle in time, send anyway
+    # (queued nudge will be picked up on next prompt turn regardless).
+    local target="$tmux_session:$worker"
+    local wake_msg="You have a new task from the orchestrator. Check your additional context and execute it now."
+
+    if wait_for_idle "$tmux_session" "$worker" 15; then
+        send_to_pane "$target" "$wake_msg"
+        log "Delivered wake to $worker (idle detected)"
+    else
+        # Worker is busy — send anyway. The nudge file is already queued and will
+        # be drained on the next UserPromptSubmit hook. The typed text may land
+        # awkwardly but Claude will still process it on the next turn.
+        send_to_pane "$target" "$wake_msg"
+        log "Delivered wake to $worker (busy, best-effort)"
+    fi
 
     local urgency_label=""
     [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
     echo "  Nudge queued for $worker${urgency_label}: $task"
     echo "  Will be injected on next prompt turn via tw-mail-check hook."
+}
+
+# Check if a Claude worker is idle at the prompt (ready to receive input).
+# Inspects the tmux pane's visible content for Claude Code's prompt indicator.
+# Returns 0 if idle, 1 if busy/unknown.
+worker_is_idle() {
+    local tmux_session="$1" wname="$2"
+
+    # Capture last 5 lines of the pane
+    local pane_text
+    pane_text=$(tmux capture-pane -t "$tmux_session:$wname" -p -S -5 2>/dev/null) || return 1
+
+    # Claude Code shows "esc to interrupt" in the status bar when busy with a tool call.
+    if echo "$pane_text" | grep -q "esc to interrupt"; then
+        return 1  # busy
+    fi
+
+    # Idle indicators (any of these mean the worker is at the prompt):
+    # - "❯" (U+276F) prompt character
+    # - Status bar with "bypass permissions" or "hold Space to speak"
+    # - "Sautéed for" idle timer
+    if echo "$pane_text" | grep -qE '❯|bypass permissions|hold Space to speak|Sautéed for'; then
+        return 0  # idle at prompt
+    fi
+
+    return 1  # unknown state, assume busy
+}
+
+# Wait for a worker to become idle, with timeout.
+# Returns 0 if idle detected, 1 if timed out.
+wait_for_idle() {
+    local tmux_session="$1" wname="$2" timeout_secs="${3:-10}"
+    local deadline=$(($(date +%s) + timeout_secs))
+    local idle_count=0
+
+    while [[ $(date +%s) -lt $deadline ]]; do
+        if worker_is_idle "$tmux_session" "$wname"; then
+            idle_count=$((idle_count + 1))
+            # Require 2 consecutive idle polls to filter transient states
+            if [[ $idle_count -ge 2 ]]; then
+                return 0
+            fi
+            sleep 0.2
+        else
+            idle_count=0
+            sleep 0.5
+        fi
+    done
+
+    return 1  # timed out
+}
+
+# Send text to a tmux pane reliably. Handles chunking and enter key timing.
+send_to_pane() {
+    local target="$1" text="$2"
+
+    # Use literal send-keys (-l) to avoid key name interpretation, chunk at 512 chars
+    local chunk_size=512
+    local len=${#text}
+    local offset=0
+
+    while [[ $offset -lt $len ]]; do
+        local chunk="${text:$offset:$chunk_size}"
+        tmux send-keys -t "$target" -l "$chunk"
+        offset=$((offset + chunk_size))
+        [[ $offset -lt $len ]] && sleep 0.01
+    done
+
+    # Brief pause then Enter
+    sleep 0.1
+    tmux send-keys -t "$target" Enter
 }
 
 # Check if a worker window has a live Claude process (not just a bare shell).
@@ -3099,7 +3214,7 @@ bd show <bead-id>                # Load full session history
 ## Session Naming
 - tmux sessions: `{project}-{feature}`
 - URLs: `http://{project}-{feature}.localhost` (primary), `-api.localhost` (backend)
-- Branches: `bentley/{feature}`
+- Branches: `{user}/{feature}` (configurable via branch_prefix in .tw.yml)
 - Beads: `{feature} ({project})`
 PRIME
 
@@ -3203,7 +3318,7 @@ cmd_doctor() {
         _ok "Caddy daemon running"
     else
         _fail "Caddy daemon not running"
-        _hint "Start with: sudo launchctl kickstart -k system/com.bentley.tw-caddy"
+        _hint "Start with: sudo launchctl kickstart -k system/com.tw.caddy"
     fi
 
     # 2b. Caddy admin API
@@ -3724,8 +3839,8 @@ for name, info in svcs.items():
                         nudge_enqueue "$session_key" "keeper" \
                             "Service $svc_name is DOWN on port $svc_port. Check the services window and restart it. Run: tw status ${feature}" \
                             30 2>/dev/null || true
-                        tmux send-keys -t "$tmux_session:keeper" \
-                            "You have a new task from the orchestrator. Check your additional context and execute it now." Enter 2>/dev/null || true
+                        send_to_pane "$tmux_session:keeper" \
+                            "You have a new task from the orchestrator. Check your additional context and execute it now." 2>/dev/null || true
                         _daemon_log "Nudged keeper about $svc_name"
                     fi
                 fi
@@ -3875,7 +3990,7 @@ tw — tiddly-winks: feature space manager
 Commands:
   tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
   tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
-  tw stop <feature> [--done]            Stop session (--done tears down worktrees + closes bead)
+  tw stop <feature|N> [--done]           Stop session (--done tears down worktrees + closes bead)
   tw list [--project=X] [--json]         List active sessions
   tw attach [<N>|<name>] [--claude]     Attach to a session's tmux
 
