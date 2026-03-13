@@ -2212,9 +2212,10 @@ with open(f, 'w') as fh:
 " "$hooked_file" "$task" 2>/dev/null || true
     fi
 
-    # Send a minimal wake signal so the worker's next turn drains the queue.
-    # A bare Enter is safe — if Claude is mid-tool-call it just buffers.
-    tmux send-keys -t "$tmux_session:$worker" "" Enter
+    # Send a prompt that triggers the mail-check hook AND tells Claude to act.
+    # The hook injects nudge content as additionalContext, but Claude needs
+    # an explicit user prompt to drive execution (not just context injection).
+    tmux send-keys -t "$tmux_session:$worker" "You have a new task from the orchestrator. Check your additional context and execute it now." Enter
 
     local urgency_label=""
     [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
