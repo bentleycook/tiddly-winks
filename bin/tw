@@ -3604,6 +3604,16 @@ print(json.dumps(data, indent=2))
     # Write heartbeat timestamp
     date +%s > "$DAEMON_HEARTBEAT_FILE"
 
+    # Auto-close any retiring windows
+    for sess in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
+        for win in $(tmux list-windows -t "$sess" -F "#{window_name}" 2>/dev/null); do
+            if [[ "$win" == *-retiring* ]]; then
+                _daemon_log "Closing retiring window: $sess:$win"
+                tmux kill-window -t "$sess:$win" 2>/dev/null || true
+            fi
+        done
+    done
+
     # Truncate log if needed
     _daemon_log_truncate
 }
