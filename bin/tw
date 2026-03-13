@@ -907,14 +907,18 @@ cmd_start() {
 
         log "Service '$svc' on port $port (path: $abs_path)"
 
+        # Wrap in a restart loop with exponential backoff (max 30s)
+        # Services auto-restart on crash; give up after 10 consecutive failures
+        local restart_cmd="bash -c 'attempt=0; max_attempts=10; delay=2; while [ \$attempt -lt \$max_attempts ]; do $shell_cmd; exit_code=\$?; attempt=\$((attempt + 1)); if [ \$attempt -lt \$max_attempts ]; then echo \"[tw] Service crashed (exit \$exit_code), restarting in \${delay}s (attempt \$attempt/\$max_attempts)...\"; sleep \$delay; delay=\$((delay < 30 ? delay * 2 : 30)); fi; done; echo \"[tw] Service failed after \$max_attempts attempts. Run tw start to restart.\"; exec bash'"
+
         # First service gets its own pane in the services window; rest split
         if [[ "${services_window_created:-0}" -eq 0 ]]; then
             tmux new-window -t "$tmux_session" -n "services" \
-                "bash -c \"$shell_cmd; exec bash\""
+                "$restart_cmd"
             services_window_created=1
         else
             tmux split-window -t "$tmux_session:services" -v \
-                "bash -c \"$shell_cmd; exec bash\""
+                "$restart_cmd"
         fi
     done
 
@@ -3599,6 +3603,38 @@ print(json.dumps(data, indent=2))
         done
 
         _daemon_log "session $session_key: ${alive_workers} alive, ${dead_workers} respawned, ${hung_workers} hung"
+
+        # Check service ports — nudge keeper if any service is down
+        local services_json
+        services_json=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+s = d.get(sys.argv[2], {})
+svcs = s.get('services', {})
+for name, info in svcs.items():
+    port = info.get('port', '')
+    if port:
+        print(f'{name}:{port}')
+" "$sessions_data" "$session_key" 2>/dev/null || true)
+
+        if [[ -n "$services_json" ]]; then
+            while IFS=: read -r svc_name svc_port; do
+                [[ -z "$svc_port" ]] && continue
+                if ! lsof -i :"$svc_port" -sTCP:LISTEN >/dev/null 2>&1; then
+                    _daemon_log "DOWN service: $session_key/$svc_name (port $svc_port)"
+                    # Nudge the keeper worker if one exists
+                    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "keeper"; then
+                        nudge_enqueue "$session_key" "keeper" \
+                            "Service $svc_name is DOWN on port $svc_port. Check the services window and restart it. Run: tw status ${feature}" \
+                            30 2>/dev/null || true
+                        tmux send-keys -t "$tmux_session:keeper" \
+                            "You have a new task from the orchestrator. Check your additional context and execute it now." Enter 2>/dev/null || true
+                        _daemon_log "Nudged keeper about $svc_name"
+                    fi
+                fi
+            done <<< "$services_json"
+        fi
+
     done <<< "$session_keys"
 
     # Write heartbeat timestamp
