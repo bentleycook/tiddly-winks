@@ -255,6 +255,90 @@ for w in dw:
 " "$session_key" 2>/dev/null
 }
 
+# ─── Activity Spinner ────────────────────────────────────────────────────────
+#
+# Background loop that shows braille spinner frames on worker tmux window names
+# when a Claude process is actively using CPU. Runs per-session.
+
+SPINNER_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+SPINNER_RESERVED="god|main|services"
+
+spinner_start() {
+    local tmux_session="$1" session_key="$2"
+    local pid_file="$TW_DIR/spinner-${session_key}.pid"
+
+    # Kill any existing spinner for this session
+    if [[ -f "$pid_file" ]]; then
+        kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+
+    (
+        trap 'rm -f "'"$pid_file"'"' EXIT
+        local frame=0
+        local -A prev_state  # track previous active state per window
+
+        while tmux has-session -t "$tmux_session" 2>/dev/null; do
+            # Get window index:name pairs (use index for reliable targeting)
+            local win_list
+            win_list=$(tmux list-windows -t "$tmux_session" -F "#{window_index}:#{window_name}" 2>/dev/null) || break
+
+            while IFS= read -r entry; do
+                [[ -z "$entry" ]] && continue
+                local widx="${entry%%:*}"
+                local wname="${entry#*:}"
+
+                # Skip reserved windows and strip any existing spinner
+                local base_name="${wname% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+                [[ "$base_name" =~ ^($SPINNER_RESERVED)$ ]] && continue
+
+                # Get pane PID (target by index — safe with spaces in names)
+                local pane_pid
+                pane_pid=$(tmux list-panes -t "$tmux_session:$widx" -F "#{pane_pid}" 2>/dev/null | head -1)
+                [[ -z "$pane_pid" ]] && continue
+
+                # Find claude/node child process and check CPU
+                local child_pid cpu active=0
+                child_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1)
+                if [[ -n "$child_pid" ]]; then
+                    cpu=$(ps -p "$child_pid" -o %cpu= 2>/dev/null | xargs)
+                    # Compare integer part — active if CPU > 1%
+                    local cpu_int="${cpu%%.*}"
+                    if [[ -n "$cpu_int" && "$cpu_int" -gt 1 ]] 2>/dev/null; then
+                        active=1
+                    fi
+                fi
+
+                if [[ $active -eq 1 ]]; then
+                    local new_name="$base_name ${SPINNER_FRAMES[$frame]}"
+                    tmux rename-window -t "$tmux_session:$widx" "$new_name" 2>/dev/null || true
+                    prev_state[$base_name]=1
+                elif [[ "${prev_state[$base_name]:-0}" -eq 1 ]]; then
+                    # Was active, now idle — strip spinner
+                    tmux rename-window -t "$tmux_session:$widx" "$base_name" 2>/dev/null || true
+                    prev_state[$base_name]=0
+                fi
+            done <<< "$win_list"
+
+            frame=$(( (frame + 1) % ${#SPINNER_FRAMES[@]} ))
+            sleep 0.3
+        done
+    ) &
+
+    local spinner_pid=$!
+    disown "$spinner_pid"
+    echo "$spinner_pid" > "$pid_file"
+}
+
+spinner_stop() {
+    local session_key="$1"
+    local pid_file="$TW_DIR/spinner-${session_key}.pid"
+    if [[ -f "$pid_file" ]]; then
+        kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    fi
+}
+
 # ─── Port Allocation ─────────────────────────────────────────────────────────
 
 # Track ports allocated in this run to avoid intra-session collisions
@@ -387,6 +471,7 @@ with open(sys.argv[1], 'w') as f:
 " "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id"
 
     tmux new-window -t "$tmux_session" -n "$wname"
+    tmux set-option -t "$tmux_session:$wname" allow-rename off 2>/dev/null || true
     tmux send-keys -t "$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
 
@@ -1057,6 +1142,9 @@ EOF
     regen_caddyfile
     caddy_reload
 
+    # Start activity spinner for worker windows
+    spinner_start "$tmux_session" "$session_key"
+
     # Update bead
     if [[ -n "$bead_id" ]]; then
         local bead_body
@@ -1142,6 +1230,9 @@ cmd_stop() {
 
     local bead_id
     bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+    # Kill activity spinner
+    spinner_stop "$session_key"
 
     # Kill the feature's tmux session
     if tmux has-session -t "$tmux_session" 2>/dev/null; then
@@ -1536,6 +1627,13 @@ EOF
     echo "$new_data" | sessions_write
     regen_caddyfile
     caddy_reload
+
+    # Clean up any orphaned spinner PIDs
+    for pid_file in "$TW_DIR"/spinner-*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        kill "$(cat "$pid_file")" 2>/dev/null || true
+        rm -f "$pid_file"
+    done
 
     echo "  Prune complete."
 }
