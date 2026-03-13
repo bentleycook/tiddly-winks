@@ -1,0 +1,5 @@
+project: tiddly-winks
+
+issue_tracker:
+  type: github
+  repo: bentleycook/tiddly-winks

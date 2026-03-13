@@ -274,25 +274,41 @@ caddy_reload() {
 agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 
 # Spawn a worker window and wire up hook-based context injection.
-# Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id]
+# Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id]
 spawn_worker() {
-    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}"
+    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}" worker_bead_id="${7:-}"
     local output_file
     output_file="$(agents_dir "$session_key")/${wname}.md"
 
     # Write hooked work file — consumed by the SessionStart hook (tw-prime.sh)
-    # to inject bead context + role + output file path at session open.
+    # to inject bead context + role + output file path + worker identity at session open.
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
     mkdir -p "$hooked_dir"
     python3 -c "
 import json, sys
 with open(sys.argv[1], 'w') as f:
-    json.dump({'bead_id': sys.argv[2], 'worker': sys.argv[3], 'role': sys.argv[4], 'output_file': sys.argv[5]}, f, indent=2)
-" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file"
+    json.dump({
+        'bead_id': sys.argv[2],
+        'worker': sys.argv[3],
+        'role': sys.argv[4],
+        'output_file': sys.argv[5],
+        'worker_bead_id': sys.argv[6]
+    }, f, indent=2)
+" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id"
 
     tmux new-window -t "$tmux_session" -n "$wname"
     tmux send-keys -t "$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
+
+    # Queue an initial wake prompt — delivered on the worker's first turn.
+    # Safe to send-keys here because Claude hasn't started any tool calls yet.
+    # The delay gives Claude time to fully boot (load hooks, settings, auth).
+    (
+        sleep 16
+        tmux send-keys -t "$tmux_session:$wname" \
+            "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
+    ) &
+
     log "Started worker: $wname (role: $wrole)"
 }
 
@@ -333,8 +349,13 @@ $worker_lines
 - Code changes → relevant domain worker (backend/frontend)
 - Code questions, codebase exploration → relevant domain worker
 - Test runs, lint, CI checks → ci worker
-- Service health, start/stop → keeper worker
+- Service health, start/stop, worker health → keeper worker
 - After dispatching, poll the worker's output file; once results appear, summarize and ask what's next
+
+## Worker discoveries
+Workers may file new beads when they discover bugs or work items. Periodically check:
+  bd list --status=open
+to see what workers have found. Triage and prioritize as needed.
 
 ## On startup — gather state by delegation, not directly
 Dispatch to each relevant worker:
@@ -368,6 +389,32 @@ bead_find_open() {
     bd_run "$bd_dir" list --status=open 2>/dev/null | grep -F "$title" | head -1 | awk '{print $2}' | tr -d '#' || true
 }
 
+# Find an existing worker identity bead (searches open + in_progress).
+# Title convention: "tw:worker <name> (<project>)"
+worker_bead_find() {
+    local worker="$1" project="$2" bd_dir="${3:-}"
+    local title="tw:worker ${worker} (${project})"
+    {
+        bd_run "$bd_dir" list --status=open 2>/dev/null
+        bd_run "$bd_dir" list --status=in_progress 2>/dev/null
+    } | grep -F "$title" | head -1 | awk '{print $2}' | tr -d '#' || true
+}
+
+worker_bead_find_or_create() {
+    local worker="$1" project="$2" bd_dir="${3:-}"
+    local title="tw:worker ${worker} (${project})"
+    local wbead_id
+    wbead_id=$(worker_bead_find "$worker" "$project" "$bd_dir")
+    if [[ -z "$wbead_id" ]]; then
+        wbead_id=$(bead_create "$title" "$bd_dir")
+        bead_mark_in_progress "$wbead_id" "$bd_dir"
+        log "Created worker bead $wbead_id: $title"
+    else
+        log "Reusing worker bead $wbead_id: $title"
+    fi
+    echo "$wbead_id"
+}
+
 bead_create() {
     local title="$1" bd_dir="${2:-}"
     bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[a-zA-Z]+-[a-z0-9]+' | head -1 || true
@@ -388,17 +435,17 @@ bead_find_or_create() {
 
 bead_update_body() {
     local bead_id="$1" body="$2" bd_dir="${3:-}"
-    bd_run "$bd_dir" update "$bead_id" --body="$body" 2>/dev/null || true
+    bd_run "$bd_dir" update "$bead_id" --body="$body" >/dev/null 2>&1 || true
 }
 
 bead_mark_in_progress() {
     local bead_id="$1" bd_dir="${2:-}"
-    bd_run "$bd_dir" update "$bead_id" --status=in_progress 2>/dev/null || true
+    bd_run "$bd_dir" update "$bead_id" --status=in_progress >/dev/null 2>&1 || true
 }
 
 bead_close() {
     local bead_id="$1" bd_dir="${2:-}"
-    bd_run "$bd_dir" close "$bead_id" 2>/dev/null || true
+    bd_run "$bd_dir" close "$bead_id" >/dev/null 2>&1 || true
 }
 
 bead_get_body() {
@@ -667,7 +714,7 @@ cmd_start() {
     branch_prefix=$(yaml_get_nested "$effective_config" "worktrees.branch_prefix" "")
 
     # Associative arrays for worktree paths and db name
-    declare -A worktree_paths
+    declare -A worktree_paths=()
     local db_name=""
 
     local service_names
@@ -821,8 +868,12 @@ cmd_start() {
     local workers_str=""
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
+        local wname="${wpair%%:*}"
+        local wrole="${wpair##*:}"
+        local worker_bead_id
+        worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
         spawn_worker "$tmux_session" "$session_key" "$config_dir" \
-            "${wpair%%:*}" "${wpair##*:}" "$bead_id"
+            "$wname" "$wrole" "$bead_id" "$worker_bead_id"
         workers_str+="$wpair"$'\n'
     done
 
@@ -914,7 +965,7 @@ EOF
             "$worktrees_bead_block" "$db_name")
         bead_update_body "$bead_id" "$bead_body" "$config_dir"
         bead_mark_in_progress "$bead_id" "$config_dir"
-        bd_run "$config_dir" sync 2>/dev/null || true
+        bd_run "$config_dir" vc commit -m "tw session update" 2>/dev/null || true
     fi
 
     # Print summary
@@ -1072,7 +1123,7 @@ EOF
 - bead remains open (run: tw start $feature to resume)" 2>/dev/null || true
             log "Updated bead $bead_id (still open — use --done to close)"
         fi
-        bd_run "$config_dir" sync 2>/dev/null || true
+        bd_run "$config_dir" vc commit -m "tw session update" 2>/dev/null || true
     fi
 
     echo "  Stopped: $feature ($project)"
@@ -1514,7 +1565,7 @@ ${appended_text}"
 
     bd_run "$config_dir" update "$bead_id" --body="$new_body" 2>/dev/null \
         || die "Failed to update bead $bead_id"
-    bd_run "$config_dir" sync 2>/dev/null || true
+    bd_run "$config_dir" vc commit -m "tw session update" 2>/dev/null || true
 
     log "Appended to bead $bead_id"
     echo "  Bead $bead_id updated. Run: bd show $bead_id"
@@ -1546,23 +1597,121 @@ cmd_init() {
     local git_remote
     git_remote=$(git remote get-url origin 2>/dev/null || true)
 
-    log "Analyzing project with Claude agent..."
+    # ─── Fast local pre-scan ─────────────────────────────────────────────────
+    log "Scanning project structure..."
+
+    local prescan=""
+
+    # Top-level directory listing
+    prescan+="## Directory listing
+$(ls -1a "$project_dir" | head -50)
+
+"
+
+    # Detect sub-repos (dirs with their own package.json or pyproject.toml)
+    local subrepos=""
+    for d in "$project_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        local dname
+        dname=$(basename "$d")
+        if [[ -f "$d/package.json" || -f "$d/pyproject.toml" || -f "$d/Pipfile" || -f "$d/.git" ]]; then
+            subrepos+="- $dname"
+            [[ -f "$d/package.json" ]] && subrepos+=" (package.json)"
+            [[ -f "$d/pyproject.toml" ]] && subrepos+=" (pyproject.toml)"
+            [[ -f "$d/Pipfile" ]] && subrepos+=" (Pipfile)"
+            [[ -d "$d/.git" ]] && subrepos+=" (separate git repo)"
+            subrepos+=$'\n'
+        fi
+    done
+    [[ -n "$subrepos" ]] && prescan+="## Sub-repos detected
+$subrepos
+"
+
+    # Key config files — read first 30 lines of each if they exist
+    for f in package.json pyproject.toml Pipfile docker-compose.yml docker-compose.yaml \
+             Makefile .env.example Cargo.toml go.mod; do
+        if [[ -f "$project_dir/$f" ]]; then
+            prescan+="## $f (first 30 lines)
+$(head -30 "$project_dir/$f")
+...
+
+"
+        fi
+    done
+
+    # Detect framework configs
+    for pattern in vite.config.* next.config.* nuxt.config.* svelte.config.*; do
+        for f in "$project_dir"/$pattern; do
+            [[ -f "$f" ]] || continue
+            prescan+="## $(basename "$f") (first 15 lines)
+$(head -15 "$f")
+...
+
+"
+        done
+    done
+
+    # Sub-repo package.jsons
+    if [[ -n "$subrepos" ]]; then
+        for d in "$project_dir"/*/; do
+            local dname
+            dname=$(basename "$d")
+            if [[ -f "$d/package.json" ]]; then
+                prescan+="## $dname/package.json (first 20 lines)
+$(head -20 "$d/package.json")
+...
+
+"
+            fi
+            if [[ -f "$d/pyproject.toml" ]]; then
+                prescan+="## $dname/pyproject.toml (first 20 lines)
+$(head -20 "$d/pyproject.toml")
+...
+
+"
+            fi
+        done
+    fi
+
+    # Detect package manager
+    local pkg_mgr="npm"
+    [[ -f "$project_dir/bun.lockb" || -f "$project_dir/bun.lock" ]] && pkg_mgr="bun"
+    [[ -f "$project_dir/yarn.lock" ]] && pkg_mgr="yarn"
+    [[ -f "$project_dir/pnpm-lock.yaml" ]] && pkg_mgr="pnpm"
+    prescan+="## Detected package manager: $pkg_mgr
+"
+
+    # Check for database setup scripts
+    local db_scripts=""
+    for f in scripts/db.sh scripts/setup-db.sh scripts/reset-db.sh db/setup.sh; do
+        [[ -f "$project_dir/$f" ]] && db_scripts+="- $f"$'\n'
+    done
+    for d in "$project_dir"/*/; do
+        local dname
+        dname=$(basename "$d")
+        for f in scripts/db.sh scripts/setup-db.sh scripts/reset-db.sh; do
+            [[ -f "$d/$f" ]] && db_scripts+="- $dname/$f"$'\n'
+        done
+    done
+    [[ -n "$db_scripts" ]] && prescan+="## Database setup scripts
+$db_scripts
+"
+
+    log "Generating config with Claude..."
 
     local prompt
     prompt=$(cat <<PROMPT
-You are analyzing a software project to generate a .tw.yml config for tiddly-winks, a feature space manager.
+You are generating a .tw.yml config for tiddly-winks, a feature space manager.
 
-## Your task
+## Pre-scan results
 
-Explore the project at: $project_dir
-
-Use your tools (Glob, Read) to:
-1. Map the top-level structure — identify if this is a monorepo, a single app, or a workspace with sub-repos
-2. Read package.json, pyproject.toml, docker-compose.yml, Makefile, vite.config.*, next.config.*, .env.example — whichever exist
-3. For any top-level subdirectory that looks like a sub-repo (has its own package.json or pyproject.toml), read that too
-4. Check for database setup scripts
+$prescan
 
 Git remote: ${git_remote:-none}
+Project directory: $project_dir
+
+You do NOT need to use any tools — all the information you need is above.
+If something critical is ambiguous, use Read to check one or two specific files.
 
 ## .tw.yml schema
 
@@ -1683,8 +1832,29 @@ print(text)
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         echo "$yaml_out" > "$project_dir/.tw.yml"
         log "Wrote $project_dir/.tw.yml"
+
+        # Init bead store if not present
+        if [[ ! -d "$project_dir/.beads" ]]; then
+            local init_project
+            init_project=$(yaml_get "$project_dir/.tw.yml" "project" "")
+            if [[ -n "$init_project" ]]; then
+                (cd "$project_dir" && bd init --stealth --prefix "$init_project" --quiet 2>/dev/null) \
+                    && log "Initialized bead store: $project_dir/.beads" || true
+            fi
+        fi
+
         echo ""
-        echo "  Done. Review and adjust as needed, then: tw start <feature>"
+        echo "  Done. Review and adjust as needed."
+        echo ""
+
+        # Offer to start immediately
+        local start_answer
+        read -r -p "Start a feature now? Enter name (or press Enter to skip): " start_answer
+        if [[ -n "$start_answer" ]]; then
+            cmd_start "$start_answer"
+        else
+            echo "  Ready. Run: tw start <feature>"
+        fi
     else
         echo "  Aborted — nothing written."
     fi
@@ -1807,7 +1977,130 @@ cmd_send() {
     echo "  Will be injected on next prompt turn via tw-mail-check hook."
 }
 
-cmd_workers() {
+# Check if a worker window has a live Claude process (not just a bare shell).
+# Returns 0 if alive, 1 if dead/missing.
+worker_is_alive() {
+    local tmux_session="$1" wname="$2"
+    # Get the pane PID for this window, then check if claude/node is in its process tree
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$tmux_session:$wname" -F "#{pane_pid}" 2>/dev/null | head -1)
+    [[ -z "$pane_pid" ]] && return 1
+    # Check if any child of the pane shell is a claude/node process
+    pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1
+}
+
+cmd_handoff() {
+    local feature="" worker=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$worker" ]]; then worker="$1"
+                else die "Too many arguments"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$feature" || -z "$worker" ]] && die "Usage: tw handoff <feature> <worker>"
+
+    # Resolve session + config
+    local session_key project config_dir tmux_session
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    fi
+    tmux_session="$session_key"
+
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session'"
+
+    # Verify worker window exists
+    tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+        | grep -qx "$worker" \
+        || die "Worker window '$worker' not found in session '$tmux_session'"
+
+    # 1. Save worker's output file to their identity bead
+    local output_file
+    output_file="$(agents_dir "$session_key")/${worker}.md"
+
+    local worker_bead_id
+    worker_bead_id=$(worker_bead_find "$worker" "$project" "$config_dir")
+
+    if [[ -n "$worker_bead_id" && -f "$output_file" ]]; then
+        local output_content
+        output_content=$(cat "$output_file")
+        if [[ -n "$output_content" ]]; then
+            local timestamp
+            timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            bd_run "$config_dir" comments add "$worker_bead_id" "## Session handoff — $timestamp
+
+$output_content" 2>/dev/null || log "Warning: could not append to worker bead $worker_bead_id"
+            # Clear output file for fresh session
+            > "$output_file"
+            log "Saved output to worker bead $worker_bead_id"
+        fi
+    fi
+
+    # 2. Kill the Claude process in the worker window (send /exit)
+    tmux send-keys -t "$tmux_session:$worker" "/exit" Enter
+    sleep 2
+
+    # 3. If Claude is still running, force-kill the pane and recreate
+    if worker_is_alive "$tmux_session" "$worker"; then
+        tmux send-keys -t "$tmux_session:$worker" C-c
+        sleep 1
+    fi
+
+    # 4. Resolve role from hooked JSON or config
+    local wrole=""
+    local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+    if [[ -f "$hooked_file" ]]; then
+        wrole=$(python3 -c "
+import json
+try: print(json.load(open('$hooked_file')).get('role', ''))
+except: pass
+" 2>/dev/null)
+    fi
+
+    # 5. Respawn Claude in the same window
+    local bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+    [[ -z "$worker_bead_id" ]] && worker_bead_id=$(worker_bead_find_or_create "$worker" "$project" "$config_dir")
+
+    # Write updated hooked JSON
+    local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    mkdir -p "$hooked_dir"
+    python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({
+        'bead_id': sys.argv[2],
+        'worker': sys.argv[3],
+        'role': sys.argv[4],
+        'output_file': sys.argv[5],
+        'worker_bead_id': sys.argv[6]
+    }, f, indent=2)
+" "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id"
+
+    tmux send-keys -t "$tmux_session:$worker" \
+        "TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
+
+    log "Handed off $worker — fresh session starting with identity bead $worker_bead_id"
+    echo "  Handoff complete: $worker"
+    echo "  Identity bead: $worker_bead_id (work history preserved)"
+}
+
+cmd_patrol() {
     local feature=""
 
     while [[ $# -gt 0 ]]; do
@@ -1817,7 +2110,255 @@ cmd_workers() {
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw workers <feature>"
+    [[ -z "$feature" ]] && die "Usage: tw patrol <feature>"
+
+    # Resolve session + config
+    local session_key project config_dir tmux_session
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+        config_file="$config_dir/.tw.yml"
+        [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
+    fi
+    tmux_session="$session_key"
+
+    tmux has-session -t "$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session'"
+
+    local override_file="$config_dir/.tw.override.yml"
+    [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
+    local effective_config="$config_file"
+    if [[ -f "$override_file" ]]; then
+        effective_config=$(yaml_merge_override "$config_file" "$override_file")
+    fi
+
+    local worker_pairs
+    mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+
+    local agents_path
+    agents_path="$(agents_dir "$session_key")"
+    local now
+    now=$(date +%s)
+    local report="" issues=0
+
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    echo "  │  Patrol Report: $feature"
+    echo "  │  $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+
+    # 1. Worker window health
+    printf "  %-20s %-10s %-10s %s\n" "WORKER" "WINDOW" "PROCESS" "OUTPUT AGE"
+    printf "  %-20s %-10s %-10s %s\n" "--------------------" "----------" "----------" "----------"
+
+    local dead_workers="" stuck_workers=""
+
+    for wpair in "${worker_pairs[@]}"; do
+        [[ -z "$wpair" ]] && continue
+        local wname="${wpair%%:*}"
+        local window_status="missing" process_status="-" output_age="-"
+
+        if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+            window_status="present"
+            if worker_is_alive "$tmux_session" "$wname"; then
+                process_status="alive"
+            else
+                process_status="dead"
+                dead_workers+="$wname "
+                (( issues++ )) || true
+            fi
+        else
+            dead_workers+="$wname "
+            (( issues++ )) || true
+        fi
+
+        # Check output file freshness
+        local output_file="$agents_path/${wname}.md"
+        if [[ -f "$output_file" ]]; then
+            local mtime
+            mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
+            local age_secs=$((now - mtime))
+            if [[ $age_secs -lt 60 ]]; then
+                output_age="${age_secs}s"
+            elif [[ $age_secs -lt 3600 ]]; then
+                output_age="$((age_secs / 60))m"
+            else
+                output_age="$((age_secs / 3600))h"
+                # Stuck if alive but no output in >1h
+                if [[ "$process_status" == "alive" && $age_secs -gt 3600 ]]; then
+                    stuck_workers+="$wname "
+                    (( issues++ )) || true
+                fi
+            fi
+        else
+            output_age="none"
+        fi
+
+        printf "  %-20s %-10s %-10s %s\n" "$wname" "$window_status" "$process_status" "$output_age"
+    done
+
+    echo ""
+
+    # 2. Service health
+    local services_json
+    services_json=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+s = d.get('$session_key', {}).get('services', {})
+for name, info in s.items():
+    print(f'{name}:{info[\"port\"]}')
+" 2>/dev/null || true)
+
+    if [[ -n "$services_json" ]]; then
+        printf "  %-20s %-10s %s\n" "SERVICE" "PORT" "STATUS"
+        printf "  %-20s %-10s %s\n" "--------------------" "----------" "----------"
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local svc_name="${line%%:*}" svc_port="${line##*:}"
+            local svc_status="down"
+            if lsof -i ":$svc_port" 2>/dev/null | grep -q LISTEN; then
+                svc_status="up"
+            else
+                (( issues++ )) || true
+            fi
+            printf "  %-20s %-10s %s\n" "$svc_name" "$svc_port" "$svc_status"
+        done <<< "$services_json"
+
+        echo ""
+    fi
+
+    # 3. Take action on dead/stuck workers
+    if [[ -n "$dead_workers" ]]; then
+        echo "  [!] Dead/missing workers: $dead_workers"
+        echo "      Auto-respawning..."
+        cmd_workers "$feature" --respawn 2>&1 | sed 's/^/      /'
+        echo ""
+    fi
+
+    if [[ -n "$stuck_workers" ]]; then
+        echo "  [!] Stuck workers (>1h no output): $stuck_workers"
+        for w in $stuck_workers; do
+            nudge_enqueue "$session_key" "$w" "Health check from patrol — your output file hasn't been updated in over 1 hour. Are you stuck? Please report your current status." 30
+            echo "      Nudged: $w"
+        done
+        echo ""
+    fi
+
+    # 4. Plugin dispatch
+    local plugins_dir="$HOME/.tiddly-winks/plugins"
+    local cooldown_dir="$HOME/.tiddly-winks/cooldowns/${session_key}"
+    mkdir -p "$cooldown_dir"
+
+    if [[ -d "$plugins_dir" ]]; then
+        local plugins_dispatched=0 plugins_skipped=0
+
+        for plugin_file in "$plugins_dir"/*.md; do
+            [[ -f "$plugin_file" ]] || continue
+
+            # Parse TOML frontmatter (between +++ lines)
+            local plugin_name="" plugin_worker="" plugin_cooldown="" plugin_body=""
+            local _plugin_parsed
+            _plugin_parsed=$(python3 -c "
+import re, sys, json
+text = open(sys.argv[1]).read()
+m = re.match(r'\+\+\+\n(.*?)\n\+\+\+\n(.*)', text, re.DOTALL)
+if not m: sys.exit(0)
+fm, body = m.groups()
+d = {}
+for line in fm.strip().splitlines():
+    k, _, v = line.partition('=')
+    d[k.strip()] = v.strip().strip('\"')
+d['body'] = body.strip()
+json.dump(d, sys.stdout)
+" "$plugin_file" 2>/dev/null)
+            [[ -z "$_plugin_parsed" ]] && continue
+            plugin_name=$(echo "$_plugin_parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))")
+            plugin_worker=$(echo "$_plugin_parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('worker',''))")
+            plugin_cooldown=$(echo "$_plugin_parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('cooldown',''))")
+            plugin_body=$(echo "$_plugin_parsed" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))")
+
+            [[ -z "${plugin_name:-}" || -z "${plugin_worker:-}" ]] && continue
+
+            # Check if target worker exists in this session
+            local worker_exists=0
+            for wpair in "${worker_pairs[@]}"; do
+                [[ "${wpair%%:*}" == "$plugin_worker" ]] && worker_exists=1 && break
+            done
+            if [[ $worker_exists -eq 0 ]]; then
+                (( plugins_skipped++ )) || true
+                continue
+            fi
+
+            # Check cooldown
+            local cooldown_file="$cooldown_dir/${plugin_name}.last"
+            local cooldown_secs=0
+            if [[ -n "${plugin_cooldown:-}" ]]; then
+                # Parse "5m", "1h", "30m" etc.
+                local cd_val="${plugin_cooldown%[mhMH]}"
+                local cd_unit="${plugin_cooldown: -1}"
+                case "$cd_unit" in
+                    h|H) cooldown_secs=$((cd_val * 3600)) ;;
+                    *) cooldown_secs=$((cd_val * 60)) ;;
+                esac
+            fi
+
+            if [[ -f "$cooldown_file" ]]; then
+                local last_run
+                last_run=$(cat "$cooldown_file")
+                local elapsed=$((now - last_run))
+                if [[ $elapsed -lt $cooldown_secs ]]; then
+                    (( plugins_skipped++ )) || true
+                    continue
+                fi
+            fi
+
+            # Dispatch: nudge the target worker with plugin instructions
+            nudge_enqueue "$session_key" "$plugin_worker" \
+                "## Plugin: ${plugin_name}
+
+${plugin_body}" 60
+            echo "$now" > "$cooldown_file"
+            echo "  [plugin] ${plugin_name} → ${plugin_worker}"
+            (( plugins_dispatched++ )) || true
+        done
+
+        if [[ $plugins_dispatched -gt 0 || $plugins_skipped -gt 0 ]]; then
+            echo "  Plugins: $plugins_dispatched dispatched, $plugins_skipped skipped (cooldown/no worker)"
+            echo ""
+        fi
+    fi
+
+    # 5. Summary
+    if [[ $issues -eq 0 ]]; then
+        echo "  All clear — $((${#worker_pairs[@]})) workers healthy."
+    else
+        echo "  Issues found: $issues"
+    fi
+    echo ""
+}
+
+cmd_workers() {
+    local feature="" health_flag=0 respawn_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --health) health_flag=1; shift ;;
+            --respawn) respawn_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn]"
 
     # Resolve session + config
     local session_key project config_dir tmux_session effective_config
@@ -1839,7 +2380,12 @@ cmd_workers() {
     tmux has-session -t "$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
 
-    effective_config=$(merge_config "$config_file" "$config_dir")
+    local override_file="$config_dir/.tw.override.yml"
+    [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
+    effective_config="$config_file"
+    if [[ -f "$override_file" ]]; then
+        effective_config=$(yaml_merge_override "$config_file" "$override_file")
+    fi
 
     local worker_pairs
     mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
@@ -1850,6 +2396,57 @@ cmd_workers() {
     bead_id=$(sessions_get_key "$session_key" "bead_id")
 
     mkdir -p "$(agents_dir "$session_key")"
+
+    # --health: report worker status
+    if [[ $health_flag -eq 1 ]]; then
+        echo ""
+        printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "ROLE"
+        printf "  %-20s %-12s %s\n" "--------------------" "------------" "--------------------"
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}" wrole="${wpair##*:}"
+            local status="missing"
+            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+                if worker_is_alive "$tmux_session" "$wname"; then
+                    status="alive"
+                else
+                    status="dead"
+                fi
+            fi
+            printf "  %-20s %-12s %s\n" "$wname" "$status" "$wrole"
+        done
+        echo ""
+        return 0
+    fi
+
+    # --respawn: respawn dead/missing workers only
+    if [[ $respawn_flag -eq 1 ]]; then
+        local respawned=0 alive=0
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}" wrole="${wpair##*:}"
+
+            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+                if worker_is_alive "$tmux_session" "$wname"; then
+                    (( alive++ )) || true
+                    continue
+                fi
+                # Dead window — kill it before respawning
+                tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || true
+                log "Killed dead worker window: $wname"
+            fi
+
+            local worker_bead_id
+            worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
+            spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
+            (( respawned++ )) || true
+        done
+        echo ""
+        echo "  Workers: $respawned respawned, $alive alive"
+        return 0
+    fi
+
+    # Default: spawn missing workers (original behavior)
     local spawned=0 skipped=0
 
     for wpair in "${worker_pairs[@]}"; do
@@ -1865,7 +2462,9 @@ cmd_workers() {
             continue
         fi
 
-        spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id"
+        local worker_bead_id
+        worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
+        spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
         (( spawned++ )) || true
     done
 
@@ -1885,6 +2484,10 @@ Usage:
   tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
   tw stop <feature> [--done]            Stop session (--done tears down worktrees + closes bead)
   tw workers <feature>                  Spawn missing worker windows into a running session
+  tw workers <feature> --health         Check worker window liveness (alive/dead/missing)
+  tw workers <feature> --respawn        Respawn dead or missing workers with identity intact
+  tw handoff <feature> <worker>        Cycle a worker's session (save context, restart fresh)
+  tw patrol <feature>                  Health check: workers, services, stuck detection, auto-respawn
   tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker (injected at next turn)
   tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
   tw nudge drain <session> <worker>     Drain and print all queued nudges
@@ -1917,6 +2520,8 @@ case "$subcommand" in
     claude)  cmd_claude "$@" ;;
     append)  cmd_append "$@" ;;
     workers) cmd_workers "$@" ;;
+    handoff) cmd_handoff "$@" ;;
+    patrol)  cmd_patrol "$@" ;;
     send)    cmd_send "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
