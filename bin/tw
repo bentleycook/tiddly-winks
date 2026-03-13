@@ -402,7 +402,7 @@ with open(sys.argv[1], 'w') as f:
     log "Started worker: $wname (role: $wrole)"
 }
 
-# Send the orchestrator seed to the claude window once agents are known.
+# Send the orchestrator seed to the god window once agents are known.
 # Usage: seed_orchestrator <tmux_session> <session_key> <feature> <project> <bead_id> <branch> <worker_pairs_str> <worktrees_json>
 seed_orchestrator() {
     local tmux_session="$1" session_key="$2" feature="$3" project="$4"
@@ -460,9 +460,9 @@ Wait for output files to populate, then synthesize a state summary for the user.
 
     (
         sleep 6
-        tmux send-keys -t "$tmux_session:claude" "$seed"
+        tmux send-keys -t "$tmux_session:god" "$seed"
         sleep 0.5
-        tmux send-keys -t "$tmux_session:claude" "" Enter
+        tmux send-keys -t "$tmux_session:god" "" Enter
     ) &
 }
 
@@ -870,7 +870,10 @@ cmd_start() {
     fi
 
     # Start tmux session for this feature
-    tmux new-session -d -s "$tmux_session" -n "main"
+    # Window 0 is "god" (orchestrator) — created with the session so it's always index 0
+    tmux new-session -d -s "$tmux_session" -n "god"
+    tmux send-keys -t "$tmux_session:god" "cd '$config_dir' && claude --dangerously-skip-permissions" Enter
+    tmux new-window -t "$tmux_session" -n "main"
     tmux send-keys -t "$tmux_session:main" "cd '$config_dir'" Enter
 
     # Allocate ports and start services
@@ -955,10 +958,6 @@ cmd_start() {
     # Compute branch name early (needed for orchestrator seed)
     local branch="${branch_prefix:-bentley/}${feature}"
 
-    # Add claude window (the orchestrator seat)
-    tmux new-window -t "$tmux_session" -n "claude"
-    tmux send-keys -t "$tmux_session:claude" "cd '$config_dir' && claude --dangerously-skip-permissions" Enter
-
     # Create agents output directory
     mkdir -p "$(agents_dir "$session_key")"
 
@@ -989,7 +988,7 @@ cmd_start() {
     fi
 
     # Focus orchestrator window
-    tmux select-window -t "$tmux_session:claude"
+    tmux select-window -t "$tmux_session:god"
 
     # Build worktrees block for bead body
     local worktrees_bead_block=""
@@ -1366,8 +1365,8 @@ PYEOF
 
     # Select target window
     if [[ $claude_flag -eq 1 ]]; then
-        tmux select-window -t "$tmux_session:claude" 2>/dev/null \
-            || log "No claude window — attaching to default"
+        tmux select-window -t "$tmux_session:god" 2>/dev/null \
+            || log "No god window — attaching to default"
     elif [[ -n "$window" ]]; then
         tmux select-window -t "$tmux_session:$window" 2>/dev/null \
             || log "No window '$window' — attaching to default"
@@ -1664,10 +1663,10 @@ cmd_claude() {
         die "No tmux session '$tmux_session'. Run: tw start $feature"
     fi
 
-    # Create claude window if it doesn't exist
-    local claude_window="claude"
+    # Create god window if it doesn't exist
+    local claude_window="god"
     if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
-        log "Creating claude window in $tmux_session"
+        log "Creating god window in $tmux_session"
         tmux new-window -t "$tmux_session" -n "$claude_window"
         tmux send-keys -t "$tmux_session:$claude_window" "cd '$config_dir' && claude --dangerously-skip-permissions" Enter
     fi
@@ -1735,7 +1734,7 @@ EOF
         printf '\033]1;%s\007' "$feature"
     fi
 
-    # Switch to claude window and attach
+    # Switch to god window and attach
     tmux select-window -t "$tmux_session:$claude_window"
     tmux attach-session -t "$tmux_session"
 }
@@ -2958,7 +2957,7 @@ print(s.get('bead_id', ''))
 ```bash
 tw list                          # Numbered list of all sessions
 tw attach <N>                    # Attach by index from tw list
-tw attach <name> --claude        # Jump to Claude window
+tw attach <name> --claude        # Jump to god (orchestrator) window
 tw status <feature>              # Ports, URLs, worktrees, bead, workers
 tw open <feature>                # Open primary URL in browser
 ```
@@ -3796,7 +3795,7 @@ Agent commands (used by Claude workers):
   tw status <feature> [--json]           Show ports, URLs, worktrees, bead
   tw open <feature>                     Open primary URL in browser
   tw editor <feature>                   Generate per-feature .code-workspace and open in VS Code
-  tw claude <feature>                   Open/attach to Claude orchestrator window
+  tw claude <feature>                   Open/attach to god (orchestrator) window
   tw append <feature>                   Append wrap-up text to bead (reads from stdin)
   tw setup claude                       Install hooks for auto-injecting tw prime
   tw prime                              AI workflow context (inject via hooks)
