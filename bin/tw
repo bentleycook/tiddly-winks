@@ -51,6 +51,49 @@ except Exception:
 EOF
 }
 
+# Scrub likely secrets (API keys, tokens) from text before storing in beads
+# or injecting into prompts. Replaces values with [REDACTED].
+scrub_secrets() {
+    python3 -c "
+import re, sys
+
+text = sys.stdin.read()
+
+# Patterns: prefix + separator + secret value
+# Each tuple: (description, regex)
+patterns = [
+    # Clerk keys: sk_live_, pk_live_, ce_live_, sk_test_, pk_test_, ce_test_
+    (r'(?:sk|pk|ce)_(?:live|test)_[A-Za-z0-9]{10,}'),
+    # Stripe keys: sk_live_, pk_live_, rk_live_, sk_test_, etc.
+    (r'(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{10,}'),
+    # OpenAI keys: sk-...
+    (r'sk-[A-Za-z0-9_-]{20,}'),
+    # Generic key=value or key: value with long alphanumeric secrets
+    # Match: API_KEY=abc123..., api_key: abc123..., token=abc123...
+    (r'(?<=[Kk][Ee][Yy][\s=:]+)[A-Za-z0-9_-]{20,}'),
+    (r'(?<=[Tt][Oo][Kk][Ee][Nn][\s=:]+)[A-Za-z0-9_-]{20,}'),
+    (r'(?<=[Ss][Ee][Cc][Rr][Ee][Tt][\s=:]+)[A-Za-z0-9_-]{20,}'),
+    (r'(?<=[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][\s=:]+)\S{8,}'),
+    # Bearer tokens
+    (r'(?<=[Bb]earer\s)[A-Za-z0-9._-]{20,}'),
+    # Generic long base64-ish strings preceded by common key-like labels
+    # e.g. 'API key ce_live_2TlX12oCXm68nrZHv7nt9HLZ'
+    (r'(?<=[Aa][Pp][Ii]\s[Kk][Ee][Yy]\s)[A-Za-z0-9_-]{10,}'),
+    # AWS keys
+    (r'AKIA[0-9A-Z]{16}'),
+    # GitHub tokens
+    (r'gh[pousr]_[A-Za-z0-9_]{16,}'),
+    # Generic: env-var-style NAME=long-secret on its own line
+    (r'(?m)^[A-Z][A-Z0-9_]*(?:_KEY|_SECRET|_TOKEN|_PASSWORD|_CREDENTIALS)=[^\s]{8,}'),
+]
+
+for p in patterns:
+    text = re.sub(p, '[REDACTED]', text)
+
+sys.stdout.write(text)
+"
+}
+
 # Get all service names from a YAML file
 yaml_service_names() {
     local file="$1"
@@ -106,6 +149,21 @@ try:
     proxy = d.get('proxy', {}) or {}
     for subdomain, service in proxy.items():
         print(f"{subdomain}:{service}")
+except Exception:
+    pass
+EOF
+}
+
+# Get quality gates as "name:command\n..." pairs
+yaml_quality_gates() {
+    local file="$1"
+    python3 - "$file" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    gates = d.get('quality_gates', {}) or {}
+    for name, cmd in gates.items():
+        print(f"{name}:{cmd}")
 except Exception:
     pass
 EOF
@@ -1711,7 +1769,7 @@ cmd_append() {
 
     # Read from stdin
     local appended_text
-    appended_text=$(cat)
+    appended_text=$(cat | scrub_secrets)
     [[ -z "$appended_text" ]] && die "No text provided (pipe text or paste + Ctrl-D)"
 
     local timestamp
@@ -1919,6 +1977,11 @@ workers:
     role: frontend-dev      # include only if a frontend service is present
   backend:
     role: backend-dev       # include only if a backend service is present
+
+quality_gates:                # optional: commands workers must pass before PRs
+  typecheck: "tsc --noEmit"   # only if TypeScript project
+  lint: "bun run lint"        # adapt to project's linter (eslint, ruff, etc.)
+  test: "bun test"            # adapt to project's test runner
 \`\`\`
 
 ## Rules
@@ -1938,6 +2001,9 @@ workers:
   Use exactly these role names — they map to role files in ~/.claude/roles/.
   If multiple frontends exist, use a single frontend worker (one agent covers all
   frontend codebases).
+- quality_gates: include if the project has TypeScript (typecheck), a linter (lint),
+  or tests (test). Use the project's actual commands (e.g. bun test, npm run lint,
+  ruff check, pytest). Omit for projects with no clear quality checks.
 
 ## Output
 
@@ -2132,6 +2198,20 @@ cmd_send() {
 
     nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
 
+    # GUPP: write current_task to hooked file so worker resumes on restart
+    local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+    if [[ -f "$hooked_file" ]]; then
+        python3 -c "
+import json, sys
+f = sys.argv[1]
+task = sys.argv[2]
+d = json.load(open(f))
+d['current_task'] = task
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$hooked_file" "$task" 2>/dev/null || true
+    fi
+
     # Send a minimal wake signal so the worker's next turn drains the queue.
     # A bare Enter is safe — if Claude is mid-tool-call it just buffers.
     tmux send-keys -t "$tmux_session:$worker" "" Enter
@@ -2203,7 +2283,7 @@ cmd_handoff() {
 
     if [[ -n "$worker_bead_id" && -f "$output_file" ]]; then
         local output_content
-        output_content=$(cat "$output_file")
+        output_content=$(cat "$output_file" | scrub_secrets)
         if [[ -n "$output_content" ]]; then
             local timestamp
             timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -2579,7 +2659,8 @@ cmd_spawn() {
 
     echo ""
     echo "  Spawned dynamic worker: $name (role: $role)"
-    echo "  Send work:  tw send $feature $name \"<task>\""
+    echo "  Send work:  tw hook {set|clear|show} <feature> <worker>  Manage GUPP hooks on workers
+  tw send $feature $name \"<task>\""
     echo "  Health:     tw workers $feature --health"
     echo ""
 }
@@ -2741,6 +2822,87 @@ print(json.dumps(rows, indent=2))
 }
 
 
+cmd_gates() {
+    local feature="${1:-}"
+    local specific_gate=""
+
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --gate=*) specific_gate="${1#--gate=}"; shift ;;
+            --gate)   specific_gate="${2:-}"; shift 2 ;;
+            -*) die "Unknown option: $1" ;;
+            *) shift ;;
+        esac
+    done
+
+    # Find config
+    local config_file
+    config_file=$(find_config 2>/dev/null) || die "No .tw.yml found"
+    local project
+    project=$(yaml_get "$config_file" "project" "")
+    [[ -z "$project" ]] && die "No project defined in .tw.yml"
+
+    # Parse quality gates
+    local gates_output
+    gates_output=$(yaml_quality_gates "$config_file")
+    [[ -z "$gates_output" ]] && die "No quality_gates defined in .tw.yml"
+
+    # Determine working directory: use worktree if session is active, else config dir
+    local work_dir
+    work_dir=$(dirname "$config_file")
+
+    if [[ -n "$feature" ]]; then
+        local session_key="${project}-${feature}"
+        local config_dir
+        config_dir=$(sessions_get_key "$session_key" "config_dir" 2>/dev/null || true)
+        if [[ -n "$config_dir" && -d "$config_dir" ]]; then
+            work_dir="$config_dir"
+        fi
+    fi
+
+    local total=0 passed=0 failed=0 failed_names=""
+
+    while IFS=: read -r gname gcmd; do
+        [[ -z "$gname" ]] && continue
+
+        # If --gate specified, skip non-matching gates
+        if [[ -n "$specific_gate" && "$gname" != "$specific_gate" ]]; then
+            continue
+        fi
+
+        ((total++)) || true
+        printf "\033[1;34m▶ Running gate: %s\033[0m\n" "$gname"
+        printf "  \033[2m%s\033[0m\n" "$gcmd"
+
+        if (cd "$work_dir" && eval "$gcmd") 2>&1; then
+            printf "\033[1;32m✓ %s passed\033[0m\n\n" "$gname"
+            ((passed++)) || true
+        else
+            printf "\033[1;31m✗ %s failed\033[0m\n\n" "$gname"
+            ((failed++)) || true
+            failed_names+="  - $gname"$'\n'
+        fi
+    done <<< "$gates_output"
+
+    if [[ $total -eq 0 ]]; then
+        if [[ -n "$specific_gate" ]]; then
+            die "Gate '$specific_gate' not found in quality_gates"
+        else
+            die "No quality gates to run"
+        fi
+    fi
+
+    echo "─────────────────────────────────"
+    if [[ $failed -eq 0 ]]; then
+        printf "\033[1;32mAll %d gate(s) passed\033[0m\n" "$total"
+    else
+        printf "\033[1;31m%d of %d gate(s) failed:\033[0m\n" "$failed" "$total"
+        echo "$failed_names"
+        exit 1
+    fi
+}
+
 cmd_prime() {
     # Dynamic AI context — always in sync with the CLI
     # Intended to be injected via hooks at SessionStart and PreCompact
@@ -2838,6 +3000,24 @@ bd show <bead-id>                # Load full session history
 - Branches: `bentley/{feature}`
 - Beads: `{feature} ({project})`
 PRIME
+
+    # Append quality gates if defined in project config
+    if [[ -n "${config_file:-}" ]]; then
+        local gates_output
+        gates_output=$(yaml_quality_gates "$config_file")
+        if [[ -n "$gates_output" ]]; then
+            echo ""
+            echo "## Quality Gates"
+            echo "Before submitting PRs, workers MUST run these checks:"
+            echo '```bash'
+            while IFS=: read -r gname gcmd; do
+                [[ -z "$gname" ]] && continue
+                printf '%-30s # %s\n' "$gcmd" "$gname"
+            done <<< "$gates_output"
+            echo '```'
+            echo "Run all gates: \`tw gates <feature>\`"
+        fi
+    fi
 
     # Append dynamic context if we detected a session
     if [[ -n "$current_session" ]]; then
@@ -3166,6 +3346,368 @@ PYEOF
     echo "  Test with: claude (in a directory with .tw.yml)"
 }
 
+
+cmd_hook() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        set)
+            local feature="" worker="" task=""
+            while [[ $# -gt 0 ]]; do
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$worker" ]]; then worker="$1"
+                else task="$task $1"
+                fi
+                shift
+            done
+            task="${task# }"
+            [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
+                && die 'Usage: tw hook set <feature> <worker> "<task>"'
+
+            local session_key
+            local config_file
+            if config_file=$(find_config 2>/dev/null); then
+                local project
+                project=$(yaml_get "$config_file" "project" "")
+                session_key="${project}-${feature}"
+            else
+                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+                [[ -z "$session_key" ]] && die "No session found for '$feature'"
+            fi
+
+            local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+            [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker' in session '$session_key'"
+
+            python3 -c "
+import json, sys
+f, task = sys.argv[1], sys.argv[2]
+d = json.load(open(f))
+d['current_task'] = task
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+w = d.get('worker', '?')
+print(f'  Hook set for {w}: {task}')
+" "$hooked_file" "$task"
+            ;;
+        clear)
+            local feature="${1:-}" worker="${2:-}"
+            [[ -z "$feature" || -z "$worker" ]] \
+                && die "Usage: tw hook clear <feature> <worker>"
+
+            local session_key
+            local config_file
+            if config_file=$(find_config 2>/dev/null); then
+                local project
+                project=$(yaml_get "$config_file" "project" "")
+                session_key="${project}-${feature}"
+            else
+                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+                [[ -z "$session_key" ]] && die "No session found for '$feature'"
+            fi
+
+            local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+            [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker'"
+
+            python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d.pop('current_task', None)
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+w = d.get('worker', '?')
+print(f'  Hook cleared for {w}')
+" "$hooked_file"
+            ;;
+        show)
+            local feature="${1:-}" worker="${2:-}"
+            [[ -z "$feature" || -z "$worker" ]] \
+                && die "Usage: tw hook show <feature> <worker>"
+
+            local session_key
+            local config_file
+            if config_file=$(find_config 2>/dev/null); then
+                local project
+                project=$(yaml_get "$config_file" "project" "")
+                session_key="${project}-${feature}"
+            else
+                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+                [[ -z "$session_key" ]] && die "No session found for '$feature'"
+            fi
+
+            local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+            [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker'"
+
+            python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+task = d.get('current_task', '')
+if task:
+    w = d.get('worker', '?')
+    print(f'  Hook for {w}: {task}')
+else:
+    w = d.get('worker', '?')
+    print(f'  No hook set for {w}')
+" "$hooked_file"
+            ;;
+        *)
+            die "Usage: tw hook {set|clear|show} <feature> <worker> [task]"
+            ;;
+    esac
+}
+
+
+# ─── Daemon ───────────────────────────────────────────────────────────────────
+
+DAEMON_PID_FILE="$TW_DIR/daemon.pid"
+DAEMON_LOG_FILE="$TW_DIR/logs/daemon.log"
+DAEMON_HEARTBEAT_FILE="$TW_DIR/daemon.heartbeat"
+DAEMON_HUNG_THRESHOLD=900  # 15 minutes
+
+_daemon_is_running() {
+    [[ -f "$DAEMON_PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$DAEMON_PID_FILE")
+    kill -0 "$pid" 2>/dev/null
+}
+
+_daemon_log() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$ts] $*" >> "$DAEMON_LOG_FILE"
+}
+
+_daemon_log_truncate() {
+    # Keep last 1000 lines
+    if [[ -f "$DAEMON_LOG_FILE" ]]; then
+        local lines
+        lines=$(wc -l < "$DAEMON_LOG_FILE")
+        if [[ $lines -gt 1200 ]]; then
+            local tmp
+            tmp=$(tail -1000 "$DAEMON_LOG_FILE")
+            echo "$tmp" > "$DAEMON_LOG_FILE"
+        fi
+    fi
+}
+
+_daemon_tick() {
+    _daemon_log "heartbeat tick"
+
+    [[ ! -f "$SESSIONS_FILE" ]] && { _daemon_log "no sessions file"; return; }
+
+    local session_keys
+    session_keys=$(sessions_list_keys 2>/dev/null) || { _daemon_log "failed to read sessions"; return; }
+    [[ -z "$session_keys" ]] && { _daemon_log "no active sessions"; return; }
+
+    local now
+    now=$(date +%s)
+
+    while IFS= read -r session_key; do
+        [[ -z "$session_key" ]] && continue
+
+        local project feature tmux_session
+        project=$(sessions_get_key "$session_key" "project")
+        feature=$(sessions_get_key "$session_key" "feature")
+        tmux_session="$session_key"
+
+        # Check if tmux session is alive
+        if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+            _daemon_log "DEAD session: $session_key (tmux gone) — pruning"
+            local sessions_data new_data
+            sessions_data=$(sessions_read)
+            new_data=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+data.pop(sys.argv[2], None)
+print(json.dumps(data, indent=2))
+" "$sessions_data" "$session_key")
+            echo "$new_data" | sessions_write
+            regen_caddyfile 2>/dev/null || true
+            caddy_reload 2>/dev/null || true
+            continue
+        fi
+
+        # Session is alive — check workers
+        local config_dir
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+        [[ -z "$config_dir" ]] && { _daemon_log "WARN: $session_key has no workspace"; continue; }
+
+        local config_file="$config_dir/.tw.yml"
+        [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
+        [[ ! -f "$config_file" ]] && { _daemon_log "WARN: $session_key has no config file"; continue; }
+
+        local override_file="$config_dir/.tw.override.yml"
+        [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
+        local effective_config="$config_file"
+        if [[ -f "$override_file" ]]; then
+            effective_config=$(yaml_merge_override "$config_file" "$override_file")
+        fi
+
+        local worker_pairs
+        mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
+        local dyn_pairs
+        mapfile -t dyn_pairs < <(sessions_get_dynamic_workers "$session_key")
+        worker_pairs+=("${dyn_pairs[@]}")
+
+        local bead_id
+        bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+        local dead_workers=0 alive_workers=0 hung_workers=0
+        local agents_path
+        agents_path="$(agents_dir "$session_key")"
+
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}" wrole="${wpair##*:}"
+            local is_dead=0
+
+            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+                if worker_is_alive "$tmux_session" "$wname"; then
+                    (( alive_workers++ )) || true
+                else
+                    is_dead=1
+                fi
+            else
+                is_dead=1
+            fi
+
+            if [[ $is_dead -eq 1 ]]; then
+                _daemon_log "DEAD worker: $session_key/$wname — respawning"
+                tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || true
+                local worker_bead_id
+                worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir" 2>/dev/null || echo "")
+                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null || {
+                    _daemon_log "FAIL: could not respawn $session_key/$wname"
+                }
+                (( dead_workers++ )) || true
+                continue
+            fi
+
+            # Check for hung workers (output file not modified in DAEMON_HUNG_THRESHOLD)
+            local output_file="$agents_path/${wname}.md"
+            if [[ -f "$output_file" ]]; then
+                local mtime
+                mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
+                local age_secs=$((now - mtime))
+                if [[ $age_secs -gt $DAEMON_HUNG_THRESHOLD ]]; then
+                    _daemon_log "WARN: hung worker $session_key/$wname — output not modified in ${age_secs}s"
+                    (( hung_workers++ )) || true
+                fi
+            fi
+        done
+
+        _daemon_log "session $session_key: ${alive_workers} alive, ${dead_workers} respawned, ${hung_workers} hung"
+    done <<< "$session_keys"
+
+    # Write heartbeat timestamp
+    date +%s > "$DAEMON_HEARTBEAT_FILE"
+
+    # Truncate log if needed
+    _daemon_log_truncate
+}
+
+cmd_daemon() {
+    local subcmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        start) _daemon_start "$@" ;;
+        stop)  _daemon_stop ;;
+        status) _daemon_status ;;
+        *) die "Usage: tw daemon start [--interval=180] | stop | status" ;;
+    esac
+}
+
+_daemon_start() {
+    local interval=180
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval=*) interval="${1#--interval=}"; shift ;;
+            --interval) interval="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    if _daemon_is_running; then
+        local pid
+        pid=$(cat "$DAEMON_PID_FILE")
+        die "Daemon already running (PID $pid). Stop it first: tw daemon stop"
+    fi
+
+    mkdir -p "$TW_DIR/logs"
+
+    # Fork the daemon loop into background
+    (
+        _daemon_log "daemon started (PID $$, interval ${interval}s)"
+        trap '_daemon_log "daemon stopped (PID $$)"; rm -f "$DAEMON_PID_FILE"' EXIT
+
+        while true; do
+            _daemon_tick || _daemon_log "tick error (exit code $?)"
+            sleep "$interval"
+        done
+    ) &
+    local daemon_pid=$!
+    disown "$daemon_pid"
+    echo "$daemon_pid" > "$DAEMON_PID_FILE"
+
+    log "Daemon started (PID $daemon_pid, interval ${interval}s)"
+    log "Log: $DAEMON_LOG_FILE"
+}
+
+_daemon_stop() {
+    if ! _daemon_is_running; then
+        log "Daemon is not running."
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$DAEMON_PID_FILE")
+    kill "$pid" 2>/dev/null || true
+    rm -f "$DAEMON_PID_FILE"
+    log "Daemon stopped (PID $pid)."
+}
+
+_daemon_status() {
+    echo ""
+    if _daemon_is_running; then
+        local pid
+        pid=$(cat "$DAEMON_PID_FILE")
+        echo "  Daemon: running (PID $pid)"
+    else
+        echo "  Daemon: not running"
+        # Clean up stale PID file
+        [[ -f "$DAEMON_PID_FILE" ]] && rm -f "$DAEMON_PID_FILE"
+    fi
+
+    if [[ -f "$DAEMON_HEARTBEAT_FILE" ]]; then
+        local last_beat now age_secs
+        last_beat=$(cat "$DAEMON_HEARTBEAT_FILE")
+        now=$(date +%s)
+        age_secs=$((now - last_beat))
+        local age_str
+        if [[ $age_secs -lt 60 ]]; then
+            age_str="${age_secs}s ago"
+        elif [[ $age_secs -lt 3600 ]]; then
+            age_str="$((age_secs / 60))m ago"
+        else
+            age_str="$((age_secs / 3600))h ago"
+        fi
+        echo "  Last heartbeat: $(date -r "$last_beat" '+%Y-%m-%d %H:%M:%S') ($age_str)"
+    else
+        echo "  Last heartbeat: never"
+    fi
+
+    if [[ -f "$DAEMON_LOG_FILE" ]]; then
+        echo "  Log: $DAEMON_LOG_FILE ($(wc -l < "$DAEMON_LOG_FILE") lines)"
+        echo ""
+        echo "  Recent log:"
+        tail -5 "$DAEMON_LOG_FILE" | sed 's/^/    /'
+    fi
+    echo ""
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 usage() {
@@ -3186,6 +3728,7 @@ Agent commands (used by Claude workers):
   tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
   tw patrol <feature>                   Health check: workers, services, stuck detection, auto-respawn
   tw spawn <feature> <name> <role>      Dynamically spawn a new worker into a running session
+  tw hook {set|clear|show} <feature> <worker>  Manage GUPP hooks on workers
   tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker
   tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
   tw nudge drain <session> <worker>     Drain and print all queued nudges
@@ -3198,7 +3741,12 @@ Agent commands (used by Claude workers):
   tw prime                              AI workflow context (inject via hooks)
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
+  tw gates <feature> [--gate=NAME]       Run quality gates (all or specific)
+  tw daemon {start|stop|status}          Heartbeat watchdog for worker health
   tw doctor                              Run health checks on tw environment
+  tw daemon start [--interval=180]        Start background health-check daemon
+  tw daemon stop                          Stop the daemon
+  tw daemon status                        Show daemon status + last heartbeat
 
 Config file: .tw.yml (also accepts .devenv.yml for compatibility)
 URLs: http://{project}-{feature}.localhost (Chrome/Firefox only — not Safari)
@@ -3225,11 +3773,15 @@ case "$subcommand" in
     handoff) cmd_handoff "$@" ;;
     attach)  cmd_attach "$@" ;;
     patrol)  cmd_patrol "$@" ;;
+    hook)    cmd_hook "$@" ;;
     send)    cmd_send "$@" ;;
     setup)   cmd_setup "$@" ;;
     prime)   cmd_prime ;;
     onboard) cmd_onboard ;;
+    gates)   cmd_gates "$@" ;;
+    daemon)  cmd_daemon "$@" ;;
     doctor)  cmd_doctor "$@" ;;
+    daemon)  cmd_daemon "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
