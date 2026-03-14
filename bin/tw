@@ -509,6 +509,9 @@ with open(sys.argv[1], 'w') as f:
             "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
     ) &
 
+    # Clear any leftover signals from previous session
+    worker_signal_clear_all "$session_key" "$wname" 2>/dev/null || true
+
     # Record session start in worker CV
     local _cv_project="${session_key%%-*}"
     local _cv_feature="${session_key#*-}"
@@ -855,6 +858,95 @@ if history:
         elif etype == 'respawn':
             print(f'    {ts}  respawn  {feat}')
 " "$file"
+}
+
+# ─── Worker Signal (Self-Managed Completion) ────────────────────────────────
+#
+# Workers can signal their state by writing a sentinel file.
+# Currently supported signals: "done" — worker has finished its task.
+
+worker_signal_dir() {
+    echo "$TW_DIR/signals"
+}
+
+# Write a signal for a worker. Creates a sentinel file.
+# Usage: worker_signal_set <session_key> <worker> <signal>
+worker_signal_set() {
+    local session_key="$1" worker="$2" signal="$3"
+    local dir
+    dir="$(worker_signal_dir)/${session_key}"
+    mkdir -p "$dir"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${dir}/${worker}.${signal}"
+    log "Signal set: $worker → $signal"
+}
+
+# Check if a signal is set for a worker.
+# Returns 0 if set, 1 if not.
+worker_signal_check() {
+    local session_key="$1" worker="$2" signal="$3"
+    [[ -f "$(worker_signal_dir)/${session_key}/${worker}.${signal}" ]]
+}
+
+# Clear a signal for a worker.
+worker_signal_clear() {
+    local session_key="$1" worker="$2" signal="$3"
+    rm -f "$(worker_signal_dir)/${session_key}/${worker}.${signal}"
+    log "Signal cleared: $worker ← $signal"
+}
+
+# Clear all signals for a worker (used on respawn/wake).
+worker_signal_clear_all() {
+    local session_key="$1" worker="$2"
+    rm -f "$(worker_signal_dir)/${session_key}/${worker}".* 2>/dev/null || true
+}
+
+# ─── Pool Reuse (Wake Idle Workers) ─────────────────────────────────────────
+#
+# Instead of killing an idle worker and spawning fresh, re-initialize it
+# in place: update the hooked context file and send a wake prompt.
+# This preserves the Claude session's accumulated context.
+
+# Re-initialize an idle worker with fresh context instead of respawning.
+# Returns 0 if wake succeeded, 1 if worker is not idle/alive.
+# Usage: worker_wake <tmux_session> <session_key> <config_dir> <wname> <wrole> <bead_id> <worker_bead_id>
+worker_wake() {
+    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5"
+    local bead_id="${6:-}" worker_bead_id="${7:-}"
+
+    # Only wake workers that are idle
+    if ! worker_is_idle "$tmux_session" "$wname"; then
+        return 1
+    fi
+
+    # Clear any completion signals
+    worker_signal_clear_all "$session_key" "$wname"
+
+    # Update the hooked context file with fresh bead/task info
+    local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    mkdir -p "$hooked_dir"
+    python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({
+        'bead_id': sys.argv[2],
+        'worker': sys.argv[3],
+        'role': sys.argv[4],
+        'output_file': sys.argv[5],
+        'worker_bead_id': sys.argv[6]
+    }, f, indent=2)
+" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" \
+  "$(agents_dir "$session_key")/${wname}.md" "$worker_bead_id"
+
+    # Send a wake prompt to re-activate the worker
+    local wake_msg="You are being re-activated for new work. Re-read your role and context from the SessionStart hook, check bd show $bead_id for the latest feature state, and report ready to your output file."
+    send_to_pane "$tmux_session:$wname" "$wake_msg"
+
+    # Record in CV
+    local _cv_project="${session_key%%-*}"
+    local _cv_feature="${session_key#*-}"
+    cv_record_session_start "$_cv_project" "$wname" "$_cv_feature" 2>/dev/null || true
+
+    log "Woke idle worker: $wname (reused session)"
 }
 
 bead_create() {
@@ -2588,6 +2680,9 @@ cmd_send() {
     local ttl=30
     [[ "$urgent" -eq 1 ]] && ttl=120
 
+    # Clear done signal — worker is being re-activated
+    worker_signal_clear_all "$session_key" "$worker" 2>/dev/null || true
+
     nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
 
     # GUPP: write current_task to hooked file so worker resumes on restart
@@ -2625,6 +2720,52 @@ with open(f, 'w') as fh:
     [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
     echo "  Nudge queued for $worker${urgency_label}: $task"
     echo "  Will be injected on next prompt turn via tw-mail-check hook."
+}
+
+cmd_signal() {
+    local feature="" worker="" signal=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$worker" ]]; then worker="$1"
+                elif [[ -z "$signal" ]]; then signal="$1"
+                else die "Too many arguments"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$feature" || -z "$worker" || -z "$signal" ]] \
+        && die "Usage: tw signal <feature> <worker> <signal>
+Supported signals: done, clear"
+
+    local session_key project
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+    fi
+
+    case "$signal" in
+        done)
+            worker_signal_set "$session_key" "$worker" "done"
+            echo "  ✓ $worker signaled done"
+            ;;
+        clear)
+            worker_signal_clear_all "$session_key" "$worker"
+            echo "  ✓ $worker signals cleared"
+            ;;
+        *)
+            die "Unknown signal: $signal. Supported: done, clear"
+            ;;
+    esac
 }
 
 # Check if a Claude worker is idle at the prompt (ready to receive input).
@@ -2710,11 +2851,11 @@ worker_is_alive() {
     pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1
 }
 
-# Determine worker state: working, idle, stalled, or dead.
-# Prints state to stdout. Uses process, prompt, and output file freshness signals.
-# Usage: worker_state <tmux_session> <wname> <agents_path>
+# Determine worker state: working, idle, stalled, done, or dead.
+# Prints state to stdout. Uses process, prompt, signals, and output file freshness.
+# Usage: worker_state <tmux_session> <wname> <agents_path> [session_key]
 worker_state() {
-    local tmux_session="$1" wname="$2" agents_path="${3:-}"
+    local tmux_session="$1" wname="$2" agents_path="${3:-}" session_key="${4:-$tmux_session}"
 
     # 1. Check if window exists
     if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
@@ -2726,7 +2867,12 @@ worker_state() {
         echo "dead"; return
     fi
 
-    # 3. Check output file freshness for stall detection
+    # 3. Check for "done" signal (self-managed completion)
+    if worker_signal_check "$session_key" "$wname" "done"; then
+        echo "done"; return
+    fi
+
+    # 4. Check output file freshness for stall detection
     local stalled=0
     if [[ -n "$agents_path" ]]; then
         local output_file="$agents_path/${wname}.md"
@@ -2739,12 +2885,12 @@ worker_state() {
         fi
     fi
 
-    # 4. Check if idle at prompt
+    # 5. Check if idle at prompt
     if worker_is_idle "$tmux_session" "$wname"; then
         echo "idle"; return
     fi
 
-    # 5. Alive and busy — working or stalled
+    # 6. Alive and busy — working or stalled
     if [[ $stalled -eq 1 ]]; then
         echo "stalled"; return
     fi
@@ -2939,7 +3085,7 @@ cmd_patrol() {
     printf "  %-20s %-12s %-10s %s\n" "WORKER" "STATE" "ROLE" "OUTPUT AGE"
     printf "  %-20s %-12s %-10s %s\n" "--------------------" "------------" "----------" "----------"
 
-    local dead_workers="" stalled_workers=""
+    local dead_workers="" stalled_workers="" done_workers=""
 
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
@@ -2947,11 +3093,12 @@ cmd_patrol() {
         local wrole="${wpair##*:}"
         local state output_age="-"
 
-        state=$(worker_state "$tmux_session" "$wname" "$agents_path")
+        state=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
 
         case "$state" in
             dead)    dead_workers+="$wname "; (( issues++ )) || true ;;
             stalled) stalled_workers+="$wname "; (( issues++ )) || true ;;
+            done)    done_workers+="$wname " ;;
         esac
 
         # Output file age for display
@@ -3040,6 +3187,13 @@ for name, info in s.items():
             nudge_enqueue "$session_key" "$w" "Health check from patrol — your output file hasn't been updated in over 1 hour. Are you stuck? Please report your current status." 30
             echo "      Nudged: $w"
         done
+        echo ""
+    fi
+
+    if [[ -n "$done_workers" ]]; then
+        echo "  [✓] Done workers (signaled completion): $done_workers"
+        echo "      These workers are idle and available for new tasks."
+        echo "      Wake with: tw send $feature <worker> \"<new task>\""
         echo ""
     fi
 
@@ -3275,7 +3429,7 @@ cmd_workers() {
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
             local status
-            status=$(worker_state "$tmux_session" "$wname" "$agents_path")
+            status=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
             health_lines+=("${wname}:${wrole}:${status}")
         done
 
@@ -3529,10 +3683,11 @@ tw prune                         # Clean up dead sessions after reboot
 
 ### Worker Management
 ```bash
-tw workers <feature> --health    # Check worker state (working/idle/stalled/dead)
+tw workers <feature> --health    # Check worker state (working/idle/stalled/done/dead)
 tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
-tw send <feature> <worker> "task description"  # Queue task for a worker
+tw send <feature> <worker> "task description"  # Queue task for a worker (clears done signal)
+tw signal <feature> <worker> done   # Signal task completion (available for reuse)
 tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
 tw patrol <feature>              # Full health check + auto-respawn + plugins
 tw spawn <feature> <name> <role> # Add a worker to a running session
@@ -4783,14 +4938,16 @@ Commands:
 
 Agent commands (used by Claude workers):
   tw workers <feature>                  Spawn missing worker windows into a running session
-  tw workers <feature> --health [--json] Check worker state (working/idle/stalled/dead)
+  tw workers <feature> --health [--json] Check worker state (working/idle/stalled/done/dead)
   tw workers <feature> --cv <name>     Show worker CV and work history
   tw workers <feature> --respawn [--force] Respawn dead workers (--force overrides circuit breaker)
   tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
   tw patrol <feature>                   Health check: workers, services, stuck detection, auto-respawn
   tw spawn <feature> <name> <role>      Dynamically spawn a new worker into a running session
+  tw signal <feature> <worker> done     Signal task completion (worker stays alive, available for reuse)
+  tw signal <feature> <worker> clear    Clear all signals for a worker
   tw hook {set|clear|show} <feature> <worker>  Manage GUPP hooks on workers
-  tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker
+  tw send <feature> <worker> "<task>" [--urgent]   Queue a nudge for a worker (clears done signal)
   tw nudge enqueue <session> <worker> "<msg>" [ttl] Enqueue a raw nudge message
   tw nudge drain <session> <worker>     Drain and print all queued nudges
   tw status <feature> [--json]           Show ports, URLs, worktrees, bead
@@ -4839,6 +4996,7 @@ case "$subcommand" in
     patrol)  cmd_patrol "$@" ;;
     hook)    cmd_hook "$@" ;;
     send)    cmd_send "$@" ;;
+    signal)  cmd_signal "$@" ;;
     setup)   cmd_setup "$@" ;;
     prime)   cmd_prime ;;
     onboard) cmd_onboard ;;
