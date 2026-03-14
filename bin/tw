@@ -1414,7 +1414,9 @@ cmd_start() {
         local worker_bead_id
         worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
         spawn_worker "$tmux_session" "$session_key" "$config_dir" \
-            "$wname" "$wrole" "$bead_id" "$worker_bead_id"
+            "$wname" "$wrole" "$bead_id" "$worker_bead_id" || {
+            log "Worker $wname spawn failed (non-fatal, session continues)"
+        }
         workers_str+="$wpair"$'\n'
     done
 
