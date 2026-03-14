@@ -509,6 +509,11 @@ with open(sys.argv[1], 'w') as f:
             "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
     ) &
 
+    # Record session start in worker CV
+    local _cv_project="${session_key%%-*}"
+    local _cv_feature="${session_key#*-}"
+    cv_record_session_start "$_cv_project" "$wname" "$_cv_feature" 2>/dev/null || true
+
     log "Started worker: $wname (role: $wrole)"
 }
 
@@ -690,6 +695,166 @@ breaker_notify_god() {
         tmux send-keys -t "$tmux_session:god" "$msg" Enter 2>/dev/null || true
     fi
     log "$msg"
+}
+
+# ─── Worker CV (Persistent Identity) ─────────────────────────────────────────
+#
+# JSON file per worker tracking sessions, completions, and work history.
+# Survives across features and sessions. Stored locally for fast access.
+
+cv_dir() { echo "$TW_DIR/cv"; }
+
+# Get the CV file path for a worker. Keyed by project+worker (not session),
+# so CVs persist across features within a project.
+cv_file() {
+    local project="$1" worker="$2"
+    echo "$(cv_dir)/${project}-${worker}.json"
+}
+
+# Initialize or load a CV. Prints the file path.
+cv_ensure() {
+    local project="$1" worker="$2"
+    local file
+    file=$(cv_file "$project" "$worker")
+    mkdir -p "$(cv_dir)"
+    if [[ ! -f "$file" ]]; then
+        python3 -c "
+import json, sys
+from datetime import datetime, timezone
+cv = {
+    'worker': sys.argv[1],
+    'project': sys.argv[2],
+    'created': datetime.now(timezone.utc).isoformat(),
+    'sessions': 0,
+    'handoffs': 0,
+    'features_worked': [],
+    'history': []
+}
+with open(sys.argv[3], 'w') as f:
+    json.dump(cv, f, indent=2)
+" "$worker" "$project" "$file"
+    fi
+    echo "$file"
+}
+
+# Record a session start in the CV.
+cv_record_session_start() {
+    local project="$1" worker="$2" feature="$3"
+    local file
+    file=$(cv_ensure "$project" "$worker")
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone
+with open(sys.argv[1]) as f:
+    cv = json.load(f)
+cv['sessions'] = cv.get('sessions', 0) + 1
+feat = sys.argv[2]
+if feat not in cv.get('features_worked', []):
+    cv.setdefault('features_worked', []).append(feat)
+with open(sys.argv[1], 'w') as f:
+    json.dump(cv, f, indent=2)
+" "$file" "$feature"
+}
+
+# Record a handoff in the CV with a summary of work done.
+cv_record_handoff() {
+    local project="$1" worker="$2" feature="$3" summary="$4"
+    local file
+    file=$(cv_ensure "$project" "$worker")
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone
+with open(sys.argv[1]) as f:
+    cv = json.load(f)
+cv['handoffs'] = cv.get('handoffs', 0) + 1
+entry = {
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'feature': sys.argv[2],
+    'type': 'handoff',
+    'summary': sys.argv[3]
+}
+cv.setdefault('history', []).append(entry)
+# Keep last 50 history entries
+cv['history'] = cv['history'][-50:]
+with open(sys.argv[1], 'w') as f:
+    json.dump(cv, f, indent=2)
+" "$file" "$feature" "$summary"
+}
+
+# Record a respawn (crash recovery) in the CV.
+cv_record_respawn() {
+    local project="$1" worker="$2" feature="$3"
+    local file
+    file=$(cv_ensure "$project" "$worker")
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone
+with open(sys.argv[1]) as f:
+    cv = json.load(f)
+entry = {
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'feature': sys.argv[2],
+    'type': 'respawn'
+}
+cv.setdefault('history', []).append(entry)
+cv['history'] = cv['history'][-50:]
+with open(sys.argv[1], 'w') as f:
+    json.dump(cv, f, indent=2)
+" "$file" "$feature"
+}
+
+# Display a worker's CV in human-readable format.
+cv_show() {
+    local project="$1" worker="$2"
+    local file
+    file=$(cv_file "$project" "$worker")
+    if [[ ! -f "$file" ]]; then
+        echo "  No CV found for $worker ($project)"
+        return 1
+    fi
+    python3 -c "
+import json, sys
+from datetime import datetime, timezone
+
+with open(sys.argv[1]) as f:
+    cv = json.load(f)
+
+worker = cv.get('worker', '?')
+project = cv.get('project', '?')
+created = cv.get('created', '?')[:10]
+sessions = cv.get('sessions', 0)
+handoffs = cv.get('handoffs', 0)
+features = cv.get('features_worked', [])
+history = cv.get('history', [])
+
+# Count respawns
+respawns = sum(1 for h in history if h.get('type') == 'respawn')
+
+print(f'  Worker:     {worker}')
+print(f'  Project:    {project}')
+print(f'  Since:      {created}')
+print(f'  Sessions:   {sessions}')
+print(f'  Handoffs:   {handoffs}')
+print(f'  Respawns:   {respawns}')
+print(f'  Features:   {\", \".join(features) if features else \"(none)\"}')
+
+if history:
+    print()
+    print('  Recent history:')
+    now = datetime.now(timezone.utc)
+    for entry in history[-10:]:
+        ts = entry.get('timestamp', '')[:16].replace('T', ' ')
+        etype = entry.get('type', '?')
+        feat = entry.get('feature', '')
+        summary = entry.get('summary', '')
+        if etype == 'handoff':
+            # Truncate long summaries
+            if len(summary) > 60:
+                summary = summary[:57] + '...'
+            print(f'    {ts}  handoff  {feat}: {summary}')
+        elif etype == 'respawn':
+            print(f'    {ts}  respawn  {feat}')
+" "$file"
 }
 
 bead_create() {
@@ -2696,6 +2861,16 @@ with open(sys.argv[1], 'w') as f:
     # Voluntary handoff = healthy worker — reset circuit breaker
     breaker_reset "$session_key" "$worker"
 
+    # Record handoff in worker CV
+    local _cv_feature="${session_key#*-}"
+    local _cv_summary=""
+    if [[ -n "${output_content:-}" ]]; then
+        # Extract first meaningful line as summary
+        _cv_summary=$(echo "$output_content" | grep -v '^$' | grep -v '^#' | head -1 | cut -c1-80)
+    fi
+    [[ -z "$_cv_summary" ]] && _cv_summary="session handoff"
+    cv_record_handoff "$project" "$worker" "$_cv_feature" "$_cv_summary" 2>/dev/null || true
+
     log "Handed off $worker — fresh session starting with identity bead $worker_bead_id"
     echo "  Handoff complete: $worker"
     echo "  Identity bead: $worker_bead_id (work history preserved)"
@@ -2847,7 +3022,7 @@ for name, info in s.items():
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$w" "$project" "$config_dir" 2>/dev/null || echo "")
                 spawn_worker "$tmux_session" "$session_key" "$config_dir" "$w" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null \
-                    && echo "      ✓ $w respawned" \
+                    && { echo "      ✓ $w respawned"; cv_record_respawn "$project" "$w" "$feature" 2>/dev/null || true; } \
                     || echo "      ✗ $w respawn failed"
             else
                 # Breaker tripped
@@ -3032,7 +3207,7 @@ cmd_spawn() {
 }
 
 cmd_workers() {
-    local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0
+    local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0 cv_worker=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3040,12 +3215,14 @@ cmd_workers() {
             --respawn) respawn_flag=1; shift ;;
             --json) json_flag=1; shift ;;
             --force) force_flag=1; shift ;;
+            --cv) cv_worker="${2:-}"; shift; [[ -n "$cv_worker" ]] && shift ;;
+            --cv=*) cv_worker="${1#--cv=}"; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--force]"
+    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--cv <worker>]"
 
     # Resolve session + config
     local session_key project config_dir tmux_session effective_config
@@ -3127,6 +3304,14 @@ print(json.dumps(rows, indent=2))
             done
             echo ""
         fi
+        return 0
+    fi
+
+    # --cv: show worker CV
+    if [[ -n "$cv_worker" ]]; then
+        echo ""
+        cv_show "$project" "$cv_worker"
+        echo ""
         return 0
     fi
 
@@ -3344,7 +3529,8 @@ tw prune                         # Clean up dead sessions after reboot
 
 ### Worker Management
 ```bash
-tw workers <feature> --health    # Check worker liveness
+tw workers <feature> --health    # Check worker state (working/idle/stalled/dead)
+tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
 tw send <feature> <worker> "task description"  # Queue task for a worker
 tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
@@ -4597,7 +4783,8 @@ Commands:
 
 Agent commands (used by Claude workers):
   tw workers <feature>                  Spawn missing worker windows into a running session
-  tw workers <feature> --health [--json] Check worker window liveness (alive/dead/missing)
+  tw workers <feature> --health [--json] Check worker state (working/idle/stalled/dead)
+  tw workers <feature> --cv <name>     Show worker CV and work history
   tw workers <feature> --respawn [--force] Respawn dead workers (--force overrides circuit breaker)
   tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
   tw patrol <feature>                   Health check: workers, services, stuck detection, auto-respawn
