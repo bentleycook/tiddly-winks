@@ -1813,19 +1813,14 @@ PYEOF
             return 1
         fi
     elif [[ "$target" =~ ^[0-9]+$ ]]; then
-        # Index-based: pick Nth alive session (1-based)
+        # Index-based: pick Nth session (1-based, matches tw list order)
         session_key=$(python3 - "$sessions_data" "$target" <<'PYEOF'
-import json, sys, subprocess
+import json, sys
 data = json.loads(sys.argv[1])
 idx = int(sys.argv[2])
-alive = []
-for key, s in data.items():
-    sk = f"{s['project']}-{s['feature']}"
-    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
-    if r.returncode == 0:
-        alive.append(sk)
-if 1 <= idx <= len(alive):
-    print(alive[idx - 1])
+keys = list(data.keys())
+if 1 <= idx <= len(keys):
+    print(keys[idx - 1])
 PYEOF
         )
         [[ -z "$session_key" ]] && die "No session at index $target (have $(sessions_list_keys | wc -l | tr -d ' ') sessions)"
