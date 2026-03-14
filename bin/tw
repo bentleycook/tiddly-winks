@@ -1316,15 +1316,17 @@ for svc, path in wt.items():
         fi
     fi
 
-    # Remove from sessions.json
-    local sessions_data
-    sessions_data=$(sessions_read)
-    python3 - "$sessions_data" "$session_key" <<'EOF' | sessions_write
+    # Only remove from sessions.json if --done; otherwise keep as "stopped"
+    if [[ $done_flag -eq 1 ]]; then
+        local sessions_data
+        sessions_data=$(sessions_read)
+        python3 - "$sessions_data" "$session_key" <<'EOF' | sessions_write
 import json, sys
 data = json.loads(sys.argv[1])
 data.pop(sys.argv[2], None)
 print(json.dumps(data, indent=2))
 EOF
+    fi
 
     # Regen Caddyfile
     regen_caddyfile
@@ -1351,7 +1353,12 @@ EOF
     fi
 
     echo "  Stopped: $feature ($project)"
-    [[ $done_flag -eq 1 ]] && echo "  Bead $bead_id closed." || echo "  Bead $bead_id open (use --done to close)."
+    if [[ $done_flag -eq 1 ]]; then
+        echo "  Bead $bead_id closed. Session removed."
+    else
+        echo "  Bead $bead_id open. Restart with: tw start $feature"
+        echo "  Remove with: tw stop $feature --done"
+    fi
 }
 
 cmd_list() {
@@ -1399,7 +1406,7 @@ for key, s in data.items():
     bead = s.get('bead_id', '')
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
-    status = 'alive' if feature_alive(proj, feat) else 'dead'
+    status = 'alive' if feature_alive(proj, feat) else 'stopped'
     rows.append({
         "index": idx,
         "project": proj,
@@ -3432,6 +3439,171 @@ print(dead)
         _hint "Add to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 
+    # 10. Orphaned spinner PIDs
+    local orphan_spinners=0
+    for pid_file in "$TW_DIR"/spinner-*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        local spid
+        spid=$(cat "$pid_file")
+        if ! kill -0 "$spid" 2>/dev/null; then
+            (( orphan_spinners++ )) || true
+            rm -f "$pid_file"
+        fi
+    done
+    if [[ $orphan_spinners -gt 0 ]]; then
+        _warn "$orphan_spinners orphaned spinner PID file(s) cleaned up"
+    else
+        _ok "No orphaned spinner PIDs"
+    fi
+
+    # 11. Caddy route sync — check that every alive session has matching Caddy routes
+    if curl -sf "$CADDY_ADMIN/config/" &>/dev/null && [[ -f "$SESSIONS_FILE" ]]; then
+        local caddy_config route_mismatches=0
+        caddy_config=$(curl -sf "$CADDY_ADMIN/config/" 2>/dev/null || echo '{}')
+        local missing_routes
+        missing_routes=$(python3 - "$caddy_config" <<'PYEOF' 2>/dev/null || true
+import json, sys, subprocess
+
+caddy = json.loads(sys.argv[1])
+caddy_str = json.dumps(caddy)
+
+sessions = json.load(open("$SESSIONS_FILE"))
+missing = []
+for key, s in sessions.items():
+    sk = f"{s.get('project','')}-{s.get('feature','')}"
+    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    if r.returncode != 0:
+        continue  # not alive, skip
+    proxy_map = s.get('proxy_map', {})
+    for subdomain in proxy_map:
+        if subdomain == '':
+            host = f"{s['project']}-{s['feature']}.localhost"
+        else:
+            host = f"{s['project']}-{s['feature']}-{subdomain}.localhost"
+        if host not in caddy_str:
+            missing.append(host)
+
+for m in missing:
+    print(m)
+PYEOF
+        )
+        if [[ -n "$missing_routes" ]]; then
+            route_mismatches=$(echo "$missing_routes" | wc -l | tr -d ' ')
+            _warn "$route_mismatches Caddy route(s) missing for alive sessions"
+            while IFS= read -r route; do
+                _hint "Missing: $route"
+            done <<< "$missing_routes"
+            _hint "Fix with: tw prune && tw start <feature>"
+        else
+            _ok "Caddy routes in sync with alive sessions"
+        fi
+    fi
+
+    # 12. Stale worktrees — worktree dirs that exist but have no matching session
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        local stale_wt=0
+        local all_wt_paths
+        all_wt_paths=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+for s in d.values():
+    for path in s.get('worktrees', {}).values():
+        print(path)
+" 2>/dev/null || true)
+
+        # Check each registered worktree path actually exists
+        while IFS= read -r wt_path; do
+            [[ -z "$wt_path" ]] && continue
+            if [[ ! -d "$wt_path" ]]; then
+                (( stale_wt++ )) || true
+                _warn "Worktree path missing on disk: $wt_path"
+                _hint "Session may need restart: tw stop <feature> && tw start <feature>"
+            fi
+        done <<< "$all_wt_paths"
+        [[ $stale_wt -eq 0 ]] && _ok "All registered worktree paths exist"
+    fi
+
+    # 13. Orphaned tw workers — claude processes with TW_WORKER env that aren't in a tmux pane
+    local orphan_workers
+    orphan_workers=$(python3 - <<'PYEOF' 2>/dev/null || echo 0
+import subprocess
+
+# Get all tmux pane PIDs
+try:
+    r = subprocess.run(['tmux', 'list-panes', '-a', '-F', '#{pane_pid}'],
+                       capture_output=True, text=True)
+    pane_pids = set(r.stdout.strip().split('\n')) if r.returncode == 0 else set()
+except Exception:
+    pane_pids = set()
+
+# Get all claude PIDs
+try:
+    r = subprocess.run(['pgrep', '-f', 'claude.*--dangerously-skip-permissions'],
+                       capture_output=True, text=True)
+    claude_pids = [p.strip() for p in r.stdout.strip().split('\n') if p.strip()]
+except Exception:
+    claude_pids = []
+
+orphans = 0
+for cpid in claude_pids:
+    # Check if this is a tw worker (parent shell has TW_WORKER in env)
+    try:
+        r = subprocess.run(['ps', '-p', cpid, '-o', 'ppid='], capture_output=True, text=True)
+        ppid = r.stdout.strip()
+        if not ppid:
+            continue
+        # Check parent's environment for TW_WORKER
+        r = subprocess.run(['ps', '-p', ppid, '-E', '-o', 'command='],
+                           capture_output=True, text=True)
+        if 'TW_WORKER' not in r.stdout and 'TW_SESSION' not in r.stdout:
+            continue  # Not a tw-managed process, skip
+        # It's a tw worker — check if parent is a live tmux pane
+        if ppid not in pane_pids:
+            orphans += 1
+    except Exception:
+        continue
+
+print(orphans)
+PYEOF
+    )
+    if [[ "$orphan_workers" -gt 0 ]] 2>/dev/null; then
+        _warn "$orphan_workers orphaned tw worker process(es) found (not in any tmux pane)"
+        _hint "Inspect with: ps aux | grep 'TW_WORKER.*claude'"
+    else
+        _ok "No orphaned tw worker processes"
+    fi
+
+    # 14. Port conflicts — check if any session's ports are held by unexpected processes
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        local port_conflicts=0
+        python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+for key, s in d.items():
+    for svc, info in s.get('services', {}).items():
+        port = info.get('port', '') if isinstance(info, dict) else info
+        if port:
+            print(f'{key}|{svc}|{port}')
+" 2>/dev/null | while IFS='|' read -r sk svc port; do
+            [[ -z "$port" ]] && continue
+            local port_holder
+            port_holder=$(lsof -ti :"$port" 2>/dev/null | head -1)
+            if [[ -n "$port_holder" ]]; then
+                # Check if the process belongs to this session's tmux
+                local holder_cmd
+                holder_cmd=$(ps -p "$port_holder" -o command= 2>/dev/null | head -c 60)
+                # Port is in use — that's expected if session is alive. Only warn if session is dead.
+                local tmux_key="${sk}"
+                if ! tmux has-session -t "$tmux_key" 2>/dev/null; then
+                    _warn "Port $port ($svc in $sk) held by stale process: $holder_cmd"
+                    _hint "Kill with: kill $port_holder"
+                    (( port_conflicts++ )) || true
+                fi
+            fi
+        done
+        [[ ${port_conflicts:-0} -eq 0 ]] && _ok "No stale port conflicts"
+    fi
+
     # Summary
     echo
     if [[ $errors -eq 0 && $warnings -eq 0 ]]; then
@@ -3981,6 +4153,220 @@ _daemon_status() {
     echo ""
 }
 
+# ─── Runtime Config ──────────────────────────────────────────────────────────
+
+cmd_config() {
+    local sub="${1:-}"
+    shift 2>/dev/null || true
+
+    case "$sub" in
+        proxy)   _config_proxy "$@" ;;
+        service) _config_service "$@" ;;
+        show)    _config_show "$@" ;;
+        *)
+            cat <<'EOF'
+tw config — modify runtime session configuration
+
+  tw config proxy <feature> <subdomain> <service>   Remap a proxy route
+  tw config service <feature> <name> port <port>    Change a service's port
+  tw config service <feature> <name> add <port>     Register a new service
+  tw config show <feature>                          Show current runtime config
+
+Examples:
+  tw config proxy my-feature "" frontend      # route primary URL to frontend
+  tw config proxy my-feature api backend      # route -api subdomain to backend
+  tw config service my-feature web port 5173  # set web service port
+  tw config service my-feature web add 5173   # register new service "web" on port 5173
+EOF
+            ;;
+    esac
+}
+
+_config_resolve_session() {
+    local feature="$1"
+    local session_key project config_dir tmux_session config_file
+
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        config_dir="$(dirname "$config_file")"
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+    fi
+
+    echo "$session_key"
+}
+
+_config_proxy() {
+    local feature="${1:-}" subdomain="${2:-}" service="${3:-}"
+    [[ -z "$feature" || -z "$service" ]] \
+        && die "Usage: tw config proxy <feature> <subdomain> <service>
+  subdomain: \"\" for primary, or a name like \"api\"
+  service: name of the service to proxy to (must exist in session)"
+
+    # Allow "" to be passed as empty string for primary subdomain
+    [[ "$subdomain" == '""' || "$subdomain" == "''" ]] && subdomain=""
+
+    local session_key
+    session_key=$(_config_resolve_session "$feature")
+
+    # Verify the service exists in the session
+    local sessions_data
+    sessions_data=$(sessions_read)
+    local svc_exists
+    svc_exists=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+s = d.get(sys.argv[2], {})
+svcs = s.get('services', {})
+print('yes' if sys.argv[3] in svcs else 'no')
+" "$sessions_data" "$session_key" "$service" 2>/dev/null)
+
+    [[ "$svc_exists" != "yes" ]] && die "Service '$service' not found in session '$session_key'. Available: $(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+s = d.get(sys.argv[2], {})
+print(', '.join(s.get('services', {}).keys()))
+" "$sessions_data" "$session_key" 2>/dev/null)"
+
+    # Update proxy_map in sessions.json
+    local new_sessions
+    new_sessions=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
+subdomain = sys.argv[3]
+service = sys.argv[4]
+if key in data:
+    data[key].setdefault('proxy_map', {})[subdomain] = service
+print(json.dumps(data, indent=2))
+" "$sessions_data" "$session_key" "$subdomain" "$service")
+    echo "$new_sessions" | sessions_write
+
+    regen_caddyfile
+    caddy_reload
+
+    local project feature_name
+    project=$(echo "$sessions_data" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('$session_key',{}).get('project',''))")
+    feature_name=$(echo "$sessions_data" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('$session_key',{}).get('feature',''))")
+
+    local url
+    if [[ -z "$subdomain" ]]; then
+        url="http://${project}-${feature_name}.localhost"
+    else
+        url="http://${project}-${feature_name}-${subdomain}.localhost"
+    fi
+
+    echo "  Proxy updated: $url → $service"
+    echo "  Caddy reloaded."
+}
+
+_config_service() {
+    local feature="${1:-}" name="${2:-}" action="${3:-}" value="${4:-}"
+    [[ -z "$feature" || -z "$name" || -z "$action" ]] \
+        && die "Usage: tw config service <feature> <name> {port|add} <value>"
+
+    local session_key
+    session_key=$(_config_resolve_session "$feature")
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    case "$action" in
+        port)
+            [[ -z "$value" ]] && die "Usage: tw config service <feature> <name> port <port>"
+            local new_sessions
+            new_sessions=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
+name = sys.argv[3]
+port = int(sys.argv[4])
+if key in data and name in data[key].get('services', {}):
+    data[key]['services'][name]['port'] = port
+    print(json.dumps(data, indent=2))
+else:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+" "$sessions_data" "$session_key" "$name" "$value") \
+                || die "Service '$name' not found in session '$session_key'"
+            echo "$new_sessions" | sessions_write
+            regen_caddyfile
+            caddy_reload
+            echo "  Service '$name' port updated to $value. Caddy reloaded."
+            ;;
+        add)
+            [[ -z "$value" ]] && die "Usage: tw config service <feature> <name> add <port>"
+            local new_sessions
+            new_sessions=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
+name = sys.argv[3]
+port = int(sys.argv[4])
+if key in data:
+    data[key].setdefault('services', {})[name] = {'port': port}
+    print(json.dumps(data, indent=2))
+else:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+" "$sessions_data" "$session_key" "$name" "$value") \
+                || die "Session '$session_key' not found"
+            echo "$new_sessions" | sessions_write
+            regen_caddyfile
+            caddy_reload
+            echo "  Service '$name' added on port $value. Caddy reloaded."
+            ;;
+        *)
+            die "Unknown action '$action'. Use: port, add"
+            ;;
+    esac
+}
+
+_config_show() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw config show <feature>"
+
+    local session_key
+    session_key=$(_config_resolve_session "$feature")
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    python3 - "$sessions_data" "$session_key" <<'PYEOF'
+import json, sys
+
+data = json.loads(sys.argv[1])
+key = sys.argv[2]
+s = data.get(key)
+if not s:
+    print(f"  No session '{key}' found.")
+    sys.exit(1)
+
+project = s.get('project', '')
+feature = s.get('feature', '')
+services = s.get('services', {})
+proxy_map = s.get('proxy_map', {})
+
+print(f"  Session: {key}")
+print()
+print("  Services:")
+for name, info in services.items():
+    port = info.get('port', '?')
+    print(f"    {name}: port {port}")
+
+print()
+print("  Proxy routes:")
+for subdomain, svc_name in proxy_map.items():
+    svc = services.get(svc_name, {})
+    port = svc.get('port', '?')
+    if subdomain == '':
+        host = f'http://{project}-{feature}.localhost'
+    else:
+        host = f'http://{project}-{feature}-{subdomain}.localhost'
+    print(f"    {host} → {svc_name} (:{port})")
+PYEOF
+}
+
 # ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 usage() {
@@ -4015,6 +4401,10 @@ Agent commands (used by Claude workers):
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
   tw gates <feature> [--gate=NAME]       Run quality gates (all or specific)
+  tw config proxy <feature> <sub> <svc>   Remap a proxy route at runtime
+  tw config service <feature> <n> port <p> Update a service's port
+  tw config service <feature> <n> add <p>  Register a new service
+  tw config show <feature>                Show runtime config (services + proxies)
   tw doctor                              Run health checks on tw environment
   tw daemon start [--interval=180]        Start background health-check daemon
   tw daemon stop                          Stop the daemon
@@ -4052,6 +4442,7 @@ case "$subcommand" in
     onboard) cmd_onboard ;;
     gates)   cmd_gates "$@" ;;
     daemon)  cmd_daemon "$@" ;;
+    config)  cmd_config "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
