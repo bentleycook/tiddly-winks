@@ -2545,6 +2545,48 @@ worker_is_alive() {
     pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1
 }
 
+# Determine worker state: working, idle, stalled, or dead.
+# Prints state to stdout. Uses process, prompt, and output file freshness signals.
+# Usage: worker_state <tmux_session> <wname> <agents_path>
+worker_state() {
+    local tmux_session="$1" wname="$2" agents_path="${3:-}"
+
+    # 1. Check if window exists
+    if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+        echo "dead"; return
+    fi
+
+    # 2. Check if Claude process is alive
+    if ! worker_is_alive "$tmux_session" "$wname"; then
+        echo "dead"; return
+    fi
+
+    # 3. Check output file freshness for stall detection
+    local stalled=0
+    if [[ -n "$agents_path" ]]; then
+        local output_file="$agents_path/${wname}.md"
+        if [[ -f "$output_file" ]]; then
+            local now mtime age_secs
+            now=$(date +%s)
+            mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
+            age_secs=$((now - mtime))
+            [[ $age_secs -gt 3600 ]] && stalled=1
+        fi
+    fi
+
+    # 4. Check if idle at prompt
+    if worker_is_idle "$tmux_session" "$wname"; then
+        echo "idle"; return
+    fi
+
+    # 5. Alive and busy — working or stalled
+    if [[ $stalled -eq 1 ]]; then
+        echo "stalled"; return
+    fi
+
+    echo "working"
+}
+
 cmd_handoff() {
     local feature="" worker=""
 
@@ -2718,32 +2760,26 @@ cmd_patrol() {
     echo "  └─────────────────────────────────────────────────────────┘"
     echo ""
 
-    # 1. Worker window health
-    printf "  %-20s %-10s %-10s %s\n" "WORKER" "WINDOW" "PROCESS" "OUTPUT AGE"
-    printf "  %-20s %-10s %-10s %s\n" "--------------------" "----------" "----------" "----------"
+    # 1. Worker state assessment
+    printf "  %-20s %-12s %-10s %s\n" "WORKER" "STATE" "ROLE" "OUTPUT AGE"
+    printf "  %-20s %-12s %-10s %s\n" "--------------------" "------------" "----------" "----------"
 
-    local dead_workers="" stuck_workers=""
+    local dead_workers="" stalled_workers=""
 
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
-        local window_status="missing" process_status="-" output_age="-"
+        local wrole="${wpair##*:}"
+        local state output_age="-"
 
-        if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
-            window_status="present"
-            if worker_is_alive "$tmux_session" "$wname"; then
-                process_status="alive"
-            else
-                process_status="dead"
-                dead_workers+="$wname "
-                (( issues++ )) || true
-            fi
-        else
-            dead_workers+="$wname "
-            (( issues++ )) || true
-        fi
+        state=$(worker_state "$tmux_session" "$wname" "$agents_path")
 
-        # Check output file freshness
+        case "$state" in
+            dead)    dead_workers+="$wname "; (( issues++ )) || true ;;
+            stalled) stalled_workers+="$wname "; (( issues++ )) || true ;;
+        esac
+
+        # Output file age for display
         local output_file="$agents_path/${wname}.md"
         if [[ -f "$output_file" ]]; then
             local mtime
@@ -2755,17 +2791,12 @@ cmd_patrol() {
                 output_age="$((age_secs / 60))m"
             else
                 output_age="$((age_secs / 3600))h"
-                # Stuck if alive but no output in >1h
-                if [[ "$process_status" == "alive" && $age_secs -gt 3600 ]]; then
-                    stuck_workers+="$wname "
-                    (( issues++ )) || true
-                fi
             fi
         else
             output_age="none"
         fi
 
-        printf "  %-20s %-10s %-10s %s\n" "$wname" "$window_status" "$process_status" "$output_age"
+        printf "  %-20s %-12s %-10s %s\n" "$wname" "$state" "$wrole" "$output_age"
     done
 
     echo ""
@@ -2828,9 +2859,9 @@ for name, info in s.items():
         echo ""
     fi
 
-    if [[ -n "$stuck_workers" ]]; then
-        echo "  [!] Stuck workers (>1h no output): $stuck_workers"
-        for w in $stuck_workers; do
+    if [[ -n "$stalled_workers" ]]; then
+        echo "  [!] Stalled workers (>1h no output): $stalled_workers"
+        for w in $stalled_workers; do
             nudge_enqueue "$session_key" "$w" "Health check from patrol — your output file hasn't been updated in over 1 hour. Are you stuck? Please report your current status." 30
             echo "      Nudged: $w"
         done
@@ -3057,21 +3088,17 @@ cmd_workers() {
 
     mkdir -p "$(agents_dir "$session_key")"
 
-    # --health: report worker status
+    # --health: report worker status with 4-state model
     if [[ $health_flag -eq 1 ]]; then
+        local agents_path
+        agents_path="$(agents_dir "$session_key")"
         # Collect worker status lines as "name:role:status"
         local health_lines=()
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
-            local status="missing"
-            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
-                if worker_is_alive "$tmux_session" "$wname"; then
-                    status="alive"
-                else
-                    status="dead"
-                fi
-            fi
+            local status
+            status=$(worker_state "$tmux_session" "$wname" "$agents_path")
             health_lines+=("${wname}:${wrole}:${status}")
         done
 
