@@ -289,6 +289,19 @@ With `--done`:
 - Removes all worktrees (`git worktree remove --force`)
 - Closes the bead
 
+### Fixing proxy routes at runtime
+
+If the proxy is pointing at the wrong service (e.g. backend instead of frontend):
+
+```bash
+tw config show my-feature                    # see current config
+tw config proxy my-feature "" frontend       # fix primary URL → frontend
+tw config proxy my-feature api backend       # fix -api subdomain → backend
+tw config service my-feature web add 5173    # register a new service
+```
+
+Changes take effect immediately — Caddy reloads automatically.
+
 ### After a reboot
 
 tmux sessions don't survive reboots. Clean up stale session records:
@@ -358,6 +371,9 @@ tw editor <feature>                   Generate .code-workspace and open in VS Co
 tw claude <feature>                   Attach to orchestrator window
 tw append <feature>                   Append text to bead (reads from stdin)
 tw prune                              Remove stale sessions after reboot
+tw config show <feature>              Show runtime services + proxy routes
+tw config proxy <feature> <sub> <svc> Remap a proxy route (Caddy reloads)
+tw config service <feature> ...       Add/update service ports
 tw doctor                             Run health checks on tw environment
 tw setup claude                       Install Claude hooks for auto-context injection
 tw help                               Show usage

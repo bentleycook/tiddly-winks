@@ -458,10 +458,24 @@ caddy_reload() {
 
 agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 
+# Maximum concurrent Claude worker processes across all sessions.
+# Safety net to prevent spawn storms from overwhelming the machine.
+TW_MAX_WORKERS=${TW_MAX_WORKERS:-20}
+
 # Spawn a worker window and wire up hook-based context injection.
 # Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id]
 spawn_worker() {
     local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}" worker_bead_id="${7:-}"
+
+    # Spawn cap — refuse if too many Claude workers are already running
+    local active_workers
+    active_workers=$(pgrep -f "claude.*--dangerously-skip-permissions" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$active_workers" -ge "$TW_MAX_WORKERS" ]]; then
+        log "Spawn cap reached: $active_workers active workers (max $TW_MAX_WORKERS). Refusing to spawn $wname."
+        echo "  ⚡ Spawn cap: $active_workers/$TW_MAX_WORKERS workers running. Not spawning $wname." >&2
+        return 1
+    fi
+
     local output_file
     output_file="$(agents_dir "$session_key")/${wname}.md"
 
@@ -604,6 +618,78 @@ worker_bead_find_or_create() {
         log "Reusing worker bead $wbead_id: $title"
     fi
     echo "$wbead_id"
+}
+
+# ─── Spawn Circuit Breaker ────────────────────────────────────────────────────
+#
+# Tracks respawn failures per worker. After N failures within a time window,
+# blocks further respawns and notifies the orchestrator (god window).
+# Prevents runaway respawn storms when a worker keeps crashing.
+
+BREAKER_MAX_FAILURES=3
+BREAKER_WINDOW_SECS=1800  # 30 minutes
+
+breaker_dir() { echo "$TW_DIR/breaker/${1}"; }
+
+# Record a respawn attempt. Returns 1 if breaker is tripped (should block).
+breaker_check_and_record() {
+    local session_key="$1" worker="$2"
+    local dir
+    dir="$(breaker_dir "$session_key")"
+    mkdir -p "$dir"
+    local file="$dir/${worker}"
+    local now
+    now=$(date +%s)
+
+    local count=0 first_failure="$now"
+
+    if [[ -f "$file" ]]; then
+        local stored_count stored_time
+        stored_count=$(head -1 "$file" 2>/dev/null || echo 0)
+        stored_time=$(tail -1 "$file" 2>/dev/null || echo "$now")
+
+        # If outside the window, reset
+        local elapsed=$(( now - stored_time ))
+        if [[ $elapsed -gt $BREAKER_WINDOW_SECS ]]; then
+            count=0
+            first_failure="$now"
+        else
+            count="$stored_count"
+            first_failure="$stored_time"
+        fi
+    fi
+
+    count=$(( count + 1 ))
+    printf '%s\n%s\n' "$count" "$first_failure" > "$file"
+
+    if [[ $count -gt $BREAKER_MAX_FAILURES ]]; then
+        return 1  # tripped
+    fi
+    return 0
+}
+
+# Reset breaker for a worker (called on successful handoff or manual reset).
+breaker_reset() {
+    local session_key="$1" worker="$2"
+    rm -f "$(breaker_dir "$session_key")/${worker}"
+}
+
+# Reset all breakers for a session.
+breaker_reset_all() {
+    local session_key="$1"
+    rm -rf "$(breaker_dir "$session_key")"
+}
+
+# Notify the god window that a worker has been circuit-broken.
+breaker_notify_god() {
+    local tmux_session="$1" worker="$2" count="$3"
+    local msg="[tw breaker] Worker '$worker' has failed $count times in ${BREAKER_WINDOW_SECS}s. Auto-respawn blocked. Manual action needed: tw workers <feature> --respawn --force"
+    # Send as a message to the god window if it exists
+    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "god"; then
+        tmux send-keys -t "$tmux_session:god" "" 2>/dev/null || true
+        tmux send-keys -t "$tmux_session:god" "$msg" Enter 2>/dev/null || true
+    fi
+    log "$msg"
 }
 
 bead_create() {
@@ -1263,8 +1349,9 @@ PYEOF
     local bead_id
     bead_id=$(sessions_get_key "$session_key" "bead_id")
 
-    # Kill activity spinner
+    # Kill activity spinner + reset circuit breakers
     spinner_stop "$session_key"
+    breaker_reset_all "$session_key"
 
     # Kill the feature's tmux session
     if tmux has-session -t "$tmux_session" 2>/dev/null; then
@@ -2564,6 +2651,9 @@ with open(sys.argv[1], 'w') as f:
     tmux send-keys -t "$tmux_session:$worker" \
         "TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' claude --dangerously-skip-permissions" Enter
 
+    # Voluntary handoff = healthy worker — reset circuit breaker
+    breaker_reset "$session_key" "$worker"
+
     log "Handed off $worker — fresh session starting with identity bead $worker_bead_id"
     echo "  Handoff complete: $worker"
     echo "  Identity bead: $worker_bead_id (work history preserved)"
@@ -2709,11 +2799,32 @@ for name, info in s.items():
         echo ""
     fi
 
-    # 3. Take action on dead/stuck workers
+    # 3. Take action on dead/stuck workers (with circuit breaker)
     if [[ -n "$dead_workers" ]]; then
         echo "  [!] Dead/missing workers: $dead_workers"
-        echo "      Auto-respawning..."
-        cmd_workers "$feature" --respawn 2>&1 | sed 's/^/      /'
+        local bead_id
+        bead_id=$(sessions_get_key "$session_key" "bead_id")
+        for w in $dead_workers; do
+            if breaker_check_and_record "$session_key" "$w"; then
+                # Breaker OK — respawn this worker
+                echo "      Respawning: $w"
+                local wrole=""
+                for wp in "${worker_pairs[@]}"; do
+                    [[ "${wp%%:*}" == "$w" ]] && wrole="${wp##*:}" && break
+                done
+                [[ -z "$wrole" ]] && wrole="dev"
+                local worker_bead_id
+                worker_bead_id=$(worker_bead_find_or_create "$w" "$project" "$config_dir" 2>/dev/null || echo "")
+                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$w" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null \
+                    && echo "      ✓ $w respawned" \
+                    || echo "      ✗ $w respawn failed"
+            else
+                # Breaker tripped
+                echo "      ⚡ $w circuit breaker tripped (${BREAKER_MAX_FAILURES}+ failures in ${BREAKER_WINDOW_SECS}s)"
+                echo "        Manual override: tw workers $feature --respawn --force"
+                breaker_notify_god "$tmux_session" "$w" "$BREAKER_MAX_FAILURES"
+            fi
+        done
         echo ""
     fi
 
@@ -2890,19 +3001,20 @@ cmd_spawn() {
 }
 
 cmd_workers() {
-    local feature="" health_flag=0 respawn_flag=0 json_flag=0
+    local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --health) health_flag=1; shift ;;
             --respawn) respawn_flag=1; shift ;;
             --json) json_flag=1; shift ;;
+            --force) force_flag=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn]"
+    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--force]"
 
     # Resolve session + config
     local session_key project config_dir tmux_session effective_config
@@ -2991,9 +3103,15 @@ print(json.dumps(rows, indent=2))
         return 0
     fi
 
-    # --respawn: respawn dead/missing workers only
+    # --respawn: respawn dead/missing workers only (with circuit breaker)
     if [[ $respawn_flag -eq 1 ]]; then
-        local respawned=0 alive=0
+        # --force resets all breakers before respawning
+        if [[ $force_flag -eq 1 ]]; then
+            breaker_reset_all "$session_key"
+            log "Circuit breakers reset for $session_key"
+        fi
+
+        local respawned=0 alive=0 blocked=0
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
@@ -3008,13 +3126,20 @@ print(json.dumps(rows, indent=2))
                 log "Killed dead worker window: $wname"
             fi
 
-            local worker_bead_id
-            worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
-            spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
-            (( respawned++ )) || true
+            # Check circuit breaker (skip if --force already reset)
+            if breaker_check_and_record "$session_key" "$wname"; then
+                local worker_bead_id
+                worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
+                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
+                (( respawned++ )) || true
+            else
+                echo "  ⚡ $wname: circuit breaker tripped (use --force to override)"
+                breaker_notify_god "$tmux_session" "$wname" "$BREAKER_MAX_FAILURES"
+                (( blocked++ )) || true
+            fi
         done
         echo ""
-        echo "  Workers: $respawned respawned, $alive alive"
+        echo "  Workers: $respawned respawned, $alive alive${blocked:+, $blocked blocked by breaker}"
         return 0
     fi
 
@@ -3193,11 +3318,20 @@ tw prune                         # Clean up dead sessions after reboot
 ### Worker Management
 ```bash
 tw workers <feature> --health    # Check worker liveness
-tw workers <feature> --respawn   # Respawn dead/missing workers
+tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
 tw send <feature> <worker> "task description"  # Queue task for a worker
 tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
 tw patrol <feature>              # Full health check + auto-respawn + plugins
 tw spawn <feature> <name> <role> # Add a worker to a running session
+```
+
+### Runtime Config (fix proxy/port issues without restarting)
+```bash
+tw config show <feature>                   # Show current services + proxy routes
+tw config proxy <feature> "" frontend      # Route primary URL to a different service
+tw config proxy <feature> api backend      # Route -api subdomain
+tw config service <feature> web add 5173   # Register a new service
+tw config service <feature> web port 5174  # Change a service's port
 ```
 
 ### Context Recovery
@@ -3602,6 +3736,60 @@ for key, s in d.items():
             fi
         done
         [[ ${port_conflicts:-0} -eq 0 ]] && _ok "No stale port conflicts"
+    fi
+
+    # 15. Proxy content check — detect when primary proxy hits backend instead of frontend
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+for key, s in d.items():
+    pm = s.get('proxy_map', {})
+    svcs = s.get('services', {})
+    p = s.get('project', '')
+    f = s.get('feature', '')
+    primary_svc = pm.get('', '')
+    if not primary_svc:
+        continue
+    port = svcs.get(primary_svc, {}).get('port', '')
+    if port:
+        print(f'{key}|{p}|{f}|{primary_svc}|{port}')
+" 2>/dev/null | while IFS='|' read -r sk proj feat svc port; do
+            [[ -z "$port" ]] && continue
+            # Only check alive sessions
+            tmux has-session -t "$sk" 2>/dev/null || continue
+
+            local url="http://localhost:${port}"
+            local body
+            body=$(curl -sf --max-time 2 "$url" 2>/dev/null || true)
+            [[ -z "$body" ]] && continue
+
+            # Check for frontend dev server indicators
+            if echo "$body" | grep -qiE 'vite|__vite|webpack|hot-update|hmr|react-refresh|__next'; then
+                _ok "Proxy $proj-$feat.localhost → $svc (frontend dev server detected)"
+            elif echo "$body" | grep -qiE '"error"|"status"|"api"|"version".*:.*"[0-9]'; then
+                _warn "Proxy $proj-$feat.localhost → $svc may be a backend API, not a frontend dev server"
+                _hint "Fix with: tw config proxy $feat \"\" <frontend-service>"
+                (( warnings++ )) || true
+            else
+                # HTML returned but no dev server indicators — could be backend serving static
+                local content_type
+                content_type=$(curl -sf --max-time 2 -o /dev/null -w "%{content_type}" "$url" 2>/dev/null || true)
+                if [[ "$content_type" == *"text/html"* ]]; then
+                    # Check if it's serving raw JS modules properly (frontend dev server does)
+                    local js_check
+                    js_check=$(curl -sf --max-time 2 -H "Accept: application/javascript" "$url/@vite/client" 2>/dev/null \
+                        || curl -sf --max-time 2 "$url/src/main.tsx" 2>/dev/null \
+                        || curl -sf --max-time 2 "$url/src/main.ts" 2>/dev/null \
+                        || true)
+                    if [[ -z "$js_check" ]]; then
+                        _warn "Proxy $proj-$feat.localhost → $svc serves HTML but no dev server module endpoints"
+                        _hint "This may be a backend with SPA catch-all. Fix with: tw config proxy $feat \"\" <frontend-service>"
+                        (( warnings++ )) || true
+                    fi
+                fi
+            fi
+        done
     fi
 
     # Summary
@@ -4383,7 +4571,7 @@ Commands:
 Agent commands (used by Claude workers):
   tw workers <feature>                  Spawn missing worker windows into a running session
   tw workers <feature> --health [--json] Check worker window liveness (alive/dead/missing)
-  tw workers <feature> --respawn        Respawn dead or missing workers with identity intact
+  tw workers <feature> --respawn [--force] Respawn dead workers (--force overrides circuit breaker)
   tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
   tw patrol <feature>                   Health check: workers, services, stuck detection, auto-respawn
   tw spawn <feature> <name> <role>      Dynamically spawn a new worker into a running session
