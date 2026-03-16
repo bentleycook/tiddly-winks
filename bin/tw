@@ -1356,7 +1356,23 @@ cmd_start() {
     # Start tmux session for this feature
     # Window 0 is "god" (orchestrator) — created with the session so it's always index 0
     tmux new-session -d -s "$tmux_session" -n "god"
-    tmux send-keys -t "$tmux_session:god" "cd '$config_dir' && claude --dangerously-skip-permissions --name '$feature'" Enter
+    tmux send-keys -t "$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+
+    # Create hooked JSON for god so it can receive nudges via tw-mail-check hook
+    local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    mkdir -p "$hooked_dir"
+    python3 -c "
+import json, sys
+with open(sys.argv[1], 'w') as f:
+    json.dump({
+        'bead_id': sys.argv[2],
+        'worker': 'god',
+        'role': 'orchestrator',
+        'output_file': '',
+        'worker_bead_id': ''
+    }, f, indent=2)
+" "${hooked_dir}/god.json" "$bead_id"
+
     tmux new-window -t "$tmux_session" -n "main"
     tmux send-keys -t "$tmux_session:main" "cd '$config_dir'" Enter
 
@@ -2204,7 +2220,7 @@ cmd_claude() {
     if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
         log "Creating god window in $tmux_session"
         tmux new-window -t "$tmux_session" -n "$claude_window"
-        tmux send-keys -t "$tmux_session:$claude_window" "cd '$config_dir' && claude --dangerously-skip-permissions --name '$feature'" Enter
+        tmux send-keys -t "$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
     fi
 
     # Build context block for pasting as first Claude message
@@ -3849,6 +3865,37 @@ tw stop <feature> [--done]       # Stop [and tear down]
 ONBOARD
 }
 
+# ─── Port Owner ────────────────────────────────────────────────────────────────
+
+cmd_port_owner() {
+    local port="${1:-}"
+    [[ -z "$port" ]] && die "Usage: tw port-owner <port>"
+    [[ ! "$port" =~ ^[0-9]+$ ]] && die "Port must be a number"
+    [[ ! -f "$SESSIONS_FILE" ]] && { echo "unmanaged (no sessions file)"; return 0; }
+
+    local result
+    result=$(python3 -c "
+import json, sys
+port = sys.argv[1]
+try:
+    data = json.load(open(sys.argv[2]))
+except Exception:
+    sys.exit(0)
+for key, session in data.items():
+    for svc, info in session.get('services', {}).items():
+        p = info.get('port', '') if isinstance(info, dict) else info
+        if str(p) == port:
+            print(f'{key}:{svc} (port {port})')
+            sys.exit(0)
+" "$port" "$SESSIONS_FILE")
+
+    if [[ -n "$result" ]]; then
+        echo "$result"
+    else
+        echo "unmanaged (no tw session owns port $port)"
+    fi
+}
+
 # ─── Doctor ───────────────────────────────────────────────────────────────────
 
 cmd_doctor() {
@@ -5058,6 +5105,7 @@ case "$subcommand" in
     gates)   cmd_gates "$@" ;;
     daemon)  cmd_daemon "$@" ;;
     config)  cmd_config "$@" ;;
+    port-owner) cmd_port_owner "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     help|--help|-h) usage ;;
