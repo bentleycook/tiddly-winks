@@ -254,6 +254,23 @@ with open('$SESSIONS_FILE', 'w') as f:
 " "$session_key" "$name" "$role"
 }
 
+# Remove a dynamic worker from the session's dynamic_workers array
+sessions_remove_dynamic_worker() {
+    local session_key="$1" name="$2"
+    python3 -c "
+import json, sys
+sk, name = sys.argv[1], sys.argv[2]
+with open('$SESSIONS_FILE') as f:
+    d = json.load(f)
+session = d.get(sk, {})
+dw = session.get('dynamic_workers', [])
+session['dynamic_workers'] = [w for w in dw if w['name'] != name]
+d[sk] = session
+with open('$SESSIONS_FILE', 'w') as f:
+    json.dump(d, f, indent=2)
+" "$session_key" "$name"
+}
+
 # Get dynamic workers as name:role pairs (same format as yaml_worker_pairs)
 sessions_get_dynamic_workers() {
     local session_key="$1"
@@ -3229,6 +3246,24 @@ for name, info in s.items():
         local bead_id
         bead_id=$(sessions_get_key "$session_key" "bead_id")
         for w in $dead_workers; do
+            # Skip respawning dynamic workers that signaled done — they finished
+            # their task and exited intentionally, not crashed
+            if worker_signal_check "$session_key" "$w" "done" 2>/dev/null; then
+                local is_dyn=0
+                for dp in "${dyn_pairs[@]}"; do
+                    [[ "${dp%%:*}" == "$w" ]] && is_dyn=1 && break
+                done
+                if [[ $is_dyn -eq 1 ]]; then
+                    # Clean up the finished one-off worker
+                    sessions_remove_dynamic_worker "$session_key" "$w"
+                    rm -f "$HOME/.tiddly-winks/hooked/${session_key}/${w}.json"
+                    tmux kill-window -t "$tmux_session:$w" 2>/dev/null || true
+                    worker_signal_clear_all "$session_key" "$w" 2>/dev/null || true
+                    echo "      Reaped: $w (one-off worker, finished and exited)"
+                    continue
+                fi
+            fi
+
             if breaker_check_and_record "$session_key" "$w"; then
                 # Breaker OK — respawn this worker
                 echo "      Respawning: $w"
@@ -3263,8 +3298,25 @@ for name, info in s.items():
 
     if [[ -n "$done_workers" ]]; then
         echo "  [✓] Done workers (signaled completion): $done_workers"
-        echo "      These workers are idle and available for new tasks."
-        echo "      Wake with: tw send $feature <worker> \"<new task>\""
+        for w in $done_workers; do
+            # Check if this is a dynamic (one-off) worker
+            local is_dynamic=0
+            for dp in "${dyn_pairs[@]}"; do
+                [[ "${dp%%:*}" == "$w" ]] && is_dynamic=1 && break
+            done
+
+            if [[ $is_dynamic -eq 1 ]]; then
+                # Reap: kill tmux window, remove from dynamic_workers, clean up
+                tmux kill-window -t "$tmux_session:$w" 2>/dev/null || true
+                sessions_remove_dynamic_worker "$session_key" "$w"
+                rm -f "$HOME/.tiddly-winks/hooked/${session_key}/${w}.json"
+                worker_signal_clear_all "$session_key" "$w" 2>/dev/null || true
+                echo "      Reaped: $w (one-off worker, task complete)"
+            else
+                echo "      Available for reuse: $w"
+                echo "      Wake with: tw send $feature $w \"<new task>\""
+            fi
+        done
         echo ""
     fi
 
