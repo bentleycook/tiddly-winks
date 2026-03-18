@@ -135,16 +135,30 @@ EOF
 }
 
 # Get workers as "name:role\n..." pairs
+# Supports multiple formats:
+#   workers: [dev-1, dev-2]              → name-only list (generic workers)
+#   workers: {dev: {role: backend-dev}}  → dict with roles (legacy)
+#   workers: {dev-1: {}, dev-2: {}}     → dict without roles (generic)
+#   pool_size: 3                         → generates dev-1..dev-N (generic)
 yaml_worker_pairs() {
     local file="$1"
     python3 - "$file" <<'EOF'
 import yaml, sys
 try:
     d = yaml.safe_load(open(sys.argv[1]))
-    workers = d.get('workers', {}) or {}
-    for name, info in workers.items():
-        role = (info or {}).get('role', name)
-        print(f"{name}:{role}")
+    workers = d.get('workers', None)
+    pool_size = d.get('pool_size', 0)
+    if isinstance(workers, list):
+        # List format: [dev-1, dev-2, ...]
+        for name in workers:
+            print(f"{name}:")
+    elif isinstance(workers, dict):
+        for name, info in workers.items():
+            role = (info or {}).get('role', '') if isinstance(info, dict) else ''
+            print(f"{name}:{role}")
+    elif pool_size and int(pool_size) > 0:
+        for i in range(1, int(pool_size) + 1):
+            print(f"dev-{i}:")
 except Exception:
     pass
 EOF
@@ -236,7 +250,7 @@ sessions_list_keys() {
 
 # Add a dynamic worker to session state
 sessions_add_dynamic_worker() {
-    local session_key="$1" name="$2" role="$3"
+    local session_key="$1" name="$2" role="${3:-}"
     python3 -c "
 import json, sys
 sk, name, role = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -301,48 +315,48 @@ spinner_start() {
         rm -f "$pid_file"
     fi
 
-    (
-        trap 'rm -f "'"$pid_file"'"' EXIT
-        local frame=0
-        local -A prev_state  # track previous active state per window
+    # Launch spinner as a fully detached background process.
+    # Redirect all FDs and use nohup to survive parent shell exit.
+    nohup bash -c '
+        pid_file="'"$pid_file"'"
+        tmux_session="'"$tmux_session"'"
+        SPINNER_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+        SPINNER_RESERVED="god|main|services"
+
+        trap "rm -f \"$pid_file\"" EXIT
+        echo $$ > "$pid_file"
+
+        frame=0
+        declare -A prev_state
 
         while tmux has-session -t "$tmux_session" 2>/dev/null; do
-            # Get window index:name pairs (use index for reliable targeting)
-            local win_list
             win_list=$(tmux list-windows -t "$tmux_session" -F "#{window_index}:#{window_name}" 2>/dev/null) || break
 
             while IFS= read -r entry; do
                 [[ -z "$entry" ]] && continue
-                local widx="${entry%%:*}"
-                local wname="${entry#*:}"
+                widx="${entry%%:*}"
+                wname="${entry#*:}"
 
-                # Skip reserved windows and strip any existing spinner
-                local base_name="${wname% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+                base_name="${wname% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
                 [[ "$base_name" =~ ^($SPINNER_RESERVED)$ ]] && continue
 
-                # Get pane PID (target by index — safe with spaces in names)
-                local pane_pid
                 pane_pid=$(tmux list-panes -t "$tmux_session:$widx" -F "#{pane_pid}" 2>/dev/null | head -1)
                 [[ -z "$pane_pid" ]] && continue
 
-                # Find claude/node child process and check CPU
-                local child_pid cpu active=0
                 child_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1)
+                active=0
                 if [[ -n "$child_pid" ]]; then
                     cpu=$(ps -p "$child_pid" -o %cpu= 2>/dev/null | xargs)
-                    # Compare integer part — active if CPU > 1%
-                    local cpu_int="${cpu%%.*}"
+                    cpu_int="${cpu%%.*}"
                     if [[ -n "$cpu_int" && "$cpu_int" -gt 1 ]] 2>/dev/null; then
                         active=1
                     fi
                 fi
 
                 if [[ $active -eq 1 ]]; then
-                    local new_name="$base_name ${SPINNER_FRAMES[$frame]}"
-                    tmux rename-window -t "$tmux_session:$widx" "$new_name" 2>/dev/null || true
+                    tmux rename-window -t "$tmux_session:$widx" "$base_name ${SPINNER_FRAMES[$frame]}" 2>/dev/null || true
                     prev_state[$base_name]=1
                 elif [[ "${prev_state[$base_name]:-0}" -eq 1 ]]; then
-                    # Was active, now idle — strip spinner
                     tmux rename-window -t "$tmux_session:$widx" "$base_name" 2>/dev/null || true
                     prev_state[$base_name]=0
                 fi
@@ -351,11 +365,8 @@ spinner_start() {
             frame=$(( (frame + 1) % ${#SPINNER_FRAMES[@]} ))
             sleep 0.3
         done
-    ) &
-
-    local spinner_pid=$!
-    disown "$spinner_pid"
-    echo "$spinner_pid" > "$pid_file"
+    ' </dev/null >/dev/null 2>&1 &
+    disown $!
 }
 
 spinner_stop() {
@@ -534,7 +545,11 @@ with open(sys.argv[1], 'w') as f:
     local _cv_feature="${session_key#*-}"
     cv_record_session_start "$_cv_project" "$wname" "$_cv_feature" 2>/dev/null || true
 
-    log "Started worker: $wname (role: $wrole)"
+    if [[ -n "$wrole" ]]; then
+        log "Started worker: $wname (initial context: $wrole)"
+    else
+        log "Started worker: $wname"
+    fi
 }
 
 # Send the orchestrator seed to the god window once agents are known.
@@ -550,7 +565,11 @@ seed_orchestrator() {
     while IFS= read -r wpair; do
         [[ -z "$wpair" ]] && continue
         local wn="${wpair%%:*}" wr="${wpair##*:}"
-        worker_lines+="- $wn ($wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+        if [[ -n "$wr" ]]; then
+            worker_lines+="- $wn (context: $wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+        else
+            worker_lines+="- $wn: tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+        fi
     done <<< "$workers_str"
 
     # Build git state-check commands for each worktree
@@ -562,6 +581,12 @@ seed_orchestrator() {
         done <<< "$worktrees_json"
     fi
 
+    # Load task templates list if available
+    local task_templates=""
+    if [[ -d "$HOME/.claude/task-templates" ]]; then
+        task_templates=$(ls "$HOME/.claude/task-templates/" 2>/dev/null | sed 's/\.md$//' | tr '\n' ', ' | sed 's/, $//')
+    fi
+
     local seed
     seed="You are the orchestrator for the '$feature' feature (project: $project).
 
@@ -570,17 +595,32 @@ Route and track — do not explore code, run commands, or implement anything you
 
 ## Workers
 $worker_lines
-## Delegation rules
-- Code changes → relevant domain worker (backend/frontend)
-- Code questions, codebase exploration → relevant domain worker
-- Test runs, lint, CI checks → ci worker
-- Service health, start/stop, worker health → keeper worker
-- After dispatching, poll the worker's output file; once results appear, summarize and ask what's next
+Workers are generic — any worker can handle any task. The task message you send IS the context. Dispatch based on availability, not on worker names.
+
+## Dispatching tasks
+Send work to any available worker:
+  tw send $feature <worker> \"<task description>\"
+The task description should be self-contained — include all context the worker needs.
+
+## Task templates
+${task_templates:+Reusable task snippets in ~/.claude/task-templates/:
+  $task_templates
+Read a template: cat ~/.claude/task-templates/<name>.md
+Prepend template content to your task message when dispatching.}${task_templates:-No task templates found. Create ~/.claude/task-templates/ with .md snippets for common tasks (run-tests, check-services, code-review, etc.)}
 
 ## Spawning new workers
-If no existing worker fits a task, spawn one dynamically:
+If all workers are busy, spawn more:
+  tw spawn $feature <name>
+Workers are generic slots — no role required. If you want to give initial context from a role file:
   tw spawn $feature <name> <role>
 Available roles: $(ls "$HOME/.claude/roles/" 2>/dev/null | sed 's/\.md$//' | tr '\n' ', ' | sed 's/, $//')
+
+## Monitoring worker progress
+Workers write to their output files incrementally. Poll progress:
+  tw feed $feature --problems    # one-shot: which workers have recent/stale output
+  tw feed $feature               # stream: tail all output files in real time
+  tw patrol $feature             # full health check + output tracking
+After dispatching, check worker output files periodically. Don't wait for workers to message you — poll their files.
 
 ## Worker discoveries
 Workers may file new beads when they discover bugs or work items. Periodically check:
@@ -588,8 +628,8 @@ Workers may file new beads when they discover bugs or work items. Periodically c
 to see what workers have found. Triage and prioritize as needed.
 
 ## On startup — gather state by delegation, not directly
-Dispatch to each relevant worker:
-  \"Explore your domain: check git log origin/staging..HEAD --oneline, read bd show $bead_id if it has content, review recent changes. Summarize: what's done, what's in progress, what's missing. Write findings to your output file.\"
+Dispatch to each worker:
+  \"Explore the codebase: check git log origin/staging..HEAD --oneline, read bd show $bead_id if it has content, review recent changes. Summarize: what's done, what's in progress, what's missing. Write findings to your output file.\"
 
 Wait for output files to populate, then synthesize a state summary for the user. Ask what to tackle next."
 
@@ -1624,7 +1664,11 @@ EOF
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}"
             local wrole="${wpair##*:}"
-            echo "    $wname  (role: $wrole)"
+            if [[ -n "$wrole" ]]; then
+                echo "    $wname  (context: $wrole)"
+            else
+                echo "    $wname"
+            fi
         done
     fi
     echo ""
@@ -1667,6 +1711,7 @@ PYEOF
         )
         [[ -z "$session_key" ]] && die "No session at index $feature"
         project=$(sessions_get_key "$session_key" "project")
+        feature=$(sessions_get_key "$session_key" "feature")
         config_dir=$(sessions_get_key "$session_key" "workspace")
     else
         local config_file
@@ -1735,9 +1780,14 @@ for svc, path in wt.items():
             fi
 
             if [[ -n "${git_root:-}" && -e "$git_root/.git" ]]; then
-                git -C "$git_root" worktree remove "$wt_git_root" --force 2>/dev/null \
-                    && log "Removed worktree: $wt_git_root" \
-                    || log "Could not remove worktree: $wt_git_root (manual cleanup may be needed)"
+                local wt_err
+                if wt_err=$(git -C "$git_root" worktree remove "$wt_git_root" --force 2>&1); then
+                    log "Removed worktree: $wt_git_root"
+                else
+                    log "Warning: could not remove worktree: $wt_git_root"
+                    log "  git said: $wt_err"
+                    log "  (session will still be removed — clean up worktree manually)"
+                fi
             fi
             removed_worktrees[$wt_git_root]=1
         done <<< "$worktrees_json"
@@ -3170,7 +3220,7 @@ cmd_patrol() {
     echo ""
 
     # 1. Worker state assessment
-    printf "  %-20s %-12s %-10s %s\n" "WORKER" "STATE" "ROLE" "OUTPUT AGE"
+    printf "  %-20s %-12s %-10s %s\n" "WORKER" "STATE" "CONTEXT" "OUTPUT AGE"
     printf "  %-20s %-12s %-10s %s\n" "--------------------" "------------" "----------" "----------"
 
     local dead_workers="" stalled_workers="" done_workers=""
@@ -3206,7 +3256,7 @@ cmd_patrol() {
             output_age="none"
         fi
 
-        printf "  %-20s %-12s %-10s %s\n" "$wname" "$state" "$wrole" "$output_age"
+        printf "  %-20s %-12s %-10s %s\n" "$wname" "$state" "${wrole:--}" "$output_age"
     done
 
     echo ""
@@ -3257,12 +3307,20 @@ for name, info in s.items():
                     # Clean up the finished one-off worker
                     sessions_remove_dynamic_worker "$session_key" "$w"
                     rm -f "$HOME/.tiddly-winks/hooked/${session_key}/${w}.json"
-                    tmux kill-window -t "$tmux_session:$w" 2>/dev/null || true
+                    # Kill ALL windows matching this name (tmux allows duplicates)
+                    while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
+                        tmux kill-window -t "$tmux_session:$w" 2>/dev/null || break
+                    done
                     worker_signal_clear_all "$session_key" "$w" 2>/dev/null || true
                     echo "      Reaped: $w (one-off worker, finished and exited)"
                     continue
                 fi
             fi
+
+            # Kill ALL dead windows matching this name before respawning
+            while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
+                tmux kill-window -t "$tmux_session:$w" 2>/dev/null || break
+            done
 
             if breaker_check_and_record "$session_key" "$w"; then
                 # Breaker OK — respawn this worker
@@ -3271,7 +3329,7 @@ for name, info in s.items():
                 for wp in "${worker_pairs[@]}"; do
                     [[ "${wp%%:*}" == "$w" ]] && wrole="${wp##*:}" && break
                 done
-                [[ -z "$wrole" ]] && wrole="dev"
+                # wrole may be empty for generic workers — that's fine
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$w" "$project" "$config_dir" 2>/dev/null || echo "")
                 spawn_worker "$tmux_session" "$session_key" "$config_dir" "$w" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null \
@@ -3317,6 +3375,34 @@ for name, info in s.items():
                 echo "      Wake with: tw send $feature $w \"<new task>\""
             fi
         done
+        echo ""
+    fi
+
+    # 3b. Output progress tracking — report workers with new output since last patrol
+    local patrol_state_dir="$HOME/.tiddly-winks/patrol-state/${session_key}"
+    mkdir -p "$patrol_state_dir"
+    local new_output_workers=""
+    for wpair in "${worker_pairs[@]}"; do
+        [[ -z "$wpair" ]] && continue
+        local wname="${wpair%%:*}"
+        local output_file="$agents_path/${wname}.md"
+        local mtime_file="$patrol_state_dir/${wname}.mtime"
+
+        [[ -f "$output_file" ]] || continue
+        local current_mtime
+        current_mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
+        local prev_mtime=0
+        [[ -f "$mtime_file" ]] && prev_mtime=$(cat "$mtime_file" 2>/dev/null || echo 0)
+
+        if [[ "$current_mtime" -gt "$prev_mtime" ]]; then
+            new_output_workers+="$wname "
+        fi
+        echo "$current_mtime" > "$mtime_file"
+    done
+
+    if [[ -n "$new_output_workers" ]]; then
+        echo "  [+] New output since last patrol: $new_output_workers"
+        echo "      View with: tw feed $feature --problems"
         echo ""
     fi
 
@@ -3413,6 +3499,97 @@ ${plugin_body}" 60
     echo ""
 }
 
+# ─── Feed: tail all worker output files ──────────────────────────────────────
+#
+# Like 'gt feed' — tails all agents/*.md files for a feature, showing new
+# output as it appears. God can run this to monitor worker progress in real time.
+
+cmd_feed() {
+    local feature="" problems_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --problems) problems_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw feed <feature> [--problems]"
+
+    # Resolve session
+    local session_key
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        local project
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+    fi
+
+    local agents_path
+    agents_path="$(agents_dir "$session_key")"
+
+    if [[ ! -d "$agents_path" ]]; then
+        die "No agents directory for session '$session_key'"
+    fi
+
+    if [[ $problems_flag -eq 1 ]]; then
+        # One-shot: show workers with stale output (>30min) or no output
+        local now
+        now=$(date +%s)
+        echo ""
+        printf "  %-20s %-12s %s\n" "WORKER" "LAST OUTPUT" "STATUS"
+        printf "  %-20s %-12s %s\n" "--------------------" "------------" "----------"
+        for f in "$agents_path"/*.md; do
+            [[ -f "$f" ]] || continue
+            local wname
+            wname=$(basename "$f" .md)
+            local mtime age_secs age_str status
+            mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+            age_secs=$((now - mtime))
+            if [[ $age_secs -lt 60 ]]; then
+                age_str="${age_secs}s ago"
+                status="active"
+            elif [[ $age_secs -lt 3600 ]]; then
+                age_str="$((age_secs / 60))m ago"
+                if [[ $age_secs -gt 1800 ]]; then
+                    status="stale"
+                else
+                    status="ok"
+                fi
+            else
+                age_str="$((age_secs / 3600))h ago"
+                status="stale"
+            fi
+            # Check file size
+            local fsize
+            fsize=$(wc -c < "$f" | tr -d ' ')
+            if [[ "$fsize" -eq 0 ]]; then
+                status="empty"
+                age_str="never"
+            fi
+            printf "  %-20s %-12s %s\n" "$wname" "$age_str" "$status"
+        done
+        echo ""
+        return 0
+    fi
+
+    # Stream mode: tail -f all output files
+    echo "  Tailing worker output for: $session_key"
+    echo "  Directory: $agents_path"
+    echo "  Press Ctrl-C to stop"
+    echo ""
+
+    # Use tail -f on all .md files, prefixing each line with the worker name
+    # fswatch would be nicer but tail -F works everywhere
+    tail -F "$agents_path"/*.md 2>/dev/null | while IFS= read -r line; do
+        echo "$line"
+    done
+}
+
 cmd_spawn() {
     local feature="" name="" role=""
 
@@ -3429,8 +3606,8 @@ cmd_spawn() {
         esac
     done
 
-    [[ -z "$feature" || -z "$name" || -z "$role" ]] \
-        && die "Usage: tw spawn <feature> <name> <role>"
+    [[ -z "$feature" || -z "$name" ]] \
+        && die "Usage: tw spawn <feature> <name> [<role>]"
 
     # Resolve session + config
     local session_key project config_dir tmux_session
@@ -3456,9 +3633,11 @@ cmd_spawn() {
         die "Worker window '$name' already exists in session '$tmux_session'"
     fi
 
-    # Validate role file exists
-    local role_file="$HOME/.claude/roles/${role}.md"
-    [[ -f "$role_file" ]] || die "Role file not found: $role_file"
+    # Validate role file exists (if role provided)
+    if [[ -n "$role" ]]; then
+        local role_file="$HOME/.claude/roles/${role}.md"
+        [[ -f "$role_file" ]] || die "Role file not found: $role_file"
+    fi
 
     # Get bead_id from session state
     local bead_id
@@ -3476,9 +3655,12 @@ cmd_spawn() {
     sessions_add_dynamic_worker "$session_key" "$name" "$role"
 
     echo ""
-    echo "  Spawned dynamic worker: $name (role: $role)"
-    echo "  Send work:  tw hook {set|clear|show} <feature> <worker>  Manage GUPP hooks on workers
-  tw send $feature $name \"<task>\""
+    if [[ -n "$role" ]]; then
+        echo "  Spawned worker: $name (initial context: $role)"
+    else
+        echo "  Spawned worker: $name"
+    fi
+    echo "  Send work:  tw send $feature $name \"<task>\""
     echo "  Health:     tw workers $feature --health"
     echo ""
 }
@@ -3570,14 +3752,14 @@ print(json.dumps(rows, indent=2))
 "
         else
             echo ""
-            printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "ROLE"
+            printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "CONTEXT"
             printf "  %-20s %-12s %s\n" "--------------------" "------------" "--------------------"
             for hline in "${health_lines[@]}"; do
                 local wname="${hline%%:*}"
                 local rest="${hline#*:}"
                 local wrole="${rest%%:*}"
                 local status="${rest##*:}"
-                printf "  %-20s %-12s %s\n" "$wname" "$status" "$wrole"
+                printf "  %-20s %-12s %s\n" "$wname" "$status" "${wrole:--}"
             done
             echo ""
         fi
@@ -3610,9 +3792,12 @@ print(json.dumps(rows, indent=2))
                     (( alive++ )) || true
                     continue
                 fi
-                # Dead window — kill it before respawning
-                tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || true
-                log "Killed dead worker window: $wname"
+                # Dead window(s) — kill ALL matching before respawning
+                # (tmux allows duplicate window names; kill-window only removes one)
+                while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+                    tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
+                done
+                log "Killed dead worker window(s): $wname"
             fi
 
             # Check circuit breaker (skip if --force already reset)
@@ -5148,6 +5333,7 @@ case "$subcommand" in
     handoff) cmd_handoff "$@" ;;
     attach)  cmd_attach "$@" ;;
     patrol)  cmd_patrol "$@" ;;
+    feed)    cmd_feed "$@" ;;
     hook)    cmd_hook "$@" ;;
     send)    cmd_send "$@" ;;
     signal)  cmd_signal "$@" ;;

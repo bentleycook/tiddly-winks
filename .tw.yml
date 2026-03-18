@@ -4,8 +4,13 @@ issue_tracker:
   type: github
   repo: bentleycook/tiddly-winks
 
+# Generic worker pool — workers are interchangeable slots.
+# Task context is injected at dispatch time via `tw send`, not baked in.
+# Supported formats:
+#   workers: [dev-1, dev-2]              — name-only list
+#   workers: {dev: {}, ops: {}}          — dict without roles
+#   workers: {ci: {role: ci-watcher}}    — dict with initial context (legacy)
+#   pool_size: 3                         — generates dev-1..dev-N
 workers:
-  ci:
-    role: ci-watcher
-  keeper:
-    role: services-keeper
+  - dev
+  - ops
