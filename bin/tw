@@ -194,6 +194,73 @@ except Exception:
 EOF
 }
 
+# Template env files using allocated service ports.
+# Reads the 'env_files' section from .tw.yml and writes templated values
+# into the target files within the given worktree/config directory.
+#
+# .tw.yml format:
+#   env_files:
+#     .env.local:                          # target file (relative to service path or config dir)
+#       VITE_API_URL: 'http://localhost:{{backend.port}}'
+#       API_PORT: '{{server.port}}'
+#
+# service_ports_json: JSON object like {"backend": 5006, "frontend": 5173}
+template_env_files() {
+    local config_file="$1" config_dir="$2" service_ports_json="$3"
+    python3 - "$config_file" "$config_dir" "$service_ports_json" <<'PYEOF'
+import yaml, sys, os, re, json
+
+config_file = sys.argv[1]
+config_dir = sys.argv[2]
+service_ports = json.loads(sys.argv[3])
+
+try:
+    d = yaml.safe_load(open(config_file))
+    env_files = d.get('env_files', {}) or {}
+except Exception:
+    sys.exit(0)
+
+if not env_files:
+    sys.exit(0)
+
+# Also read worktree paths from the config to resolve service paths
+services = d.get('services', {}) or {}
+
+for target_file, vars_dict in env_files.items():
+    if not isinstance(vars_dict, dict):
+        continue
+
+    # Determine which service this env file belongs to (if target starts with a service path)
+    # Otherwise, write relative to config_dir
+    abs_target = os.path.join(config_dir, target_file)
+
+    # Read existing file if it exists, so we can update in place
+    existing = {}
+    if os.path.isfile(abs_target):
+        for line in open(abs_target):
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, _, v = line.partition('=')
+                existing[k.strip()] = v.strip()
+
+    # Template each variable
+    for var_name, template in vars_dict.items():
+        value = str(template)
+        # Replace {{service.port}} with actual port
+        for svc_name, port in service_ports.items():
+            value = value.replace('{{' + svc_name + '.port}}', str(port))
+        existing[var_name] = value
+
+    # Write the file
+    os.makedirs(os.path.dirname(abs_target), exist_ok=True)
+    with open(abs_target, 'w') as f:
+        for k, v in existing.items():
+            f.write(f'{k}={v}\n')
+
+    print(f'Templated: {target_file} ({len(vars_dict)} vars)')
+PYEOF
+}
+
 # Merge override YAML into base YAML (override wins for service paths)
 # Returns merged YAML file path (temp file)
 yaml_merge_override() {
@@ -522,6 +589,12 @@ with open(sys.argv[1], 'w') as f:
         'worker_bead_id': sys.argv[6]
     }, f, indent=2)
 " "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id"
+
+    # Kill any existing windows with this name to prevent duplicates
+    # (can happen if daemon respawns during boot, or if tw start races with daemon)
+    while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+        tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
+    done
 
     tmux new-window -t "$tmux_session" -n "$wname"
     tmux set-option -t "$tmux_session:$wname" allow-rename off 2>/dev/null || true
@@ -1487,6 +1560,23 @@ with open(sys.argv[1], 'w') as f:
         tmux select-layout -t "$tmux_session:services" even-vertical 2>/dev/null || true
     fi
 
+    # Template env files with allocated ports (if env_files section exists in config)
+    local service_ports_json="{"
+    local _sp_first=1
+    for svc in "${!service_data[@]}"; do
+        [[ $_sp_first -eq 0 ]] && service_ports_json+=","
+        service_ports_json+="\"$svc\":${service_data[$svc]}"
+        _sp_first=0
+    done
+    service_ports_json+="}"
+    local env_output
+    env_output=$(template_env_files "$effective_config" "$config_dir" "$service_ports_json" 2>/dev/null)
+    if [[ -n "$env_output" ]]; then
+        while IFS= read -r line; do
+            log "$line"
+        done <<< "$env_output"
+    fi
+
     # Build proxy map and URLs
     local urls_block="" primary_url="" proxy_json="{"
     local proxy_pairs proxy_first=1
@@ -2013,11 +2103,30 @@ cmd_status() {
     local sessions_data
     sessions_data=$(sessions_read)
 
-    python3 - "$sessions_data" "$session_key" "$json_flag" <<'EOF'
-import json, sys, subprocess
+    # Read env_files config if available
+    local env_config_file=""
+    local status_config_dir=""
+    if config_file=$(find_config 2>/dev/null); then
+        env_config_file="$config_file"
+        status_config_dir="$(dirname "$config_file")"
+    else
+        local ws
+        ws=$(sessions_get_key "$session_key" "workspace")
+        if [[ -n "$ws" ]]; then
+            status_config_dir="$ws"
+            for cf in "$ws/.tw.yml" "$ws/.devenv.yml"; do
+                [[ -f "$cf" ]] && env_config_file="$cf" && break
+            done
+        fi
+    fi
+
+    python3 - "$sessions_data" "$session_key" "$json_flag" "$env_config_file" "$status_config_dir" <<'EOF'
+import json, sys, subprocess, os
 data = json.loads(sys.argv[1])
 key = sys.argv[2]
 json_flag = sys.argv[3] == "1"
+env_config_file = sys.argv[4] if len(sys.argv) > 4 else ""
+config_dir = sys.argv[5] if len(sys.argv) > 5 else ""
 
 s = data.get(key)
 if not s:
@@ -2080,6 +2189,29 @@ else:
     print("  URLs:")
     for svc_name, u in urls.items():
         print(f"    {svc_name:<20} {u['url']}  (→ :{u['port']})")
+
+    # Show env file mappings if configured
+    if env_config_file and os.path.isfile(env_config_file):
+        try:
+            import yaml
+            cfg = yaml.safe_load(open(env_config_file))
+            env_files = cfg.get('env_files', {}) or {}
+            if env_files:
+                service_ports = {svc: info.get('port', '?') for svc, info in s.get('services', {}).items()}
+                print()
+                print("  Env files (templated):")
+                for target, vars_dict in env_files.items():
+                    abs_path = os.path.join(config_dir, target) if config_dir else target
+                    exists = '✓' if os.path.isfile(abs_path) else '✗'
+                    print(f"    {exists} {target}")
+                    if isinstance(vars_dict, dict):
+                        for var, tmpl in vars_dict.items():
+                            val = str(tmpl)
+                            for svc_name, port in service_ports.items():
+                                val = val.replace('{{' + svc_name + '.port}}', str(port))
+                            print(f"      {var}={val}")
+        except Exception:
+            pass
     print()
 EOF
 }
@@ -4858,7 +4990,10 @@ print(json.dumps(data, indent=2))
 
             if [[ $is_dead -eq 1 ]]; then
                 _daemon_log "DEAD worker: $session_key/$wname — respawning"
-                tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || true
+                # Kill ALL windows matching this name (tmux allows duplicates)
+                while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+                    tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
+                done
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir" 2>/dev/null || echo "")
                 spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null || {
@@ -5049,6 +5184,24 @@ _daemon_status() {
 }
 
 # ─── Runtime Config ──────────────────────────────────────────────────────────
+
+cmd_completion() {
+    # Find the completion script relative to this script's location
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    local completion_file="$script_dir/../completions/tw.bash"
+
+    if [[ ! -f "$completion_file" ]]; then
+        # Try installed location
+        completion_file="$HOME/.tiddly-winks/completions/tw.bash"
+    fi
+
+    if [[ -f "$completion_file" ]]; then
+        cat "$completion_file"
+    else
+        die "Completion script not found. Expected at: $completion_file"
+    fi
+}
 
 cmd_config() {
     local sub="${1:-}"
@@ -5342,7 +5495,8 @@ case "$subcommand" in
     onboard) cmd_onboard ;;
     gates)   cmd_gates "$@" ;;
     daemon)  cmd_daemon "$@" ;;
-    config)  cmd_config "$@" ;;
+    config)     cmd_config "$@" ;;
+    completion) cmd_completion ;;
     port-owner) cmd_port_owner "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     nudge)   cmd_nudge "$@" ;;
