@@ -555,7 +555,7 @@ agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 
 # Maximum concurrent Claude worker processes across all sessions.
 # Safety net to prevent spawn storms from overwhelming the machine.
-TW_MAX_WORKERS=${TW_MAX_WORKERS:-60}
+TW_MAX_WORKERS=${TW_MAX_WORKERS:-100}
 
 # Spawn a worker window and wire up hook-based context injection.
 # Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id]
@@ -596,7 +596,7 @@ with open(sys.argv[1], 'w') as f:
         tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
     done
 
-    tmux new-window -t "$tmux_session" -n "$wname"
+    tmux new-window -d -t "$tmux_session" -n "$wname"
     tmux set-option -t "$tmux_session:$wname" allow-rename off 2>/dev/null || true
     tmux send-keys -t "$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$wname'" Enter
@@ -1353,7 +1353,31 @@ cmd_start() {
         fi
     fi
 
-    log "Starting feature: $session_key (mode=$mode)"
+    # Check for stopped session — resume instead of starting fresh
+    local resuming=0
+    local existing_bead_id="" existing_worktrees="" existing_services="" existing_branch=""
+    if sessions_get_key "$session_key" "project" 2>/dev/null | grep -q .; then
+        log "Found stopped session for $session_key — resuming"
+        resuming=1
+        existing_bead_id=$(sessions_get_key "$session_key" "bead_id")
+        existing_branch=$(sessions_get_key "$session_key" "branch")
+        existing_worktrees=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+wt = d.get('$session_key', {}).get('worktrees', {})
+for svc, path in wt.items():
+    print(f'{svc}:{path}')
+" 2>/dev/null || true)
+        existing_services=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+svcs = d.get('$session_key', {}).get('services', {})
+for name, info in svcs.items():
+    print(f'{name}:{info.get(\"port\", \"\")}')
+" 2>/dev/null || true)
+    fi
+
+    log "Starting feature: $session_key (mode=$mode${resuming:+, resuming})"
 
     # Init per-workspace bead store if needed
     if [[ ! -d "$config_dir/.beads" ]]; then
@@ -1361,10 +1385,15 @@ cmd_start() {
             && log "Initialized bead store: $config_dir/.beads" || true
     fi
 
-    # Bead
+    # Bead — reuse existing bead when resuming a stopped session
     local bead_title="$feature ($project)"
     local bead_id
-    bead_id=$(bead_find_or_create "$bead_title" "$config_dir")
+    if [[ $resuming -eq 1 && -n "$existing_bead_id" ]]; then
+        bead_id="$existing_bead_id"
+        log "Reusing existing bead: $bead_id"
+    else
+        bead_id=$(bead_find_or_create "$bead_title" "$config_dir")
+    fi
 
     # PM issue
     local pm_issue pm_display tracker_type
@@ -1384,9 +1413,37 @@ cmd_start() {
     local service_names
     mapfile -t service_names < <(yaml_service_names "$effective_config")
 
-    if [[ -n "$worktrees_base" ]]; then
+    local branch="${branch_prefix}${feature}"
+    if [[ $resuming -eq 1 && -n "$existing_branch" ]]; then
+        branch="$existing_branch"
+    fi
+
+    # When resuming, try to reuse existing worktrees from the stopped session
+    local worktrees_reused=0
+    if [[ $resuming -eq 1 && -n "$existing_worktrees" ]]; then
+        local all_exist=1
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local wt_svc="${line%%:*}" wt_path="${line#*:}"
+            if [[ -d "$wt_path" ]]; then
+                worktree_paths[$wt_svc]="$wt_path"
+            else
+                all_exist=0
+                log "Worktree missing for $wt_svc: $wt_path — will recreate"
+            fi
+        done <<< "$existing_worktrees"
+
+        if [[ $all_exist -eq 1 && ${#worktree_paths[@]} -gt 0 ]]; then
+            worktrees_reused=1
+            log "Reusing existing worktrees (all present on disk)"
+        else
+            # Some missing — reset and recreate all
+            declare -A worktree_paths=()
+        fi
+    fi
+
+    if [[ -n "$worktrees_base" && $worktrees_reused -eq 0 ]]; then
         log "Setting up worktrees under $worktrees_base/$feature/"
-        local branch="${branch_prefix}${feature}"
 
         # Phase 1: Discover unique git repos and map services to them.
         # This handles monorepo layouts (e.g. potoo/server + potoo/web share one repo)
@@ -1686,6 +1743,9 @@ with open(sys.argv[1], 'w') as f:
 import json, sys
 data = json.loads(sys.argv[1])
 key = sys.argv[2]
+# Preserve dynamic_workers from previous session if resuming
+old = data.get(key, {})
+dw = old.get('dynamic_workers', [])
 data[key] = {
     "project":    sys.argv[3],
     "feature":    sys.argv[4],
@@ -1699,6 +1759,8 @@ data[key] = {
     "db_name":    sys.argv[12],
     "branch":     sys.argv[13],
 }
+if dw:
+    data[key]['dynamic_workers'] = dw
 print(json.dumps(data, indent=2))
 EOF
 )
@@ -1725,6 +1787,7 @@ EOF
 
     # Print summary
     echo ""
+    [[ $resuming -eq 1 ]] && echo "  Resumed stopped session"
     echo "  Feature:  $feature ($project)"
     echo "  Mode:     $mode"
     echo "  Branch:   $branch"
