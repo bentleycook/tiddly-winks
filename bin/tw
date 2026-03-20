@@ -293,13 +293,48 @@ sessions_read() {
 }
 
 sessions_write() {
-    # Receives JSON on stdin
+    # Receives JSON on stdin — atomic write via temp + rename
     python3 -c "
-import json, sys
+import json, sys, os, tempfile
 data = json.loads(sys.stdin.read())
-with open('$SESSIONS_FILE', 'w') as f:
-    json.dump(data, f, indent=2)
+target = '$SESSIONS_FILE'
+parent = os.path.dirname(target)
+fd, tmp = tempfile.mkstemp(dir=parent, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, target)
+except:
+    os.unlink(tmp)
+    raise
 "
+}
+
+# Atomic JSON write helper for any file. Receives JSON on stdin.
+# Usage: echo '{}' | safe_write_json /path/to/file.json
+safe_write_json() {
+    local target="$1"
+    python3 -c "
+import json, sys, os, tempfile
+data = json.loads(sys.stdin.read())
+target = sys.argv[1]
+parent = os.path.dirname(target)
+os.makedirs(parent, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=parent, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, target)
+except:
+    os.unlink(tmp)
+    raise
+" "$target"
 }
 
 sessions_get_key() {
@@ -319,9 +354,10 @@ sessions_list_keys() {
 sessions_add_dynamic_worker() {
     local session_key="$1" name="$2" role="${3:-}"
     python3 -c "
-import json, sys
+import json, sys, os, tempfile
 sk, name, role = sys.argv[1], sys.argv[2], sys.argv[3]
-with open('$SESSIONS_FILE') as f:
+target = '$SESSIONS_FILE'
+with open(target) as f:
     d = json.load(f)
 session = d.get(sk, {})
 dw = session.get('dynamic_workers', [])
@@ -330,8 +366,18 @@ if not any(w['name'] == name for w in dw):
     dw.append({'name': name, 'role': role})
 session['dynamic_workers'] = dw
 d[sk] = session
-with open('$SESSIONS_FILE', 'w') as f:
-    json.dump(d, f, indent=2)
+parent = os.path.dirname(target)
+fd, tmp = tempfile.mkstemp(dir=parent, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(d, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, target)
+except:
+    os.unlink(tmp)
+    raise
 " "$session_key" "$name" "$role"
 }
 
@@ -339,16 +385,27 @@ with open('$SESSIONS_FILE', 'w') as f:
 sessions_remove_dynamic_worker() {
     local session_key="$1" name="$2"
     python3 -c "
-import json, sys
+import json, sys, os, tempfile
 sk, name = sys.argv[1], sys.argv[2]
-with open('$SESSIONS_FILE') as f:
+target = '$SESSIONS_FILE'
+with open(target) as f:
     d = json.load(f)
 session = d.get(sk, {})
 dw = session.get('dynamic_workers', [])
 session['dynamic_workers'] = [w for w in dw if w['name'] != name]
 d[sk] = session
-with open('$SESSIONS_FILE', 'w') as f:
-    json.dump(d, f, indent=2)
+parent = os.path.dirname(target)
+fd, tmp = tempfile.mkstemp(dir=parent, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(d, f, indent=2)
+        f.write('\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, target)
+except:
+    os.unlink(tmp)
+    raise
 " "$session_key" "$name"
 }
 
@@ -589,6 +646,27 @@ with open(sys.argv[1], 'w') as f:
         'worker_bead_id': sys.argv[6]
     }, f, indent=2)
 " "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id"
+
+    # Recover last task from worker bead and inject into hooked file
+    # so the worker resumes with context even after respawn
+    if [[ -n "$worker_bead_id" ]]; then
+        local _last_task
+        _last_task=$(bd comments "$worker_bead_id" 2>/dev/null \
+            | grep -o '\[TASK [^]]*\] .*' | tail -1 \
+            | sed 's/^\[TASK [^]]*\] //' || true)
+        if [[ -n "$_last_task" ]]; then
+            python3 -c "
+import json, sys
+f = sys.argv[1]
+task = sys.argv[2]
+d = json.load(open(f))
+d['current_task'] = task
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "${hooked_dir}/${wname}.json" "$_last_task" 2>/dev/null || true
+            log "Recovered task from bead $worker_bead_id for $wname"
+        fi
+    fi
 
     # Kill any existing windows with this name to prevent duplicates
     # (can happen if daemon respawns during boot, or if tw start races with daemon)
@@ -1132,6 +1210,55 @@ print('\n'.join(body_lines))
 " 2>/dev/null || true
 }
 
+# Sync key session state to bead metadata so it survives hard resets.
+# Usage: bead_sync_metadata <session_key> <bead_id> <config_dir>
+bead_sync_metadata() {
+    local session_key="$1" bead_id="$2" config_dir="$3"
+    [[ -z "$bead_id" ]] && return 0
+
+    local metadata_json
+    metadata_json=$(python3 - "$session_key" <<'PYEOF'
+import json, sys, os
+
+sk = sys.argv[1]
+sessions_file = os.path.expanduser("~/.tiddly-winks/sessions.json")
+try:
+    with open(sessions_file) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+
+session = data.get(sk, {})
+
+# dynamic_workers: array of {name, role, bead_id}
+dw = session.get('dynamic_workers', [])
+
+# worker_beads: map of worker_name → bead_id
+wb = session.get('worker_beads', {})
+
+# services: current port allocations
+svcs = session.get('services', {})
+
+from datetime import datetime, timezone
+result = {
+    'dynamic_workers': json.dumps(dw),
+    'worker_beads': json.dumps(wb),
+    'services': json.dumps(svcs),
+    'last_sync': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+}
+# Output as key=value lines for --set-metadata
+for k, v in result.items():
+    print(f'{k}={v}')
+PYEOF
+    )
+
+    # Apply each metadata key
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        bd_run "$config_dir" update "$bead_id" --set-metadata "$line" >/dev/null 2>&1 || true
+    done <<< "$metadata_json"
+}
+
 build_bead_body() {
     local feature="$1"
     local project="$2"
@@ -1303,6 +1430,207 @@ find_config() {
     return 1
 }
 
+# ─── Reconciliation ──────────────────────────────────────────────────────────
+#
+# Derives session state from reality (filesystem, tmux, beads) rather than
+# trusting cached state. Inspired by gastown's ZFC principle / ReconcilePool().
+
+# Reconcile sessions.json against actual filesystem and tmux state.
+# - Worktrees in sessions.json but missing on disk → clean up the entry
+# - Worktrees on disk belonging to tw but not in sessions.json → reconstruct from bead
+# - Orphaned tmux sessions (no sessions.json entry) → log warning
+reconcile_session() {
+    local config_dir="${1:-$PWD}"
+    [[ -f "$SESSIONS_FILE" ]] || return 0
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    # Phase 1: Validate sessions.json entries against reality
+    local new_data
+    new_data=$(python3 - "$sessions_data" <<'PYEOF'
+import json, sys, subprocess, os
+
+data = json.loads(sys.argv[1])
+
+for key, s in list(data.items()):
+    worktrees = s.get('worktrees', {})
+    if not worktrees:
+        continue
+
+    # Check each worktree path exists on disk
+    missing = []
+    for svc, path in worktrees.items():
+        if not os.path.isdir(path):
+            missing.append(svc)
+
+    if missing and len(missing) == len(worktrees):
+        # All worktrees gone — check if tmux session also dead
+        session_name = key
+        r = subprocess.run(['tmux', 'has-session', '-t', session_name],
+                           capture_output=True)
+        if r.returncode != 0:
+            # Both worktrees and tmux gone — remove stale entry
+            del data[key]
+            print(f"RECONCILE:removed:{key}:all worktrees missing + no tmux", file=sys.stderr)
+        else:
+            # tmux alive but worktrees gone — clear worktree refs
+            data[key]['worktrees'] = {}
+            print(f"RECONCILE:cleared_worktrees:{key}:worktrees missing but tmux alive", file=sys.stderr)
+    elif missing:
+        # Some worktrees missing — remove only the missing ones
+        for svc in missing:
+            del data[key]['worktrees'][svc]
+        print(f"RECONCILE:partial_cleanup:{key}:removed {','.join(missing)}", file=sys.stderr)
+
+print(json.dumps(data, indent=2))
+PYEOF
+    )
+
+    if [[ "$new_data" != "$sessions_data" ]]; then
+        echo "$new_data" | sessions_write
+        log "Reconciled sessions.json (cleaned stale entries)"
+    fi
+
+    # Phase 2: Check for tw worktrees on disk not tracked in sessions.json
+    local worktrees_base
+    worktrees_base=$(python3 -c "
+import json, sys, os
+data = json.loads(sys.argv[1])
+# Infer worktrees base from existing entries
+for key, s in data.items():
+    wt = s.get('worktrees', {})
+    for svc, path in wt.items():
+        # worktrees are typically at <base>/<feature>/<svc>
+        print(os.path.dirname(os.path.dirname(path)))
+        sys.exit(0)
+# Fallback: check common location
+candidate = os.path.join(sys.argv[2], 'worktrees')
+if os.path.isdir(candidate):
+    print(candidate)
+" "$new_data" "$config_dir" 2>/dev/null || true)
+
+    if [[ -n "$worktrees_base" && -d "$worktrees_base" ]]; then
+        local current_keys
+        current_keys=$(echo "$new_data" | python3 -c "import json,sys; [print(k) for k in json.load(sys.stdin)]" 2>/dev/null)
+
+        for feature_dir in "$worktrees_base"/*/; do
+            [[ -d "$feature_dir" ]] || continue
+            local feature_name
+            feature_name=$(basename "$feature_dir")
+            # Check if any session key references this feature
+            if ! echo "$current_keys" | grep -qF "$feature_name"; then
+                log "Reconcile: found untracked worktree dir: $feature_dir (no session entry)"
+                # Try to find a matching bead to reconstruct
+                local project
+                project=$(yaml_get "$config_dir/.tw.yml" "project" "" 2>/dev/null || true)
+                if [[ -n "$project" ]]; then
+                    local bead_title="$feature_name ($project)"
+                    local bead_id
+                    bead_id=$(bead_find_open "$bead_title" "$config_dir" 2>/dev/null || true)
+                    if [[ -z "$bead_id" ]]; then
+                        bead_id=$(bd_run "$config_dir" list --status=in_progress 2>/dev/null \
+                            | grep -F "$bead_title" | head -1 | awk '{print $2}' | tr -d '#' || true)
+                    fi
+                    if [[ -n "$bead_id" ]]; then
+                        log "Reconcile: found bead $bead_id for untracked feature '$feature_name' — can be recovered with: tw start $feature_name"
+                    fi
+                fi
+            fi
+        done
+    fi
+
+    # Phase 3: Detect orphaned tmux sessions
+    local tmux_sessions
+    tmux_sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null || true)
+    if [[ -n "$tmux_sessions" ]]; then
+        local registered_keys
+        registered_keys=$(echo "$new_data" | python3 -c "import json,sys; [print(k) for k in json.load(sys.stdin)]" 2>/dev/null)
+        while IFS= read -r sess_name; do
+            # Only check sessions that look like tw sessions (project-feature pattern)
+            [[ "$sess_name" == *-* ]] || continue
+            if ! echo "$registered_keys" | grep -qxF "$sess_name"; then
+                log "Reconcile: orphaned tmux session '$sess_name' (not in sessions.json)"
+            fi
+        done <<< "$tmux_sessions"
+    fi
+
+    return 0
+}
+
+# Reconcile worker state by deriving liveness from tmux + bead status.
+# - Worker bead says in_progress but tmux window dead → mark as needs_respawn
+# - tmux window alive but no bead → log warning
+reconcile_workers() {
+    local session_key="$1" config_dir="${2:-$PWD}"
+    local tmux_session="$session_key"
+
+    # Only reconcile if the tmux session exists
+    tmux has-session -t "$tmux_session" 2>/dev/null || return 0
+
+    local project
+    project=$(sessions_get_key "$session_key" "project" 2>/dev/null || true)
+    [[ -z "$project" ]] && return 0
+
+    # Get all worker windows (exclude god, main, services, and numeric windows)
+    local tmux_windows
+    tmux_windows=$(tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null || true)
+    [[ -z "$tmux_windows" ]] && return 0
+
+    local agents_path="$TW_DIR/agents/$session_key"
+
+    # Track base names we've already processed (spinner creates duplicate entries)
+    local -A seen_workers
+
+    while IFS= read -r wname; do
+        # Strip spinner suffix (e.g. "alpha ⠴" → "alpha")
+        local base_name="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+
+        # Skip non-worker windows
+        case "$base_name" in
+            god|main|services|[0-9]*) continue ;;
+        esac
+
+        # Deduplicate — spinner-renamed and base windows can both appear
+        [[ -n "${seen_workers[$base_name]+x}" ]] && continue
+        seen_workers[$base_name]=1
+
+        # Check worker bead status
+        local worker_bead_id
+        worker_bead_id=$(worker_bead_find "$base_name" "$project" "$config_dir" 2>/dev/null || true)
+
+        if [[ -z "$worker_bead_id" ]]; then
+            log "Reconcile workers: '$base_name' has tmux window but no worker bead"
+            continue
+        fi
+
+        # Derive liveness: tmux window + process
+        local state
+        state=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
+
+        # Get bead status
+        local bead_status
+        bead_status=$(bd_run "$config_dir" show "$worker_bead_id" 2>/dev/null \
+            | grep -E "^Status:" | awk '{print $2}' || true)
+
+        if [[ "$bead_status" == "in_progress" && "$state" == "dead" ]]; then
+            # Worker bead thinks it's active but tmux says dead — mark for respawn
+            bd_run "$config_dir" comments add "$worker_bead_id" \
+                "[RECONCILE] Worker tmux dead but bead in_progress. Marking needs_respawn." \
+                >/dev/null 2>&1 || true
+            bd_run "$config_dir" update "$worker_bead_id" \
+                --set-metadata "agent_state=needs_respawn" >/dev/null 2>&1 || true
+            log "Reconcile workers: '$base_name' marked needs_respawn (tmux dead, bead was in_progress)"
+        elif [[ "$state" != "dead" && "$bead_status" != "in_progress" ]]; then
+            # Worker is alive but bead isn't in_progress — sync bead
+            bead_mark_in_progress "$worker_bead_id" "$config_dir"
+            bd_run "$config_dir" update "$worker_bead_id" \
+                --set-metadata "agent_state=alive" >/dev/null 2>&1 || true
+            log "Reconcile workers: '$base_name' bead updated to in_progress (worker alive)"
+        fi
+    done <<< "$tmux_windows"
+}
+
 # ─── Subcommands ─────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -1341,6 +1669,9 @@ cmd_start() {
 
     local session_key="${project}-${feature}"
     local tmux_session="$session_key"
+
+    # Reconcile state before checking session existence — derive truth from reality
+    reconcile_session "$config_dir"
 
     # Fail if session already exists AND is registered in sessions.json
     # If tmux exists but sessions.json is missing the entry, auto-clean and proceed
@@ -1782,6 +2113,7 @@ EOF
             "$worktrees_bead_block" "$db_name")
         bead_update_body "$bead_id" "$bead_body" "$config_dir"
         bead_mark_in_progress "$bead_id" "$config_dir"
+        bead_sync_metadata "$session_key" "$bead_id" "$config_dir"
         bd_run "$config_dir" vc commit -m "tw session update" 2>/dev/null || true
     fi
 
@@ -1975,6 +2307,9 @@ EOF
 
     # Update bead
     if [[ -n "$bead_id" ]]; then
+        # Persist final session state to bead metadata before cleanup
+        bead_sync_metadata "$session_key" "$bead_id" "$config_dir"
+
         if [[ $done_flag -eq 1 ]]; then
             bead_close "$bead_id" "$config_dir"
             log "Closed bead $bead_id"
@@ -2353,6 +2688,293 @@ EOF
 
     echo "  Prune complete."
 }
+
+cmd_reconcile() {
+    local feature="${1:-}"
+
+    # Find config dir
+    local config_dir
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        config_dir="$(dirname "$config_file")"
+    else
+        config_dir="$PWD"
+    fi
+
+    log "Running reconciliation..."
+    reconcile_session "$config_dir"
+
+    # If a feature was specified, also reconcile its workers
+    if [[ -n "$feature" ]]; then
+        local project session_key
+        project=$(yaml_get "$config_dir/.tw.yml" "project" "" 2>/dev/null || true)
+        if [[ -n "$project" ]]; then
+            session_key="${project}-${feature}"
+            reconcile_workers "$session_key" "$config_dir"
+        fi
+    else
+        # Reconcile workers for all active sessions
+        local session_keys
+        session_keys=$(sessions_list_keys)
+        while IFS= read -r sk; do
+            [[ -z "$sk" ]] && continue
+            local sk_workspace
+            sk_workspace=$(sessions_get_key "$sk" "workspace" 2>/dev/null || true)
+            reconcile_workers "$sk" "${sk_workspace:-$config_dir}"
+        done <<< "$session_keys"
+    fi
+
+    echo "  Reconciliation complete."
+}
+
+# ─── Resume from beads after hard reset ──────────────────────────────────────
+
+cmd_resume() {
+    local target_feature="" all=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) target_feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$target_feature" && $all -eq 0 ]] \
+        && die "Usage: tw resume <feature> | tw resume --all"
+
+    # Prune stale entries from sessions.json first
+    cmd_prune 2>/dev/null || true
+
+    # Discover feature beads from all workspace bead stores.
+    local feature_beads
+    feature_beads=$(python3 - "$target_feature" "$all" <<'PYEOF'
+import json, sys, subprocess, os, glob
+
+target = sys.argv[1]
+resume_all = sys.argv[2] == "1"
+
+# Collect all workspaces with .beads directories
+sessions_file = os.path.expanduser("~/.tiddly-winks/sessions.json")
+workspaces = set()
+try:
+    with open(sessions_file) as f:
+        for key, s in json.load(f).items():
+            ws = s.get("workspace", "")
+            if ws and os.path.isdir(os.path.join(ws, ".beads")):
+                workspaces.add(ws)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+# Check cwd and parents for .beads
+d = os.getcwd()
+while d != "/":
+    if os.path.isdir(os.path.join(d, ".beads")):
+        workspaces.add(d)
+        break
+    d = os.path.dirname(d)
+
+# Scan ~/Programming/*/ for .beads
+for p in glob.glob(os.path.expanduser("~/Programming/*/.beads")):
+    workspaces.add(os.path.dirname(p))
+
+results = []
+seen_ids = set()
+
+for ws in workspaces:
+    try:
+        proc = subprocess.run(
+            ["bd", "export", "--all"],
+            capture_output=True, text=True, cwd=ws
+        )
+        for line in proc.stdout.strip().splitlines():
+            bead = json.loads(line)
+            if bead["id"] in seen_ids:
+                continue
+            if bead.get("status") != "in_progress":
+                continue
+            desc = bead.get("description", "")
+            if "## Feature Space" not in desc:
+                continue
+            if bead.get("title", "").startswith("tw:worker"):
+                continue
+
+            title = bead.get("title", "")
+            if "(" not in title or ")" not in title:
+                continue
+            title_feature = title.split("(")[0].strip()
+            project = title.split("(")[1].rstrip(")")
+
+            # Parse description for branch, workspace, mode
+            branch = mode = bead_ws = ""
+            for dline in desc.splitlines():
+                dline = dline.strip()
+                if dline.startswith("- branch:"):
+                    branch = dline.split(":", 1)[1].strip()
+                elif dline.startswith("- workspace:"):
+                    bead_ws = dline.split(":", 1)[1].strip()
+                elif dline.startswith("- mode:"):
+                    mode = dline.split(":", 1)[1].strip()
+
+            # Derive feature name from branch using .tw.yml branch_prefix.
+            # More reliable than bead title which may diverge.
+            feature = title_feature  # fallback
+            actual_ws = bead_ws or ws
+            if branch:
+                try:
+                    import yaml
+                    bp = ""
+                    for cfg_name in (".tw.yml", ".devenv.yml"):
+                        cfg_path = os.path.join(actual_ws, cfg_name)
+                        if os.path.isfile(cfg_path):
+                            with open(cfg_path) as cf:
+                                cfg = yaml.safe_load(cf) or {}
+                            bp = (cfg.get("worktrees") or {}).get("branch_prefix", "")
+                            break
+                    if not bp:
+                        import getpass
+                        bp = getpass.getuser() + "/"
+                    if branch.startswith(bp):
+                        feature = branch[len(bp):]
+                except Exception:
+                    pass  # keep title_feature as fallback
+
+            if not resume_all and target and feature != target:
+                continue
+
+            meta = bead.get("metadata", {}) or {}
+            dw_json = meta.get("dynamic_workers", "[]")
+
+            # Dedup by session key (project-feature) — pick the most recently updated
+            sk = f"{project}-{feature}"
+            seen_ids.add(bead["id"])
+            # Skip if we already have this session key
+            if any(r.get("_sk") == sk for r in results):
+                continue
+            results.append({
+                "_sk": sk,
+                "bead_id": bead["id"],
+                "feature": feature,
+                "project": project,
+                "branch": branch,
+                "workspace": actual_ws,
+                "mode": mode or "local",
+                "dynamic_workers": dw_json,
+            })
+    except Exception:
+        continue
+
+print(json.dumps(results))
+PYEOF
+    )
+
+    local count
+    count=$(echo "$feature_beads" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+
+    if [[ "$count" == "0" ]]; then
+        if [[ $all -eq 1 ]]; then
+            echo "  No in-progress feature beads found to resume."
+        else
+            die "No in-progress bead found for feature '$target_feature'"
+        fi
+        return 0
+    fi
+
+    echo ""
+    echo "  Found $count feature(s) to resume:"
+
+    local i=0
+    while IFS= read -r bead_json; do
+        [[ -z "$bead_json" || "$bead_json" == "null" ]] && continue
+
+        local feat proj ws mode bead_id dw_json
+        feat=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['feature'])")
+        proj=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['project'])")
+        ws=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['workspace'])")
+        mode=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['mode'])")
+        bead_id=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['bead_id'])")
+        dw_json=$(echo "$bead_json" | python3 -c "import json,sys; print(json.load(sys.stdin)['dynamic_workers'])")
+
+        local session_key="${proj}-${feat}"
+
+        if tmux has-session -t "$session_key" 2>/dev/null; then
+            echo "  ⏭  $session_key — already running, skipping"
+            continue
+        fi
+
+        echo ""
+        echo "  ▶ Resuming: $session_key (bead: $bead_id)"
+        echo "    workspace: $ws"
+        echo "    mode: $mode"
+
+        if [[ ! -d "$ws" ]]; then
+            echo "    ✗ Workspace not found: $ws — skipping"
+            continue
+        fi
+
+        if [[ ! -f "$ws/.tw.yml" && ! -f "$ws/.devenv.yml" ]]; then
+            echo "    ✗ No .tw.yml found in workspace: $ws — skipping"
+            continue
+        fi
+
+        echo "    Starting session..."
+        # Run cmd_start; it may exit non-zero due to non-critical failures
+        # (e.g., db_setup). Check tmux session existence as the real success test.
+        (cd "$ws" && cmd_start "$feat" --mode "$mode") 2>&1 || true
+
+        if ! tmux has-session -t "$session_key" 2>/dev/null; then
+            echo "    ✗ Failed to start $session_key — continuing with next"
+            continue
+        fi
+
+        # Respawn dynamic workers from bead metadata
+        if [[ -n "$dw_json" && "$dw_json" != "[]" ]]; then
+            echo "    Respawning dynamic workers..."
+            local dw_pairs
+            dw_pairs=$(python3 -c "
+import json, sys
+dw = json.loads(sys.argv[1])
+for w in dw:
+    print(f\"{w['name']}:{w.get('role', '')}\")
+" "$dw_json" 2>/dev/null || true)
+
+            while IFS= read -r wpair; do
+                [[ -z "$wpair" ]] && continue
+                local wname="${wpair%%:*}"
+                local wrole="${wpair#*:}"
+
+                # Skip if already spawned by cmd_start (from .tw.yml workers section)
+                if tmux list-windows -t "$session_key" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+                    continue
+                fi
+
+                echo "    + spawning: $wname${wrole:+ (role: $wrole)}"
+                if [[ -n "$wrole" ]]; then
+                    (cd "$ws" && cmd_spawn "$feat" "$wname" "$wrole") 2>/dev/null || {
+                        echo "      ✗ Failed to spawn $wname"
+                    }
+                else
+                    (cd "$ws" && cmd_spawn "$feat" "$wname") 2>/dev/null || {
+                        echo "      ✗ Failed to spawn $wname"
+                    }
+                fi
+            done <<< "$dw_pairs"
+        fi
+
+        echo "    ✓ $session_key resumed"
+        ((i++)) || true
+    done < <(echo "$feature_beads" | python3 -c "
+import json, sys
+for item in json.load(sys.stdin):
+    print(json.dumps(item))
+")
+
+    echo ""
+    echo "  Resume complete. $i session(s) restarted."
+    echo "  Run 'tw list' to see all sessions."
+    echo ""
+}
+
 
 cmd_editor() {
     local feature="${1:-}"
@@ -2919,7 +3541,11 @@ nudge_enqueue() {
     mkdir -p "$dir"
     ts=$(date +%s)
     msg_file="${dir}/${ts}-${ttl}.msg"
-    printf '%s' "$message" > "$msg_file"
+    # Atomic write: temp file + rename to avoid partial reads
+    local tmp_file
+    tmp_file=$(mktemp "${dir}/.nudge-XXXXXX")
+    printf '%s' "$message" > "$tmp_file"
+    mv "$tmp_file" "$msg_file"
 }
 
 # Drain all non-expired nudge messages for a worker. Prints content and deletes files.
@@ -3018,6 +3644,19 @@ cmd_send() {
 
     nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
 
+    # Persist task to worker bead as the source of truth (survives respawns)
+    local worker_bead_id=""
+    if [[ -f "$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json" ]]; then
+        worker_bead_id=$(python3 -c "
+import json
+d = json.load(open('$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json'))
+print(d.get('worker_bead_id', ''))
+" 2>/dev/null || true)
+    fi
+    if [[ -n "$worker_bead_id" ]]; then
+        bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
+    fi
+
     # GUPP: write current_task to hooked file so worker resumes on restart
     local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
     if [[ -f "$hooked_file" ]]; then
@@ -3053,6 +3692,75 @@ with open(f, 'w') as fh:
     [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
     echo "  Nudge queued for $worker${urgency_label}: $task"
     echo "  Will be injected on next prompt turn via tw-mail-check hook."
+}
+
+cmd_tasks() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw tasks <feature>"
+
+    local session_key project
+    local config_file
+    if config_file=$(find_config 2>/dev/null); then
+        project=$(yaml_get "$config_file" "project" "")
+        session_key="${project}-${feature}"
+    else
+        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
+        [[ -z "$session_key" ]] && die "No session found for '$feature'"
+        project=$(sessions_get_key "$session_key" "project")
+    fi
+
+    local config_dir
+    config_dir=$(sessions_get_key "$session_key" "workspace")
+    [[ -z "$config_dir" ]] && config_dir="$PWD"
+
+    # Gather all worker bead IDs from hooked files
+    local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    local found=0
+
+    echo ""
+    printf "  %-15s %-22s %s\n" "WORKER" "ASSIGNED" "TASK"
+    printf "  %-15s %-22s %s\n" "---------------" "----------------------" "--------------------"
+
+    for hooked_file in "$hooked_dir"/*.json; do
+        [[ -f "$hooked_file" ]] || continue
+        local wname
+        wname=$(basename "$hooked_file" .json)
+
+        local worker_bead_id
+        worker_bead_id=$(python3 -c "
+import json
+d = json.load(open('$hooked_file'))
+print(d.get('worker_bead_id', ''))
+" 2>/dev/null || true)
+        [[ -z "$worker_bead_id" ]] && continue
+
+        # Read all [TASK] comments from the worker bead
+        local task_lines
+        task_lines=$(bd comments "$worker_bead_id" 2>/dev/null \
+            | grep '\[TASK ' || true)
+        [[ -z "$task_lines" ]] && continue
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            # Extract timestamp and task text from: "... [TASK 2026-03-20T01:15Z] do the thing"
+            local ts task_text
+            ts=$(echo "$line" | grep -o '\[TASK [^]]*\]' | sed 's/\[TASK //;s/\]//')
+            task_text=$(echo "$line" | grep -o '\[TASK [^]]*\] .*' | sed 's/^\[TASK [^]]*\] //')
+            # Truncate long task text for display
+            if [[ ${#task_text} -gt 60 ]]; then
+                task_text="${task_text:0:57}..."
+            fi
+            printf "  %-15s %-22s %s\n" "$wname" "$ts" "$task_text"
+            (( found++ )) || true
+        done <<< "$task_lines"
+    done
+
+    echo ""
+    if [[ $found -eq 0 ]]; then
+        echo "  No tasks recorded in worker beads."
+    else
+        echo "  $found task(s) found across worker beads."
+    fi
 }
 
 cmd_signal() {
@@ -3355,11 +4063,61 @@ with open(sys.argv[1], 'w') as f:
     echo "  Identity bead: $worker_bead_id (work history preserved)"
 }
 
+# ─── Sync Worker Outputs to Beads ────────────────────────────────────────────
+sync_worker_output_to_bead() {
+    local session_key="$1" wname="$2" agents_path="$3" project="$4" config_dir="$5" force="${6:-0}"
+    local output_file="$agents_path/${wname}.md"
+    [[ -f "$output_file" ]] || return 0
+    local sync_dir="$HOME/.tiddly-winks/sync-offsets/${session_key}"
+    mkdir -p "$sync_dir"
+    local offset_file="$sync_dir/${wname}.last-sync-offset"
+    local prev_offset=0
+    [[ -f "$offset_file" ]] && prev_offset=$(cat "$offset_file" 2>/dev/null || echo 0)
+    local current_size
+    current_size=$(stat -f %z "$output_file" 2>/dev/null || stat -c %s "$output_file" 2>/dev/null || echo 0)
+    # Nothing new to sync
+    if [[ "$current_size" -le "$prev_offset" ]]; then
+        return 0
+    fi
+    # Extract new content (bytes from prev_offset+1 onward)
+    local new_content
+    new_content=$(tail -c "+$((prev_offset + 1))" "$output_file")
+    [[ -z "$new_content" ]] && return 0
+    # Find worker bead ID
+    local worker_bead_id
+    worker_bead_id=$(worker_bead_find "$wname" "$project" "$config_dir" 2>/dev/null)
+    if [[ -z "$worker_bead_id" ]]; then
+        local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${wname}.json"
+        if [[ -f "$hooked_file" ]]; then
+            worker_bead_id=$(python3 -c "
+import json
+try: print(json.load(open('$hooked_file')).get('worker_bead_id', ''))
+except: pass
+" 2>/dev/null)
+        fi
+    fi
+    [[ -z "$worker_bead_id" ]] && return 0
+    # Write new content to temp file and append as bead comment
+    local tmpfile
+    tmpfile=$(mktemp)
+    echo "$new_content" > "$tmpfile"
+    if bd_run "$config_dir" comments add "$worker_bead_id" -f "$tmpfile" >/dev/null 2>&1; then
+        echo "$current_size" > "$offset_file"
+        rm -f "$tmpfile"
+        echo "$wname"
+        return 0
+    fi
+    rm -f "$tmpfile"
+    return 1
+}
+
 cmd_patrol() {
     local feature=""
+    local sync_outputs=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --sync-outputs) sync_outputs=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
@@ -3386,6 +4144,9 @@ cmd_patrol() {
 
     tmux has-session -t "$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session'"
+
+    # Reconcile worker state before health checks
+    reconcile_workers "$session_key" "$config_dir"
 
     local override_file="$config_dir/.tw.override.yml"
     [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
@@ -3599,6 +4360,25 @@ for name, info in s.items():
         echo "  [+] New output since last patrol: $new_output_workers"
         echo "      View with: tw feed $feature --problems"
         echo ""
+    fi
+
+    # 3c. Sync worker outputs to beads (incremental)
+    if [[ $sync_outputs -eq 1 || -n "$new_output_workers" ]]; then
+        local synced_workers=""
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}"
+            # Only sync workers with new output (or all if --sync-outputs forced)
+            if [[ $sync_outputs -eq 1 ]] || echo "$new_output_workers" | grep -qw "$wname"; then
+                local synced
+                synced=$(sync_worker_output_to_bead "$session_key" "$wname" "$agents_path" "$project" "$config_dir" "$sync_outputs" 2>/dev/null) || true
+                [[ -n "$synced" ]] && synced_workers+="$synced "
+            fi
+        done
+        if [[ -n "$synced_workers" ]]; then
+            echo "  [↑] Synced outputs to beads: $synced_workers"
+            echo ""
+        fi
     fi
 
     # 4. Plugin dispatch
@@ -3848,6 +4628,9 @@ cmd_spawn() {
 
     # Persist to session state
     sessions_add_dynamic_worker "$session_key" "$name" "$role"
+
+    # Sync metadata to bead
+    bead_sync_metadata "$session_key" "$bead_id" "$config_dir"
 
     echo ""
     if [[ -n "$role" ]]; then
@@ -4182,6 +4965,8 @@ tw start <feature>               # Create feature space (branch, worktrees, serv
 tw stop <feature>                # Pause session (bead stays open)
 tw stop <feature> --done         # Tear down everything, close bead
 tw prune                         # Clean up dead sessions after reboot
+tw resume <feature>              # Resume feature from bead state after hard reset
+tw resume --all                  # Resume all in-progress features
 ```
 
 ### Worker Management
@@ -5514,6 +6299,9 @@ Agent commands (used by Claude workers):
   tw prime                              AI workflow context (inject via hooks)
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
+  tw reconcile [<feature>]              Derive state from reality (filesystem, tmux, beads)
+  tw resume <feature>                   Resume a feature from bead state after hard reset
+  tw resume --all                       Resume all in-progress features from beads
   tw gates <feature> [--gate=NAME]       Run quality gates (all or specific)
   tw config proxy <feature> <sub> <svc>   Remap a proxy route at runtime
   tw config service <feature> <n> port <p> Update a service's port
@@ -5542,6 +6330,7 @@ case "$subcommand" in
     open)    cmd_open "$@" ;;
     editor)  cmd_editor "$@" ;;
     prune)   cmd_prune "$@" ;;
+    resume)  cmd_resume "$@" ;;
     claude)  cmd_claude "$@" ;;
     append)  cmd_append "$@" ;;
     spawn)   cmd_spawn "$@" ;;
@@ -5552,6 +6341,7 @@ case "$subcommand" in
     feed)    cmd_feed "$@" ;;
     hook)    cmd_hook "$@" ;;
     send)    cmd_send "$@" ;;
+    tasks)   cmd_tasks "$@" ;;
     signal)  cmd_signal "$@" ;;
     setup)   cmd_setup "$@" ;;
     prime)   cmd_prime ;;
@@ -5563,6 +6353,7 @@ case "$subcommand" in
     port-owner) cmd_port_owner "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     nudge)   cmd_nudge "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
 esac

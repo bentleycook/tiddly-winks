@@ -81,8 +81,8 @@ except Exception:
 
 _tw_subcommands() {
     echo "init start stop list attach status open editor prune claude append"
-    echo "spawn workers handoff send patrol feed hook signal setup prime"
-    echo "onboard gates daemon config port-owner doctor nudge help completion"
+    echo "spawn workers handoff send tasks patrol feed hook signal setup prime"
+    echo "resume reconcile onboard gates daemon config port-owner doctor nudge help completion"
 }
 
 _tw_completions() {
@@ -140,6 +140,13 @@ _tw_completions() {
                 if [[ -d "$roles_dir" ]]; then
                     COMPREPLY=($(compgen -W "$(ls "$roles_dir" 2>/dev/null | sed 's/\.md$//')" -- "$cur"))
                 fi
+            fi
+            ;;
+
+        # tasks <feature>
+        tasks)
+            if [[ $arg_pos -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
             fi
             ;;
 
@@ -205,6 +212,13 @@ _tw_completions() {
         # config
         config)
             COMPREPLY=($(compgen -W "--get --set --list" -- "$cur"))
+            ;;
+
+        # resume <feature> | --all
+        resume)
+            if [[ $arg_pos -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "--all $(_tw_features)" -- "$cur"))
+            fi
             ;;
     esac
 
