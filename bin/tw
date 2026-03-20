@@ -421,6 +421,49 @@ for w in dw:
 " "$session_key" 2>/dev/null
 }
 
+# Resolve a feature-or-index argument into session variables.
+# Sets in the CALLER's scope: session_key, project, config_dir, tmux_session, bead_id
+# Accepts: numeric index (from tw list), exact feature name, or substring match.
+resolve_session() {
+    local _rs_feature="$1"
+
+    if [[ "$_rs_feature" =~ ^[0-9]+$ ]]; then
+        # Index-based: resolve Nth session from sessions.json (1-based, matches tw list)
+        local _rs_data
+        _rs_data=$(sessions_read)
+        session_key=$(python3 - "$_rs_data" "$_rs_feature" <<'PYEOF'
+import json, sys
+data = json.loads(sys.argv[1])
+idx = int(sys.argv[2])
+keys = list(data.keys())
+if 1 <= idx <= len(keys):
+    print(keys[idx - 1])
+PYEOF
+        )
+        [[ -z "$session_key" ]] && die "No session at index $_rs_feature"
+        project=$(sessions_get_key "$session_key" "project")
+        config_dir=$(sessions_get_key "$session_key" "workspace")
+    else
+        # String-based: try find_config first (CWD-aware), then sessions.json
+        local _rs_config_file
+        if _rs_config_file=$(find_config 2>/dev/null); then
+            project=$(yaml_get "$_rs_config_file" "project" "")
+            config_dir="$(dirname "$_rs_config_file")"
+            session_key="${project}-${_rs_feature}"
+        else
+            session_key=$(sessions_list_keys | grep -Fx "$_rs_feature" | head -1 || true)
+            if [[ -z "$session_key" ]]; then
+                session_key=$(sessions_list_keys | grep -F "$_rs_feature" | head -1 || true)
+            fi
+            [[ -z "$session_key" ]] && die "No session found for '$_rs_feature'"
+            project=$(sessions_get_key "$session_key" "project")
+            config_dir=$(sessions_get_key "$session_key" "workspace")
+        fi
+    fi
+    tmux_session="$session_key"
+    bead_id=$(sessions_get_key "$session_key" "bead_id")
+}
+
 # ─── Activity Spinner ────────────────────────────────────────────────────────
 #
 # Background loop that shows braille spinner frames on worker tmux window names
@@ -453,8 +496,8 @@ spinner_start() {
         frame=0
         declare -A prev_state
 
-        while tmux has-session -t "$tmux_session" 2>/dev/null; do
-            win_list=$(tmux list-windows -t "$tmux_session" -F "#{window_index}:#{window_name}" 2>/dev/null) || break
+        while tmux has-session -t "=$tmux_session" 2>/dev/null; do
+            win_list=$(tmux list-windows -t "=$tmux_session" -F "#{window_index}:#{window_name}" 2>/dev/null) || break
 
             while IFS= read -r entry; do
                 [[ -z "$entry" ]] && continue
@@ -464,7 +507,7 @@ spinner_start() {
                 base_name="${wname% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
                 [[ "$base_name" =~ ^($SPINNER_RESERVED)$ ]] && continue
 
-                pane_pid=$(tmux list-panes -t "$tmux_session:$widx" -F "#{pane_pid}" 2>/dev/null | head -1)
+                pane_pid=$(tmux list-panes -t "=$tmux_session:$widx" -F "#{pane_pid}" 2>/dev/null | head -1)
                 [[ -z "$pane_pid" ]] && continue
 
                 child_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1)
@@ -478,10 +521,10 @@ spinner_start() {
                 fi
 
                 if [[ $active -eq 1 ]]; then
-                    tmux rename-window -t "$tmux_session:$widx" "$base_name ${SPINNER_FRAMES[$frame]}" 2>/dev/null || true
+                    tmux rename-window -t "=$tmux_session:$widx" "$base_name ${SPINNER_FRAMES[$frame]}" 2>/dev/null || true
                     prev_state[$base_name]=1
                 elif [[ "${prev_state[$base_name]:-0}" -eq 1 ]]; then
-                    tmux rename-window -t "$tmux_session:$widx" "$base_name" 2>/dev/null || true
+                    tmux rename-window -t "=$tmux_session:$widx" "$base_name" 2>/dev/null || true
                     prev_state[$base_name]=0
                 fi
             done <<< "$win_list"
@@ -614,6 +657,17 @@ agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 # Safety net to prevent spawn storms from overwhelming the machine.
 TW_MAX_WORKERS=${TW_MAX_WORKERS:-100}
 
+# Capture pane output before killing/respawning a worker.
+# Saves the last 1000 lines to agents/<session>/<worker>-last-screen.txt
+capture_pane() {
+    local tmux_target="$1" session_key="$2" wname="$3"
+    local agents_path
+    agents_path="$(agents_dir "$session_key")"
+    mkdir -p "$agents_path"
+    tmux capture-pane -t "$tmux_target" -p -S -1000 \
+        > "$agents_path/${wname}-last-screen.txt" 2>/dev/null || true
+}
+
 # Spawn a worker window and wire up hook-based context injection.
 # Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id]
 spawn_worker() {
@@ -670,21 +724,34 @@ with open(f, 'w') as fh:
 
     # Kill any existing windows with this name to prevent duplicates
     # (can happen if daemon respawns during boot, or if tw start races with daemon)
-    while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
-        tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
+    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+        capture_pane "=$tmux_session:$wname" "$session_key" "$wname"
+    fi
+    while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+        tmux kill-window -t "=$tmux_session:$wname" 2>/dev/null || break
     done
 
-    tmux new-window -d -t "$tmux_session" -n "$wname"
-    tmux set-option -t "$tmux_session:$wname" allow-rename off 2>/dev/null || true
-    tmux send-keys -t "$tmux_session:$wname" \
+    tmux new-window -d -t "=$tmux_session" -n "$wname"
+    tmux set-option -t "=$tmux_session:$wname" allow-rename off 2>/dev/null || true
+    tmux set-option -t "=$tmux_session:$wname" remain-on-exit on 2>/dev/null || true
+    tmux send-keys -t "=$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$wname'" Enter
+
+    # Auto-respawn hook: when pane dies, capture output, check crash count, and respawn
+    # tmux calls this automatically — much faster than waiting for daemon patrol
+    local _respawn_dir="$TW_DIR/rapid-respawns/$session_key"
+    tmux set-hook -t "=$tmux_session:$wname" pane-died \
+        "run-shell 'mkdir -p \"$_respawn_dir\" && \
+         tw pane-capture \"$tmux_session\" \"$session_key\" \"$wname\" && \
+         tw pane-respawn \"$tmux_session\" \"$session_key\" \"$wname\" \"$_respawn_dir\" \"$config_dir\" \"$wrole\"'" \
+        2>/dev/null || true
 
     # Queue an initial wake prompt — delivered on the worker's first turn.
     # Safe to send-keys here because Claude hasn't started any tool calls yet.
     # The delay gives Claude time to fully boot (load hooks, settings, auth).
     (
         sleep 16
-        tmux send-keys -t "$tmux_session:$wname" \
+        tmux send-keys -t "=$tmux_session:$wname" \
             "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
     ) &
 
@@ -771,12 +838,31 @@ Workers write to their output files incrementally. Poll progress:
   tw feed $feature --problems    # one-shot: which workers have recent/stale output
   tw feed $feature               # stream: tail all output files in real time
   tw patrol $feature             # full health check + output tracking
+  cat ~/.tiddly-winks/health/${session_key}.json  # structured health report (updated by daemon)
+The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken) and crash counts. Check this FIRST before running patrol — it's faster and tells you who needs attention.
+
+## Mail (persistent messaging)
+For important signals (task done, help needed, handoffs), use mail instead of output file polling:
+  tw mail send $feature <worker> -s \"Subject\" -m \"Body\" -f god
+  tw mail inbox $feature god     # check your inbox
+  tw mail read <bead-id>         # read and mark as read
+  tw mail ack <bead-id>          # acknowledge and close
+Workers can mail you when they complete tasks or need help. Check your inbox periodically.
 After dispatching, check worker output files periodically. Don't wait for workers to message you — poll their files.
 
 ## Worker discoveries
 Workers may file new beads when they discover bugs or work items. Periodically check:
   bd list --status=open
 to see what workers have found. Triage and prioritize as needed.
+
+## Creating sub-beads (IMPORTANT)
+When decomposing work into sub-beads, ALWAYS include --description with the full
+implementation details. A title alone is useless — workers pick up beads in fresh
+sessions with no conversation history. The description must be self-contained:
+  bd create --title=\"<concise task name>\" --type=task --parent=<epic-id> --priority=2 \\
+    --description=\"What: <specific implementation steps>. Where: <files/modules affected>. Acceptance: <how to verify done>.\"
+Extract the relevant section of your plan and serialize it into --description.
+Never create a bead with just a title — that's a lost plan.
 
 ## On startup — gather state by delegation, not directly
 Dispatch to each worker:
@@ -786,9 +872,9 @@ Wait for output files to populate, then synthesize a state summary for the user.
 
     (
         sleep 6
-        tmux send-keys -t "$tmux_session:god" "$seed"
+        tmux send-keys -t "=$tmux_session:god" "$seed"
         sleep 0.5
-        tmux send-keys -t "$tmux_session:god" "" Enter
+        tmux send-keys -t "=$tmux_session:god" "" Enter
     ) &
 }
 
@@ -901,9 +987,9 @@ breaker_notify_god() {
     local tmux_session="$1" worker="$2" count="$3"
     local msg="[tw breaker] Worker '$worker' has failed $count times in ${BREAKER_WINDOW_SECS}s. Auto-respawn blocked. Manual action needed: tw workers <feature> --respawn --force"
     # Send as a message to the god window if it exists
-    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "god"; then
-        tmux send-keys -t "$tmux_session:god" "" 2>/dev/null || true
-        tmux send-keys -t "$tmux_session:god" "$msg" Enter 2>/dev/null || true
+    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "god"; then
+        tmux send-keys -t "=$tmux_session:god" "" 2>/dev/null || true
+        tmux send-keys -t "=$tmux_session:god" "$msg" Enter 2>/dev/null || true
     fi
     log "$msg"
 }
@@ -1147,7 +1233,7 @@ with open(sys.argv[1], 'w') as f:
 
     # Send a wake prompt to re-activate the worker
     local wake_msg="You are being re-activated for new work. Re-read your role and context from the SessionStart hook, check bd show $bead_id for the latest feature state, and report ready to your output file."
-    send_to_pane "$tmux_session:$wname" "$wake_msg"
+    send_to_pane "=$tmux_session:$wname" "$wake_msg"
 
     # Record in CV
     local _cv_project="${session_key%%-*}"
@@ -1566,7 +1652,7 @@ reconcile_workers() {
     local tmux_session="$session_key"
 
     # Only reconcile if the tmux session exists
-    tmux has-session -t "$tmux_session" 2>/dev/null || return 0
+    tmux has-session -t "=$tmux_session" 2>/dev/null || return 0
 
     local project
     project=$(sessions_get_key "$session_key" "project" 2>/dev/null || true)
@@ -1574,7 +1660,7 @@ reconcile_workers() {
 
     # Get all worker windows (exclude god, main, services, and numeric windows)
     local tmux_windows
-    tmux_windows=$(tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null || true)
+    tmux_windows=$(tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null || true)
     [[ -z "$tmux_windows" ]] && return 0
 
     local agents_path="$TW_DIR/agents/$session_key"
@@ -1675,12 +1761,12 @@ cmd_start() {
 
     # Fail if session already exists AND is registered in sessions.json
     # If tmux exists but sessions.json is missing the entry, auto-clean and proceed
-    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+    if tmux has-session -t "=$tmux_session" 2>/dev/null; then
         if sessions_get_key "$session_key" "project" 2>/dev/null | grep -q .; then
             die "Feature '$feature' already running. Use: tmux attach -t $tmux_session"
         else
             log "Found orphan tmux session '$tmux_session' (not in sessions.json) — killing and restarting"
-            tmux kill-session -t "$tmux_session" 2>/dev/null || true
+            tmux kill-session -t "=$tmux_session" 2>/dev/null || true
         fi
     fi
 
@@ -1874,7 +1960,10 @@ for name, info in svcs.items():
     # Start tmux session for this feature
     # Window 0 is "god" (orchestrator) — created with the session so it's always index 0
     tmux new-session -d -s "$tmux_session" -n "god"
-    tmux send-keys -t "$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+    tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+
+    # Install tw keybindings (once per tmux server)
+    _tw_install_keybindings 2>/dev/null || true
 
     # Create hooked JSON for god so it can receive nudges via tw-mail-check hook
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
@@ -1891,8 +1980,8 @@ with open(sys.argv[1], 'w') as f:
     }, f, indent=2)
 " "${hooked_dir}/god.json" "$bead_id"
 
-    tmux new-window -t "$tmux_session" -n "main"
-    tmux send-keys -t "$tmux_session:main" "cd '$config_dir'" Enter
+    tmux new-window -d -t "=$tmux_session" -n "main"
+    tmux send-keys -t "=$tmux_session:main" "cd '$config_dir'" Enter
 
     # Allocate ports and start services
     declare -A service_data
@@ -1934,18 +2023,18 @@ with open(sys.argv[1], 'w') as f:
 
         # First service gets its own pane in the services window; rest split
         if [[ "${services_window_created:-0}" -eq 0 ]]; then
-            tmux new-window -t "$tmux_session" -n "services" \
+            tmux new-window -d -t "=$tmux_session" -n "services" \
                 "$restart_cmd"
             services_window_created=1
         else
-            tmux split-window -t "$tmux_session:services" -v \
+            tmux split-window -t "=$tmux_session:services" -v \
                 "$restart_cmd"
         fi
     done
 
     # Balance panes in the services window
     if [[ "${services_window_created:-0}" -eq 1 ]]; then
-        tmux select-layout -t "$tmux_session:services" even-vertical 2>/dev/null || true
+        tmux select-layout -t "=$tmux_session:services" even-vertical 2>/dev/null || true
     fi
 
     # Template env files with allocated ports (if env_files section exists in config)
@@ -2027,7 +2116,7 @@ with open(sys.argv[1], 'w') as f:
     fi
 
     # Focus orchestrator window
-    tmux select-window -t "$tmux_session:god"
+    tmux select-window -t "=$tmux_session:god"
 
     # Build worktrees block for bead body
     local worktrees_bead_block=""
@@ -2178,51 +2267,24 @@ cmd_stop() {
 
     [[ -z "$feature" ]] && die "Usage: tw stop <feature|N> [--done]"
 
-    # Find session key — supports index (from tw list), name, or substring
-    local session_key project config_dir tmux_session
-
-    if [[ "$feature" =~ ^[0-9]+$ ]]; then
-        # Index-based: resolve Nth session from tw list (1-based)
-        local sessions_data
-        sessions_data=$(sessions_read)
-        session_key=$(python3 - "$sessions_data" "$feature" <<'PYEOF'
-import json, sys
-data = json.loads(sys.argv[1])
-idx = int(sys.argv[2])
-keys = list(data.keys())
-if 1 <= idx <= len(keys):
-    print(keys[idx - 1])
-PYEOF
-        )
-        [[ -z "$session_key" ]] && die "No session at index $feature"
-        project=$(sessions_get_key "$session_key" "project")
-        feature=$(sessions_get_key "$session_key" "feature")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    else
-        local config_file
-        if config_file=$(find_config 2>/dev/null); then
-            project=$(yaml_get "$config_file" "project" "")
-            config_dir="$(dirname "$config_file")"
-            session_key="${project}-${feature}"
-        else
-            session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-            [[ -z "$session_key" ]] && die "No session found for '$feature'"
-            project=$(sessions_get_key "$session_key" "project")
-            config_dir=$(sessions_get_key "$session_key" "workspace")
-        fi
-    fi
-    tmux_session="$session_key"
-
-    local bead_id
-    bead_id=$(sessions_get_key "$session_key" "bead_id")
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     # Kill activity spinner + reset circuit breakers
     spinner_stop "$session_key"
     breaker_reset_all "$session_key"
 
+    # Capture all worker panes before killing
+    if tmux has-session -t "=$tmux_session" 2>/dev/null; then
+        for _win in $(tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null); do
+            [[ "$_win" == "god" || "$_win" == "main" || "$_win" == "services" ]] && continue
+            capture_pane "=$tmux_session:$_win" "$session_key" "$_win"
+        done
+    fi
+
     # Kill the feature's tmux session
-    if tmux has-session -t "$tmux_session" 2>/dev/null; then
-        tmux kill-session -t "$tmux_session" 2>/dev/null || true
+    if tmux has-session -t "=$tmux_session" 2>/dev/null; then
+        tmux kill-session -t "=$tmux_session" 2>/dev/null || true
         log "Killed session: $tmux_session"
     else
         log "tmux session '$tmux_session' not found (already stopped?)"
@@ -2427,7 +2489,7 @@ data = json.loads(sys.argv[1])
 alive = []
 for key, s in data.items():
     sk = f"{s['project']}-{s['feature']}"
-    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    r = subprocess.run(['tmux', 'has-session', '-t', f'={sk}'], capture_output=True)
     if r.returncode == 0:
         alive.append(sk)
 if len(alive) == 1:
@@ -2461,18 +2523,18 @@ PYEOF
     fi
 
     local tmux_session="$session_key"
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "tmux session '$tmux_session' is dead. Run: tw prune"
 
     # Select target window — default to god (orchestrator)
     if [[ -n "$window" ]]; then
-        tmux select-window -t "$tmux_session:$window" 2>/dev/null \
+        tmux select-window -t "=$tmux_session:$window" 2>/dev/null \
             || log "No window '$window' — attaching to default"
     else
-        tmux select-window -t "$tmux_session:god" 2>/dev/null || true
+        tmux select-window -t "=$tmux_session:god" 2>/dev/null || true
     fi
 
-    exec tmux attach-session -t "$tmux_session"
+    exec tmux attach-session -t "=$tmux_session"
 }
 
 cmd_status() {
@@ -2488,15 +2550,8 @@ cmd_status() {
 
     [[ -z "$feature" ]] && die "Usage: tw status <feature> [--json]"
 
-    local session_key project
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-    fi
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     local sessions_data
     sessions_data=$(sessions_read)
@@ -2504,15 +2559,14 @@ cmd_status() {
     # Read env_files config if available
     local env_config_file=""
     local status_config_dir=""
+    local config_file
     if config_file=$(find_config 2>/dev/null); then
         env_config_file="$config_file"
         status_config_dir="$(dirname "$config_file")"
     else
-        local ws
-        ws=$(sessions_get_key "$session_key" "workspace")
-        if [[ -n "$ws" ]]; then
-            status_config_dir="$ws"
-            for cf in "$ws/.tw.yml" "$ws/.devenv.yml"; do
+        if [[ -n "$config_dir" ]]; then
+            status_config_dir="$config_dir"
+            for cf in "$config_dir/.tw.yml" "$config_dir/.devenv.yml"; do
                 [[ -f "$cf" ]] && env_config_file="$cf" && break
             done
         fi
@@ -2618,17 +2672,8 @@ cmd_open() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw open <feature>"
 
-    local session_key project
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-        feature=$(sessions_get_key "$session_key" "feature")
-    fi
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     local sessions_data
     sessions_data=$(sessions_read)
@@ -2743,8 +2788,11 @@ cmd_resume() {
     [[ -z "$target_feature" && $all -eq 0 ]] \
         && die "Usage: tw resume <feature> | tw resume --all"
 
-    # Prune stale entries from sessions.json first
-    cmd_prune 2>/dev/null || true
+    # NOTE: Do NOT call cmd_prune here. After a crash/reboot all tmux sessions
+    # are dead, so prune would wipe every entry from sessions.json before we
+    # get a chance to rediscover them from beads. The resume loop already skips
+    # sessions that are alive (line ~2900), so pruning is unnecessary.
+    # Users can run 'tw prune' separately if they want to clean up.
 
     # Discover feature beads from all workspace bead stores.
     local feature_beads
@@ -2791,7 +2839,7 @@ for ws in workspaces:
             bead = json.loads(line)
             if bead["id"] in seen_ids:
                 continue
-            if bead.get("status") != "in_progress":
+            if bead.get("status") not in ("in_progress", "open"):
                 continue
             desc = bead.get("description", "")
             if "## Feature Space" not in desc:
@@ -2897,7 +2945,7 @@ PYEOF
 
         local session_key="${proj}-${feat}"
 
-        if tmux has-session -t "$session_key" 2>/dev/null; then
+        if tmux has-session -t "=$session_key" 2>/dev/null; then
             echo "  ⏭  $session_key — already running, skipping"
             continue
         fi
@@ -2922,7 +2970,7 @@ PYEOF
         # (e.g., db_setup). Check tmux session existence as the real success test.
         (cd "$ws" && cmd_start "$feat" --mode "$mode") 2>&1 || true
 
-        if ! tmux has-session -t "$session_key" 2>/dev/null; then
+        if ! tmux has-session -t "=$session_key" 2>/dev/null; then
             echo "    ✗ Failed to start $session_key — continuing with next"
             continue
         fi
@@ -2944,7 +2992,7 @@ for w in dw:
                 local wrole="${wpair#*:}"
 
                 # Skip if already spawned by cmd_start (from .tw.yml workers section)
-                if tmux list-windows -t "$session_key" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+                if tmux list-windows -t "=$session_key" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
                     continue
                 fi
 
@@ -2980,18 +3028,11 @@ cmd_editor() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw editor <feature>"
 
-    local session_key project config_dir
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
+
     local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'. Run: tw start $feature"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    fi
+    config_file=$(find_config 2>/dev/null) || config_file="$config_dir/.tw.yml"
 
     # Build folder list from session worktrees, falling back to service paths
     local workspace_file
@@ -3081,35 +3122,23 @@ cmd_claude() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw claude <feature>"
 
-    local session_key project config_dir tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'. Run: tw start $feature"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
-    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+    if ! tmux has-session -t "=$tmux_session" 2>/dev/null; then
         die "No tmux session '$tmux_session'. Run: tw start $feature"
     fi
 
     # Create god window if it doesn't exist
     local claude_window="god"
-    if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
+    if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
         log "Creating god window in $tmux_session"
-        tmux new-window -t "$tmux_session" -n "$claude_window"
-        tmux send-keys -t "$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+        tmux new-window -d -t "=$tmux_session" -n "$claude_window"
+        tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
     fi
 
     # Build context block for pasting as first Claude message
-    local bead_id sessions_data
-    bead_id=$(sessions_get_key "$session_key" "bead_id")
+    local sessions_data
     sessions_data=$(sessions_read)
 
     local branch db_name
@@ -3171,37 +3200,20 @@ EOF
     fi
 
     # Switch to god window and attach
-    tmux select-window -t "$tmux_session:$claude_window"
-    tmux attach-session -t "$tmux_session"
+    tmux select-window -t "=$tmux_session:$claude_window"
+    tmux attach-session -t "=$tmux_session"
 }
 
 cmd_append() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw append <feature>   (reads from stdin)"
 
-    local session_key project config_dir
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    fi
-
-    local bead_id
-    bead_id=$(sessions_get_key "$session_key" "bead_id")
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     # Also search open beads if not in sessions.json (session may be stopped)
     if [[ -z "$bead_id" ]]; then
-        local config_file2
-        if config_file2=$(find_config 2>/dev/null); then
-            local proj2
-            proj2=$(yaml_get "$config_file2" "project" "")
-            bead_id=$(bead_find_open "$feature ($proj2)" "$config_dir")
-        fi
+        bead_id=$(bead_find_open "$feature ($project)" "$config_dir")
     fi
 
     [[ -z "$bead_id" ]] && die "No bead found for '$feature'. Start a session first."
@@ -3573,6 +3585,155 @@ nudge_drain() {
     done
 }
 
+# ─── Mail System (beads-backed persistent messaging) ─────────────────────────
+
+cmd_mail() {
+    local subcmd="${1:-}"
+    [[ -z "$subcmd" ]] && die "Usage: tw mail <send|inbox|read|ack> ..."
+    shift
+
+    case "$subcmd" in
+        send)  _mail_send "$@" ;;
+        inbox) _mail_inbox "$@" ;;
+        read)  _mail_read "$@" ;;
+        ack)   _mail_ack "$@" ;;
+        *)     die "Unknown mail subcommand: $subcmd. Use send, inbox, read, or ack." ;;
+    esac
+}
+
+_mail_send() {
+    local feature="" target="" subject="" body="" from=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--subject) subject="$2"; shift 2 ;;
+            -m|--message) body="$2"; shift 2 ;;
+            -f|--from)    from="$2"; shift 2 ;;
+            -*)           die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$target" ]]; then target="$1"
+                else die "Too many positional args"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$feature" || -z "$target" || -z "$subject" ]] \
+        && die 'Usage: tw mail send <feature> <target> -s "Subject" [-m "Body"] [-f sender]'
+
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
+
+    # Default sender: try to detect from env
+    if [[ -z "$from" ]]; then
+        from="${TW_WORKER_NAME:-unknown}"
+    fi
+
+    local sent_at
+    sent_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Create mail bead with metadata
+    local metadata
+    metadata=$(printf '{"mail_from":"%s","mail_to":"%s","mail_status":"unread","mail_sent_at":"%s","mail_session":"%s"}' \
+        "$from" "$target" "$sent_at" "$session_key")
+
+    local bead_id
+    bead_id=$(bd create "mail: $subject" \
+        -d "${body:-$subject}" \
+        -l "tw:mail,mail:to:${target},mail:from:${from},mail:unread" \
+        --metadata "$metadata" \
+        -p 3 \
+        2>&1 | grep -oE 'issue: [a-z0-9-]+' | head -1 | sed 's/issue: //')
+
+    if [[ -z "$bead_id" ]]; then
+        die "Failed to create mail bead"
+    fi
+
+    echo "  Mail sent: $bead_id (to=$target, subject=$subject)"
+
+    # Send nudge as wake-up
+    if tmux has-session -t "=$session_key" 2>/dev/null; then
+        if tmux list-windows -t "=$session_key" -F "#{window_name}" 2>/dev/null | grep -qx "$target"; then
+            nudge_enqueue "$session_key" "$target" \
+                "You have mail — run: tw mail read $bead_id" 5 2>/dev/null || true
+            send_to_pane "=$session_key:$target" \
+                "You have mail. Run: tw mail read $bead_id" 2>/dev/null || true
+        fi
+    fi
+}
+
+_mail_inbox() {
+    local feature="${1:-}"
+    [[ -z "$feature" ]] && die "Usage: tw mail inbox <feature> [worker]"
+    local worker="${2:-}"
+
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
+
+    # Default worker from env
+    if [[ -z "$worker" ]]; then
+        worker="${TW_WORKER_NAME:-}"
+    fi
+
+    # Query unread mail
+    local label_filter="tw:mail,mail:unread"
+    if [[ -n "$worker" ]]; then
+        label_filter="${label_filter},mail:to:${worker}"
+    fi
+
+    local mail_list
+    mail_list=$(bd list -l "$label_filter" --flat --sort=created 2>/dev/null || true)
+
+    if [[ -z "$mail_list" || "$mail_list" == *"No issues"* ]]; then
+        echo "  No unread mail${worker:+ for $worker}."
+        return 0
+    fi
+
+    echo ""
+    echo "  INBOX${worker:+ ($worker)}"
+    echo "  ─────────────────────────────────────────────────"
+    echo "$mail_list"
+    echo ""
+}
+
+_mail_read() {
+    local bead_id="${1:-}"
+    [[ -z "$bead_id" ]] && die "Usage: tw mail read <bead-id>"
+
+    # Show the message
+    bd show "$bead_id"
+
+    # Mark as read
+    bd update "$bead_id" --remove-label "mail:unread" --add-label "mail:read" \
+        --set-metadata "mail_status=read" 2>/dev/null || true
+    echo ""
+    echo "  Marked as read."
+}
+
+_mail_ack() {
+    local bead_id="${1:-}"
+    [[ -z "$bead_id" ]] && die "Usage: tw mail ack <bead-id>"
+
+    local acker="${TW_WORKER_NAME:-unknown}"
+    local acked_at
+    acked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Close the bead and mark as acked
+    bd update "$bead_id" \
+        --remove-label "mail:unread" --remove-label "mail:read" \
+        --add-label "mail:acked,mail:acked-by:${acker}" \
+        --set-metadata "mail_status=acked" \
+        --set-metadata "mail_acked_by=$acker" \
+        --set-metadata "mail_acked_at=$acked_at" \
+        2>/dev/null || true
+
+    bd close "$bead_id" 2>/dev/null || true
+
+    echo "  Mail $bead_id acknowledged and closed."
+}
+
+# ─── Nudge System ────────────────────────────────────────────────────────────
+
 cmd_nudge() {
     local subcmd="${1:-}"
     [[ -z "$subcmd" ]] && die "Usage: tw nudge <enqueue|drain> <session_key> <worker> [message]"
@@ -3618,21 +3779,12 @@ cmd_send() {
     [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
         && die 'Usage: tw send <feature> <worker> "<task>" [--urgent]'
 
-    local session_key project tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session' — is the feature running?"
-    tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
         | grep -qx "$worker" \
         || die "Worker window '$worker' not found — run: tw workers $feature"
 
@@ -3642,39 +3794,84 @@ cmd_send() {
     # Clear done signal — worker is being re-activated
     worker_signal_clear_all "$session_key" "$worker" 2>/dev/null || true
 
-    nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
+    # ─── Bead-backed task dispatch ───────────────────────────────────────────
+    # Create a task bead so the work item persists even if the worker dies.
+    # The bead is the source of truth; the nudge is just a wake-up signal.
 
-    # Persist task to worker bead as the source of truth (survives respawns)
-    local worker_bead_id=""
-    if [[ -f "$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json" ]]; then
-        worker_bead_id=$(python3 -c "
-import json
-d = json.load(open('$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json'))
-print(d.get('worker_bead_id', ''))
-" 2>/dev/null || true)
-    fi
-    if [[ -n "$worker_bead_id" ]]; then
-        bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
-    fi
-
-    # GUPP: write current_task to hooked file so worker resumes on restart
     local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
+    local worker_bead_id="" bead_id="" task_bead_id=""
     if [[ -f "$hooked_file" ]]; then
-        python3 -c "
+        eval "$(python3 -c "
+import json, shlex
+d = json.load(open('$hooked_file'))
+print(f'worker_bead_id={shlex.quote(d.get(\"worker_bead_id\", \"\"))}')
+print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
+" 2>/dev/null)"
+    fi
+
+    # Create task bead with full task text as description
+    local task_title
+    task_title=$(printf '%.80s' "$task")
+    task_bead_id=$(bd create --title="$task_title" \
+        --description="$task" \
+        --type=task \
+        --priority=2 \
+        ${bead_id:+--parent="$bead_id"} \
+        2>/dev/null | grep -oE 'tw-[a-z0-9]+' | head -1 || true)
+
+    if [[ -n "$task_bead_id" ]]; then
+        # Store assignment metadata on the task bead
+        bd update "$task_bead_id" --status=in_progress \
+            --set-metadata "assigned_to=$worker" \
+            --set-metadata "assigned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set-metadata "session=$session_key" \
+            2>/dev/null || true
+
+        # Write task bead ID to hooked file so worker picks it up on restart
+        if [[ -f "$hooked_file" ]]; then
+            python3 -c "
 import json, sys
 f = sys.argv[1]
-task = sys.argv[2]
 d = json.load(open(f))
-d['current_task'] = task
+d['current_task'] = sys.argv[2]
+d['current_task_bead'] = sys.argv[3]
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$hooked_file" "$task" "$task_bead_id" 2>/dev/null || true
+        fi
+
+        # Also record on worker identity bead for history
+        if [[ -n "$worker_bead_id" ]]; then
+            bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
+        fi
+
+        # Nudge is just a wake-up referencing the bead
+        nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
+    else
+        # Fallback: bead creation failed, use old nudge-only behavior
+        log "WARN: task bead creation failed for $worker, falling back to nudge-only"
+        nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
+
+        if [[ -f "$hooked_file" ]]; then
+            python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d['current_task'] = sys.argv[2]
 with open(f, 'w') as fh:
     json.dump(d, fh, indent=2)
 " "$hooked_file" "$task" 2>/dev/null || true
+        fi
+
+        if [[ -n "$worker_bead_id" ]]; then
+            bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
+        fi
     fi
 
     # Wait for the worker to be idle before sending, so we don't inject text
     # mid-output or mid-tool-call. If it doesn't become idle in time, send anyway
     # (queued nudge will be picked up on next prompt turn regardless).
-    local target="$tmux_session:$worker"
+    local target="=$tmux_session:$worker"
     local wake_msg="You have a new task from the orchestrator. Check your additional context and execute it now."
 
     if wait_for_idle "$tmux_session" "$worker" 15; then
@@ -3690,6 +3887,9 @@ with open(f, 'w') as fh:
 
     local urgency_label=""
     [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
+    if [[ -n "$task_bead_id" ]]; then
+        echo "  Task bead created: $task_bead_id (assigned to $worker)"
+    fi
     echo "  Nudge queued for $worker${urgency_label}: $task"
     echo "  Will be injected on next prompt turn via tw-mail-check hook."
 }
@@ -3698,20 +3898,8 @@ cmd_tasks() {
     local feature="${1:-}"
     [[ -z "$feature" ]] && die "Usage: tw tasks <feature>"
 
-    local session_key project
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-    fi
-
-    local config_dir
-    config_dir=$(sessions_get_key "$session_key" "workspace")
-    [[ -z "$config_dir" ]] && config_dir="$PWD"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     # Gather all worker bead IDs from hooked files
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
@@ -3783,21 +3971,15 @@ cmd_signal() {
         && die "Usage: tw signal <feature> <worker> <signal>
 Supported signals: done, clear"
 
-    local session_key project
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-    fi
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     case "$signal" in
         done)
             worker_signal_set "$session_key" "$worker" "done"
-            echo "  ✓ $worker signaled done"
+            # Reset crash counter on successful completion
+            rm -f "$CRASH_COUNT_DIR/$session_key/$worker" 2>/dev/null || true
+            echo "  ✓ $worker signaled done (crash counter reset)"
             ;;
         clear)
             worker_signal_clear_all "$session_key" "$worker"
@@ -3817,7 +3999,7 @@ worker_is_idle() {
 
     # Capture last 5 lines of the pane
     local pane_text
-    pane_text=$(tmux capture-pane -t "$tmux_session:$wname" -p -S -5 2>/dev/null) || return 1
+    pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p -S -5 2>/dev/null) || return 1
 
     # Claude Code shows "esc to interrupt" in the status bar when busy with a tool call.
     if echo "$pane_text" | grep -q "esc to interrupt"; then
@@ -3886,7 +4068,7 @@ worker_is_alive() {
     local tmux_session="$1" wname="$2"
     # Get the pane PID for this window, then check if claude/node is in its process tree
     local pane_pid
-    pane_pid=$(tmux list-panes -t "$tmux_session:$wname" -F "#{pane_pid}" 2>/dev/null | head -1)
+    pane_pid=$(tmux list-panes -t "=$tmux_session:$wname" -F "#{pane_pid}" 2>/dev/null | head -1)
     [[ -z "$pane_pid" ]] && return 1
     # Check if any child of the pane shell is a claude/node process
     pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1
@@ -3899,7 +4081,7 @@ worker_state() {
     local tmux_session="$1" wname="$2" agents_path="${3:-}" session_key="${4:-$tmux_session}"
 
     # 1. Check if window exists
-    if ! tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+    if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
         echo "dead"; return
     fi
 
@@ -3956,26 +4138,14 @@ cmd_handoff() {
 
     [[ -z "$feature" || -z "$worker" ]] && die "Usage: tw handoff <feature> <worker>"
 
-    # Resolve session + config
-    local session_key project config_dir tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session'"
 
     # Verify worker window exists
-    tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
         | grep -qx "$worker" \
         || die "Worker window '$worker' not found in session '$tmux_session'"
 
@@ -4002,12 +4172,12 @@ $output_content" 2>/dev/null || log "Warning: could not append to worker bead $w
     fi
 
     # 2. Kill the Claude process in the worker window (send /exit)
-    tmux send-keys -t "$tmux_session:$worker" "/exit" Enter
+    tmux send-keys -t "=$tmux_session:$worker" "/exit" Enter
     sleep 2
 
     # 3. If Claude is still running, force-kill the pane and recreate
     if worker_is_alive "$tmux_session" "$worker"; then
-        tmux send-keys -t "$tmux_session:$worker" C-c
+        tmux send-keys -t "=$tmux_session:$worker" C-c
         sleep 1
     fi
 
@@ -4042,7 +4212,7 @@ with open(sys.argv[1], 'w') as f:
     }, f, indent=2)
 " "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id"
 
-    tmux send-keys -t "$tmux_session:$worker" \
+    tmux send-keys -t "=$tmux_session:$worker" \
         "TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$worker'" Enter
 
     # Voluntary handoff = healthy worker — reset circuit breaker
@@ -4125,29 +4295,17 @@ cmd_patrol() {
 
     [[ -z "$feature" ]] && die "Usage: tw patrol <feature>"
 
-    # Resolve session + config
-    local session_key project config_dir tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-        config_file="$config_dir/.tw.yml"
-        [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session'"
 
     # Reconcile worker state before health checks
     reconcile_workers "$session_key" "$config_dir"
 
+    local config_file="$config_dir/.tw.yml"
+    [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
     local override_file="$config_dir/.tw.override.yml"
     [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
     local effective_config="$config_file"
@@ -4264,8 +4422,8 @@ for name, info in s.items():
                     sessions_remove_dynamic_worker "$session_key" "$w"
                     rm -f "$HOME/.tiddly-winks/hooked/${session_key}/${w}.json"
                     # Kill ALL windows matching this name (tmux allows duplicates)
-                    while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
-                        tmux kill-window -t "$tmux_session:$w" 2>/dev/null || break
+                    while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
+                        tmux kill-window -t "=$tmux_session:$w" 2>/dev/null || break
                     done
                     worker_signal_clear_all "$session_key" "$w" 2>/dev/null || true
                     echo "      Reaped: $w (one-off worker, finished and exited)"
@@ -4274,8 +4432,8 @@ for name, info in s.items():
             fi
 
             # Kill ALL dead windows matching this name before respawning
-            while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
-                tmux kill-window -t "$tmux_session:$w" 2>/dev/null || break
+            while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$w"; do
+                tmux kill-window -t "=$tmux_session:$w" 2>/dev/null || break
             done
 
             if breaker_check_and_record "$session_key" "$w"; then
@@ -4321,7 +4479,7 @@ for name, info in s.items():
 
             if [[ $is_dynamic -eq 1 ]]; then
                 # Reap: kill tmux window, remove from dynamic_workers, clean up
-                tmux kill-window -t "$tmux_session:$w" 2>/dev/null || true
+                tmux kill-window -t "=$tmux_session:$w" 2>/dev/null || true
                 sessions_remove_dynamic_worker "$session_key" "$w"
                 rm -f "$HOME/.tiddly-winks/hooked/${session_key}/${w}.json"
                 worker_signal_clear_all "$session_key" "$w" 2>/dev/null || true
@@ -4492,17 +4650,8 @@ cmd_feed() {
 
     [[ -z "$feature" ]] && die "Usage: tw feed <feature> [--problems]"
 
-    # Resolve session
-    local session_key
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        local project
-        project=$(yaml_get "$config_file" "project" "")
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-    fi
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     local agents_path
     agents_path="$(agents_dir "$session_key")"
@@ -4584,27 +4733,15 @@ cmd_spawn() {
     [[ -z "$feature" || -z "$name" ]] \
         && die "Usage: tw spawn <feature> <name> [<role>]"
 
-    # Resolve session + config
-    local session_key project config_dir tmux_session
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
     # Validate session is running
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
 
     # Check no existing window with that name
-    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$name"; then
+    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$name"; then
         die "Worker window '$name' already exists in session '$tmux_session'"
     fi
 
@@ -4661,29 +4798,17 @@ cmd_workers() {
 
     [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--cv <worker>]"
 
-    # Resolve session + config
-    local session_key project config_dir tmux_session effective_config
-    local config_file
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-        project=$(sessions_get_key "$session_key" "project")
-        config_dir=$(sessions_get_key "$session_key" "workspace")
-        config_file="$config_dir/.tw.yml"
-        [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
-    fi
-    tmux_session="$session_key"
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
 
-    tmux has-session -t "$tmux_session" 2>/dev/null \
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
 
+    local config_file="$config_dir/.tw.yml"
+    [[ ! -f "$config_file" ]] && config_file="$config_dir/.devenv.yml"
     local override_file="$config_dir/.tw.override.yml"
     [[ ! -f "$override_file" && -f "$config_dir/.devenv.override.yml" ]] && override_file="$config_dir/.devenv.override.yml"
-    effective_config="$config_file"
+    local effective_config="$config_file"
     if [[ -f "$override_file" ]]; then
         effective_config=$(yaml_merge_override "$config_file" "$override_file")
     fi
@@ -4765,15 +4890,15 @@ print(json.dumps(rows, indent=2))
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
 
-            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+            if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
                 if worker_is_alive "$tmux_session" "$wname"; then
                     (( alive++ )) || true
                     continue
                 fi
                 # Dead window(s) — kill ALL matching before respawning
                 # (tmux allows duplicate window names; kill-window only removes one)
-                while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
-                    tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
+                while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+                    tmux kill-window -t "=$tmux_session:$wname" 2>/dev/null || break
                 done
                 log "Killed dead worker window(s): $wname"
             fi
@@ -4804,7 +4929,7 @@ print(json.dumps(rows, indent=2))
         local wrole="${wpair##*:}"
 
         # Skip if window already exists
-        if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null \
+        if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
                 | grep -qx "$wname"; then
             log "Worker already running: $wname (skipping)"
             (( skipped++ )) || true
@@ -4980,6 +5105,16 @@ tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
 tw patrol <feature>              # Full health check + auto-respawn + plugins
 tw spawn <feature> <name> <role> # Add a worker to a running session
 ```
+
+### Mail (persistent beads-backed messaging)
+```bash
+tw mail send <feature> <target> -s "Subject" -m "Body" [-f sender]  # Send persistent mail
+tw mail inbox <feature> [worker]    # List unread mail for a worker
+tw mail read <bead-id>              # Read message and mark as read
+tw mail ack <bead-id>               # Acknowledge and close message
+```
+Use mail for important signals: TASK_DONE, HELP/BLOCKED, HANDOFF.
+Use nudges for simple wake-ups and non-critical pings.
 
 ### Runtime Config (fix proxy/port issues without restarting)
 ```bash
@@ -5206,7 +5341,7 @@ d = json.load(open('$SESSIONS_FILE'))
 dead = 0
 for key, s in d.items():
     sk = f\"{s.get('project','')}-{s.get('feature','')}\"
-    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    r = subprocess.run(['tmux', 'has-session', '-t', f'={sk}'], capture_output=True)
     if r.returncode != 0:
         dead += 1
 print(dead)
@@ -5292,7 +5427,7 @@ sessions = json.load(open("$SESSIONS_FILE"))
 missing = []
 for key, s in sessions.items():
     sk = f"{s.get('project','')}-{s.get('feature','')}"
-    r = subprocess.run(['tmux', 'has-session', '-t', sk], capture_output=True)
+    r = subprocess.run(['tmux', 'has-session', '-t', f'={sk}'], capture_output=True)
     if r.returncode != 0:
         continue  # not alive, skip
     proxy_map = s.get('proxy_map', {})
@@ -5415,7 +5550,7 @@ for key, s in d.items():
                 holder_cmd=$(ps -p "$port_holder" -o command= 2>/dev/null | head -c 60)
                 # Port is in use — that's expected if session is alive. Only warn if session is dead.
                 local tmux_key="${sk}"
-                if ! tmux has-session -t "$tmux_key" 2>/dev/null; then
+                if ! tmux has-session -t "=$tmux_key" 2>/dev/null; then
                     _warn "Port $port ($svc in $sk) held by stale process: $holder_cmd"
                     _hint "Kill with: kill $port_holder"
                     (( port_conflicts++ )) || true
@@ -5444,7 +5579,7 @@ for key, s in d.items():
 " 2>/dev/null | while IFS='|' read -r sk proj feat svc port; do
             [[ -z "$port" ]] && continue
             # Only check alive sessions
-            tmux has-session -t "$sk" 2>/dev/null || continue
+            tmux has-session -t "=$sk" 2>/dev/null || continue
 
             local url="http://localhost:${port}"
             local body
@@ -5629,16 +5764,8 @@ cmd_hook() {
             [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
                 && die 'Usage: tw hook set <feature> <worker> "<task>"'
 
-            local session_key
-            local config_file
-            if config_file=$(find_config 2>/dev/null); then
-                local project
-                project=$(yaml_get "$config_file" "project" "")
-                session_key="${project}-${feature}"
-            else
-                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-                [[ -z "$session_key" ]] && die "No session found for '$feature'"
-            fi
+            local session_key project config_dir tmux_session bead_id
+            resolve_session "$feature"
 
             local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
             [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker' in session '$session_key'"
@@ -5659,16 +5786,8 @@ print(f'  Hook set for {w}: {task}')
             [[ -z "$feature" || -z "$worker" ]] \
                 && die "Usage: tw hook clear <feature> <worker>"
 
-            local session_key
-            local config_file
-            if config_file=$(find_config 2>/dev/null); then
-                local project
-                project=$(yaml_get "$config_file" "project" "")
-                session_key="${project}-${feature}"
-            else
-                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-                [[ -z "$session_key" ]] && die "No session found for '$feature'"
-            fi
+            local session_key project config_dir tmux_session bead_id
+            resolve_session "$feature"
 
             local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
             [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker'"
@@ -5689,16 +5808,8 @@ print(f'  Hook cleared for {w}')
             [[ -z "$feature" || -z "$worker" ]] \
                 && die "Usage: tw hook show <feature> <worker>"
 
-            local session_key
-            local config_file
-            if config_file=$(find_config 2>/dev/null); then
-                local project
-                project=$(yaml_get "$config_file" "project" "")
-                session_key="${project}-${feature}"
-            else
-                session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-                [[ -z "$session_key" ]] && die "No session found for '$feature'"
-            fi
+            local session_key project config_dir tmux_session bead_id
+            resolve_session "$feature"
 
             local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
             [[ -f "$hooked_file" ]] || die "No hooked file for worker '$worker'"
@@ -5728,6 +5839,9 @@ DAEMON_PID_FILE="$TW_DIR/daemon.pid"
 DAEMON_LOG_FILE="$TW_DIR/logs/daemon.log"
 DAEMON_HEARTBEAT_FILE="$TW_DIR/daemon.heartbeat"
 DAEMON_HUNG_THRESHOLD=900  # 15 minutes
+DAEMON_STALLED_THRESHOLD=1800  # 30 minutes — alive tmux but no output change
+CRASH_COUNT_DIR="$TW_DIR/crash-counts"
+HEALTH_REPORT_DIR="$TW_DIR/health"
 
 _daemon_is_running() {
     [[ -f "$DAEMON_PID_FILE" ]] || return 1
@@ -5776,7 +5890,7 @@ _daemon_tick() {
         tmux_session="$session_key"
 
         # Check if tmux session is alive
-        if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        if ! tmux has-session -t "=$tmux_session" 2>/dev/null; then
             _daemon_log "DEAD session: $session_key (tmux gone) — pruning"
             local sessions_data new_data
             sessions_data=$(sessions_read)
@@ -5817,18 +5931,38 @@ print(json.dumps(data, indent=2))
         local bead_id
         bead_id=$(sessions_get_key "$session_key" "bead_id")
 
-        local dead_workers=0 alive_workers=0 hung_workers=0
+        local dead_workers=0 alive_workers=0 hung_workers=0 stalled_workers=0
         local agents_path
         agents_path="$(agents_dir "$session_key")"
+
+        # Build health report JSON for this session
+        local health_workers_json=""
 
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}" wrole="${wpair##*:}"
             local is_dead=0
+            local worker_status="alive"
+            local output_mtime=0
 
-            if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+            # Check output file mtime
+            local output_file="$agents_path/${wname}.md"
+            if [[ -f "$output_file" ]]; then
+                output_mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
+            fi
+
+            if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
                 if worker_is_alive "$tmux_session" "$wname"; then
                     (( alive_workers++ )) || true
+                    # Check for stalled (alive but no output in DAEMON_STALLED_THRESHOLD)
+                    if [[ $output_mtime -gt 0 ]]; then
+                        local age_secs=$((now - output_mtime))
+                        if [[ $age_secs -gt $DAEMON_STALLED_THRESHOLD ]]; then
+                            worker_status="stalled"
+                            (( stalled_workers++ )) || true
+                            _daemon_log "WARN: stalled worker $session_key/$wname — no output in ${age_secs}s"
+                        fi
+                    fi
                 else
                     is_dead=1
                 fi
@@ -5837,34 +5971,65 @@ print(json.dumps(data, indent=2))
             fi
 
             if [[ $is_dead -eq 1 ]]; then
-                _daemon_log "DEAD worker: $session_key/$wname — respawning"
-                # Kill ALL windows matching this name (tmux allows duplicates)
-                while tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
-                    tmux kill-window -t "$tmux_session:$wname" 2>/dev/null || break
-                done
-                local worker_bead_id
-                worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir" 2>/dev/null || echo "")
-                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null || {
-                    _daemon_log "FAIL: could not respawn $session_key/$wname"
-                }
+                worker_status="dead"
+
+                # Crash counter: check if circuit breaker should block respawn
+                local crash_dir="$CRASH_COUNT_DIR/$session_key"
+                local crash_file="$crash_dir/$wname"
+                mkdir -p "$crash_dir"
+                local crash_count=0
+                [[ -f "$crash_file" ]] && crash_count=$(cat "$crash_file" 2>/dev/null || echo 0)
+                (( crash_count++ )) || true
+                echo "$crash_count" > "$crash_file"
+
+                if [[ $crash_count -ge 3 ]]; then
+                    _daemon_log "CIRCUIT BREAKER: $session_key/$wname crashed $crash_count times — NOT respawning, escalating"
+                    worker_status="circuit-broken"
+                    (( dead_workers++ )) || true
+
+                    # Escalate to god via mail if god window exists
+                    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "god"; then
+                        local crash_msg="Worker '$wname' has crashed $crash_count consecutive times. Circuit breaker activated — auto-respawn disabled. Investigate and run: tw workers $feature --respawn --force"
+                        nudge_enqueue "$session_key" "god" \
+                            "CIRCUIT BREAKER: $wname crashed ${crash_count}x. $crash_msg" 120 2>/dev/null || true
+                        send_to_pane "=$tmux_session:god" \
+                            "ALERT: Worker $wname hit circuit breaker ($crash_count crashes). Check your nudges." 2>/dev/null || true
+                        _daemon_log "Escalated $wname crash to god"
+                    fi
+                else
+                    _daemon_log "DEAD worker: $session_key/$wname (crash #$crash_count) — respawning"
+                    # Kill ALL windows matching this name (tmux allows duplicates)
+                    while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
+                        tmux kill-window -t "=$tmux_session:$wname" 2>/dev/null || break
+                    done
+                    local worker_bead_id
+                    worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir" 2>/dev/null || echo "")
+                    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null || {
+                        _daemon_log "FAIL: could not respawn $session_key/$wname"
+                    }
+                fi
                 (( dead_workers++ )) || true
-                continue
+                # Don't add to health_workers_json yet — fall through
             fi
 
-            # Check for hung workers (output file not modified in DAEMON_HUNG_THRESHOLD)
-            local output_file="$agents_path/${wname}.md"
-            if [[ -f "$output_file" ]]; then
-                local mtime
-                mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
-                local age_secs=$((now - mtime))
-                if [[ $age_secs -gt $DAEMON_HUNG_THRESHOLD ]]; then
-                    _daemon_log "WARN: hung worker $session_key/$wname — output not modified in ${age_secs}s"
-                    (( hung_workers++ )) || true
-                fi
-            fi
+            # Append to health report workers array
+            [[ -n "$health_workers_json" ]] && health_workers_json+=","
+            local tmux_alive="true"
+            [[ "$worker_status" == "dead" || "$worker_status" == "circuit-broken" ]] && tmux_alive="false"
+            health_workers_json+=$(printf '{"name":"%s","role":"%s","tmux_alive":%s,"last_output_mtime":%d,"status":"%s","crash_count":%d}' \
+                "$wname" "$wrole" "$tmux_alive" "$output_mtime" "$worker_status" \
+                "$(cat "$CRASH_COUNT_DIR/$session_key/$wname" 2>/dev/null || echo 0)")
         done
 
-        _daemon_log "session $session_key: ${alive_workers} alive, ${dead_workers} respawned, ${hung_workers} hung"
+        _daemon_log "session $session_key: ${alive_workers} alive, ${dead_workers} dead, ${stalled_workers} stalled, ${hung_workers} hung"
+
+        # Write structured health report
+        mkdir -p "$HEALTH_REPORT_DIR"
+        local health_file="$HEALTH_REPORT_DIR/${session_key}.json"
+        local health_tmp="${health_file}.tmp.$$"
+        printf '{"timestamp":%d,"session":"%s","project":"%s","feature":"%s","workers":[%s]}\n' \
+            "$now" "$session_key" "$project" "$feature" "$health_workers_json" > "$health_tmp"
+        mv -f "$health_tmp" "$health_file"
 
         # Check service ports — nudge keeper if any service is down
         local services_json
@@ -5885,11 +6050,11 @@ for name, info in svcs.items():
                 if ! lsof -i :"$svc_port" -sTCP:LISTEN >/dev/null 2>&1; then
                     _daemon_log "DOWN service: $session_key/$svc_name (port $svc_port)"
                     # Nudge the keeper worker if one exists
-                    if tmux list-windows -t "$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "keeper"; then
+                    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "keeper"; then
                         nudge_enqueue "$session_key" "keeper" \
                             "Service $svc_name is DOWN on port $svc_port. Check the services window and restart it. Run: tw status ${feature}" \
                             30 2>/dev/null || true
-                        send_to_pane "$tmux_session:keeper" \
+                        send_to_pane "=$tmux_session:keeper" \
                             "You have a new task from the orchestrator. Check your additional context and execute it now." 2>/dev/null || true
                         _daemon_log "Nudged keeper about $svc_name"
                     fi
@@ -5904,10 +6069,10 @@ for name, info in svcs.items():
 
     # Auto-close any retiring windows
     for sess in $(tmux list-sessions -F "#{session_name}" 2>/dev/null); do
-        for win in $(tmux list-windows -t "$sess" -F "#{window_name}" 2>/dev/null); do
+        for win in $(tmux list-windows -t "=$sess" -F "#{window_name}" 2>/dev/null); do
             if [[ "$win" == *-retiring* ]]; then
                 _daemon_log "Closing retiring window: $sess:$win"
-                tmux kill-window -t "$sess:$win" 2>/dev/null || true
+                tmux kill-window -t "=$sess:$win" 2>/dev/null || true
             fi
         done
     done
@@ -6031,6 +6196,126 @@ _daemon_status() {
     echo ""
 }
 
+# ─── Tmux Integration ────────────────────────────────────────────────────────
+
+# Called by tmux pane-died hook — capture output before respawn
+cmd_pane_capture() {
+    local tmux_session="$1" session_key="$2" wname="$3"
+    capture_pane "=$tmux_session:$wname" "$session_key" "$wname"
+}
+
+# Called by tmux pane-died hook — respawn with rapid-fire safety
+cmd_pane_respawn() {
+    local tmux_session="$1" session_key="$2" wname="$3" respawn_dir="$4" config_dir="$5" wrole="${6:-}"
+
+    # Rapid respawn tracking: count respawns within 5-minute windows
+    local ts_file="$respawn_dir/${wname}.timestamps"
+    local now
+    now=$(date +%s)
+    local window=300  # 5 minutes
+
+    # Append current timestamp
+    echo "$now" >> "$ts_file"
+
+    # Count recent respawns (within window)
+    local recent_count=0
+    while IFS= read -r ts; do
+        [[ -z "$ts" ]] && continue
+        if [[ $((now - ts)) -le $window ]]; then
+            (( recent_count++ )) || true
+        fi
+    done < "$ts_file"
+
+    # Prune old timestamps
+    awk -v cutoff="$((now - window))" '$1 >= cutoff' "$ts_file" > "${ts_file}.tmp" 2>/dev/null
+    mv -f "${ts_file}.tmp" "$ts_file" 2>/dev/null || true
+
+    if [[ $recent_count -ge 3 ]]; then
+        # Too many rapid respawns — don't respawn, let daemon/patrol handle it
+        _daemon_log "RAPID RESPAWN: $session_key/$wname hit $recent_count respawns in ${window}s — stopping auto-respawn" 2>/dev/null || true
+        return 0
+    fi
+
+    # Safe to respawn — use tmux respawn-pane (re-uses same window)
+    sleep 3
+    tmux respawn-pane -t "=$tmux_session:$wname" \
+        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$wname'" \
+        2>/dev/null || true
+
+    # Queue wake prompt
+    (
+        sleep 16
+        tmux send-keys -t "=$tmux_session:$wname" \
+            "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
+    ) &
+}
+
+# Install tw-specific tmux keybindings (once per server)
+_tw_install_keybindings() {
+    # Check if already installed
+    local installed
+    installed=$(tmux show-environment -g TW_BINDINGS_INSTALLED 2>/dev/null | grep -v '^-' || true)
+    [[ -n "$installed" ]] && return 0
+
+    # N = next tw session, P = previous tw session
+    tmux bind-key N run-shell "tw tmux-next"
+    tmux bind-key P run-shell "tw tmux-prev"
+
+    # G = popup session switcher
+    tmux bind-key G display-popup -E -w 60 -h 20 \
+        "tmux list-sessions -F '#{session_name}' | grep -E '^[a-z]+-[a-z]' | fzf --reverse --header='Switch tw session' | xargs -I{} tmux switch-client -t ={}"
+
+    tmux set-environment -g TW_BINDINGS_INSTALLED 1
+    log "Installed tw tmux keybindings (N/P/G)"
+}
+
+# Navigate to next tw session
+cmd_tmux_next() {
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' | grep -E '^[a-z]+-[a-z]' || true)
+    [[ -z "$sessions" ]] && return 0
+
+    local found=0 first="" target=""
+    while IFS= read -r sess; do
+        [[ -z "$first" ]] && first="$sess"
+        if [[ $found -eq 1 ]]; then
+            target="$sess"
+            break
+        fi
+        [[ "$sess" == "$current" ]] && found=1
+    done <<< "$sessions"
+
+    # Wrap around to first if current is last
+    [[ -z "$target" ]] && target="$first"
+    [[ -n "$target" ]] && tmux switch-client -t "=$target"
+}
+
+# Navigate to previous tw session
+cmd_tmux_prev() {
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' | grep -E '^[a-z]+-[a-z]' || true)
+    [[ -z "$sessions" ]] && return 0
+
+    local prev="" target=""
+    local last=""
+    while IFS= read -r sess; do
+        last="$sess"
+        if [[ "$sess" == "$current" ]]; then
+            target="$prev"
+            break
+        fi
+        prev="$sess"
+    done <<< "$sessions"
+
+    # Wrap around to last if current is first
+    [[ -z "$target" ]] && target="$last"
+    [[ -n "$target" ]] && tmux switch-client -t "=$target"
+}
+
 # ─── Runtime Config ──────────────────────────────────────────────────────────
 
 cmd_completion() {
@@ -6080,17 +6365,8 @@ EOF
 
 _config_resolve_session() {
     local feature="$1"
-    local session_key project config_dir tmux_session config_file
-
-    if config_file=$(find_config 2>/dev/null); then
-        project=$(yaml_get "$config_file" "project" "")
-        config_dir="$(dirname "$config_file")"
-        session_key="${project}-${feature}"
-    else
-        session_key=$(sessions_list_keys | grep -F "$feature" | head -1 || true)
-        [[ -z "$session_key" ]] && die "No session found for '$feature'"
-    fi
-
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
     echo "$session_key"
 }
 
@@ -6352,7 +6628,12 @@ case "$subcommand" in
     completion) cmd_completion ;;
     port-owner) cmd_port_owner "$@" ;;
     doctor)  cmd_doctor "$@" ;;
+    mail)    cmd_mail "$@" ;;
     nudge)   cmd_nudge "$@" ;;
+    pane-capture)  cmd_pane_capture "$@" ;;
+    pane-respawn)  cmd_pane_respawn "$@" ;;
+    tmux-next)     cmd_tmux_next ;;
+    tmux-prev)     cmd_tmux_prev ;;
     reconcile) cmd_reconcile "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
