@@ -464,6 +464,77 @@ PYEOF
     bead_id=$(sessions_get_key "$session_key" "bead_id")
 }
 
+# ─── Tmux Color Theming ──────────────────────────────────────────────────────
+#
+# Assigns a stable color theme to each project using FNV-32a hash.
+# Same project always gets the same color across sessions/restarts.
+
+TW_THEME_PALETTE=(
+    "ocean:#1a3a5c:#e0e8f0"
+    "sunset:#8b4513:#ffd700"
+    "forest:#2d5016:#90ee90"
+    "berry:#5c1a5c:#dda0dd"
+    "copper:#704214:#ffdead"
+    "slate:#3c4f5c:#b0c4de"
+    "wine:#5c1a2a:#ffb6c1"
+    "teal:#1a5c5c:#afeeee"
+    "ember:#5c2a0a:#ffa07a"
+    "moss:#3a5c1a:#98fb98"
+)
+
+# Apply color theme to a tmux session
+session_apply_theme() {
+    local tmux_session="$1" project="$2" feature="$3" session_key="$4"
+
+    local idx entry bg fg
+    idx=$(python3 -c "import hashlib,sys; print(int(hashlib.md5(sys.argv[1].encode()).hexdigest(),16) % $((${#TW_THEME_PALETTE[@]})))" "$project")
+    entry="${TW_THEME_PALETTE[$idx]}"
+    bg="${entry#*:}"
+    bg="${bg%%:*}"
+    fg="${entry##*:}"
+
+    tmux set -t "=$tmux_session" status-style "bg=$bg,fg=$fg" 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-left " [$project/$feature] " 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-left-length 40 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-right "#(tw status-bar $session_key)" 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-right-length 60 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-interval 30 2>/dev/null || true
+}
+
+# Generate status-right string with worker activity indicators
+# Called by tmux via: #(tw status-bar <session_key>)
+cmd_status_bar() {
+    local session_key="$1"
+    [[ -z "$session_key" ]] && return
+
+    local agents_dir="$HOME/.tiddly-winks/agents/${session_key}"
+    [[ ! -d "$agents_dir" ]] && echo "" && return
+
+    local now indicators=""
+    now=$(date +%s)
+
+    for f in "$agents_dir"/*.md; do
+        [[ -f "$f" ]] || continue
+        local wname
+        wname=$(basename "$f" .md)
+        local mtime age
+        mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+        age=$(( now - mtime ))
+
+        local color
+        if [[ $age -lt 300 ]]; then
+            color="green"   # active: < 5min
+        elif [[ $age -lt 600 ]]; then
+            color="yellow"  # stale: 5-10min
+        else
+            color="red"     # stuck: > 10min
+        fi
+        indicators+="#[fg=$color]● #[default]${wname} "
+    done
+
+    echo "$indicators"
+}
+
 # ─── Activity Spinner ────────────────────────────────────────────────────────
 #
 # Background loop that shows braille spinner frames on worker tmux window names
@@ -1962,6 +2033,9 @@ for name, info in svcs.items():
     tmux new-session -d -s "$tmux_session" -n "god"
     tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
 
+    # Apply project color theme to tmux session
+    session_apply_theme "$tmux_session" "$project" "$feature" "$session_key"
+
     # Install tw keybindings (once per tmux server)
     _tw_install_keybindings 2>/dev/null || true
 
@@ -2087,6 +2161,12 @@ with open(sys.argv[1], 'w') as f:
     # Create agents output directory
     mkdir -p "$(agents_dir "$session_key")"
 
+    # Lock: prevent daemon from respawning workers while cmd_start is still spawning them.
+    # The daemon checks for this lock and skips worker health checks for this session.
+    local spawn_lock="$TW_DIR/spawn-locks/${session_key}"
+    mkdir -p "$TW_DIR/spawn-locks"
+    echo "$$" > "$spawn_lock"
+
     # Add worker windows (persistent Claude agents with roles)
     local worker_pairs
     mapfile -t worker_pairs < <(yaml_worker_pairs "$effective_config")
@@ -2104,6 +2184,9 @@ with open(sys.argv[1], 'w') as f:
         }
         workers_str+="$wpair"$'\n'
     done
+
+    # Release spawn lock
+    rm -f "$spawn_lock"
 
     # Seed orchestrator with worker context + worktree paths
     if [[ -n "$workers_str" ]]; then
@@ -2786,7 +2869,30 @@ cmd_resume() {
     done
 
     [[ -z "$target_feature" && $all -eq 0 ]] \
-        && die "Usage: tw resume <feature> | tw resume --all"
+        && die "Usage: tw resume <feature|N> | tw resume --all"
+
+    # Resolve numeric index to feature name (matches tw list numbering)
+    if [[ -n "$target_feature" && "$target_feature" =~ ^[0-9]+$ ]]; then
+        local _resume_data _resume_sk
+        _resume_data=$(sessions_read)
+        _resume_sk=$(python3 - "$_resume_data" "$target_feature" <<'PYEOF'
+import json, sys
+data = json.loads(sys.argv[1])
+idx = int(sys.argv[2])
+keys = list(data.keys())
+if 1 <= idx <= len(keys):
+    print(keys[idx - 1])
+PYEOF
+        )
+        if [[ -n "$_resume_sk" ]]; then
+            # Extract feature name from session key (project-feature)
+            local _resume_proj
+            _resume_proj=$(sessions_get_key "$_resume_sk" "project")
+            target_feature="${_resume_sk#"${_resume_proj}-"}"
+        else
+            die "No session at index $target_feature"
+        fi
+    fi
 
     # NOTE: Do NOT call cmd_prune here. After a crash/reboot all tmux sessions
     # are dead, so prune would wipe every entry from sessions.json before we
@@ -2841,15 +2947,14 @@ for ws in workspaces:
                 continue
             if bead.get("status") not in ("in_progress", "open"):
                 continue
-            desc = bead.get("description", "")
-            if "## Feature Space" not in desc:
-                continue
             if bead.get("title", "").startswith("tw:worker"):
                 continue
 
             title = bead.get("title", "")
             if "(" not in title or ")" not in title:
                 continue
+
+            desc = bead.get("description", "")
             title_feature = title.split("(")[0].strip()
             project = title.split("(")[1].rstrip(")")
 
@@ -3810,21 +3915,22 @@ print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
     fi
 
     # Create task bead with full task text as description
+    # Must run bd from the project workspace where the .beads store lives
     local task_title
     task_title=$(printf '%.80s' "$task")
-    task_bead_id=$(bd create --title="$task_title" \
+    task_bead_id=$(cd "$config_dir" && bd create --title="$task_title" \
         --description="$task" \
         --type=task \
         --priority=2 \
         ${bead_id:+--parent="$bead_id"} \
-        2>/dev/null | grep -oE 'tw-[a-z0-9]+' | head -1 || true)
+        2>/dev/null | grep -oE '[a-z0-9-]+-[a-z0-9]+' | head -1 || true)
 
     if [[ -n "$task_bead_id" ]]; then
         # Store assignment metadata on the task bead
-        bd update "$task_bead_id" --status=in_progress \
+        (cd "$config_dir" && bd update "$task_bead_id" --status=in_progress \
             --set-metadata "assigned_to=$worker" \
             --set-metadata "assigned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --set-metadata "session=$session_key" \
+            --set-metadata "session=$session_key") \
             2>/dev/null || true
 
         # Write task bead ID to hooked file so worker picks it up on restart
@@ -3842,7 +3948,7 @@ with open(f, 'w') as fh:
 
         # Also record on worker identity bead for history
         if [[ -n "$worker_bead_id" ]]; then
-            bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
+            (cd "$config_dir" && bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task") 2>/dev/null || true
         fi
 
         # Nudge is just a wake-up referencing the bead
@@ -3868,10 +3974,18 @@ with open(f, 'w') as fh:
         fi
     fi
 
+    # Check auth state before attempting wake
+    local target="=$tmux_session:$worker"
+    if worker_is_not_logged_in "$tmux_session" "$worker"; then
+        log "WARNING: $worker is not logged in — sending /login first"
+        send_to_pane "$target" "/login"
+        # Wait for login to complete before sending the actual task
+        sleep 3
+    fi
+
     # Wait for the worker to be idle before sending, so we don't inject text
     # mid-output or mid-tool-call. If it doesn't become idle in time, send anyway
     # (queued nudge will be picked up on next prompt turn regardless).
-    local target="=$tmux_session:$worker"
     local wake_msg="You have a new task from the orchestrator. Check your additional context and execute it now."
 
     if wait_for_idle "$tmux_session" "$worker" 15; then
@@ -4001,6 +4115,11 @@ worker_is_idle() {
     local pane_text
     pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p -S -5 2>/dev/null) || return 1
 
+    # Not logged in is not idle — it's a broken state (check status bar only)
+    if echo "$pane_text" | tail -3 | grep -q "Not logged in"; then
+        return 1
+    fi
+
     # Claude Code shows "esc to interrupt" in the status bar when busy with a tool call.
     if echo "$pane_text" | grep -q "esc to interrupt"; then
         return 1  # busy
@@ -4015,6 +4134,16 @@ worker_is_idle() {
     fi
 
     return 1  # unknown state, assume busy
+}
+
+# Check if a worker's Claude session is not logged in.
+# Returns 0 if not logged in, 1 otherwise.
+# Checks the bottom 3 visible lines of the pane (status bar area).
+worker_is_not_logged_in() {
+    local tmux_session="$1" wname="$2"
+    local pane_text
+    pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p 2>/dev/null) || return 1
+    echo "$pane_text" | tail -3 | grep -q "Not logged in"
 }
 
 # Wait for a worker to become idle, with timeout.
@@ -4088,6 +4217,11 @@ worker_state() {
     # 2. Check if Claude process is alive
     if ! worker_is_alive "$tmux_session" "$wname"; then
         echo "dead"; return
+    fi
+
+    # 2.5. Check if worker is not logged in
+    if worker_is_not_logged_in "$tmux_session" "$wname"; then
+        echo "not-logged-in"; return
     fi
 
     # 3. Check for "done" signal (self-managed completion)
@@ -4405,6 +4539,10 @@ for name, info in s.items():
     fi
 
     # 3. Take action on dead/stuck workers (with circuit breaker)
+    if [[ -n "$dead_workers" ]] && [[ -f "$TW_DIR/spawn-locks/${session_key}" ]]; then
+        echo "  [⏳] Spawn in progress — skipping respawn for: $dead_workers"
+        dead_workers=""
+    fi
     if [[ -n "$dead_workers" ]]; then
         echo "  [!] Dead/missing workers: $dead_workers"
         local bead_id
@@ -5096,7 +5234,7 @@ tw resume --all                  # Resume all in-progress features
 
 ### Worker Management
 ```bash
-tw workers <feature> --health    # Check worker state (working/idle/stalled/done/dead)
+tw workers <feature> --health    # Check worker state (working/idle/stalled/done/dead/not-logged-in)
 tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
 tw send <feature> <worker> "task description"  # Queue task for a worker (clears done signal)
@@ -5907,6 +6045,20 @@ print(json.dumps(data, indent=2))
         fi
 
         # Session is alive — check workers
+        # Skip if cmd_start is still spawning workers (lock file present)
+        local _spawn_lock="$TW_DIR/spawn-locks/${session_key}"
+        if [[ -f "$_spawn_lock" ]]; then
+            # Stale lock safety: if lock is older than 5 minutes, remove it (cmd_start crashed)
+            local _lock_age=$(( now - $(stat -f %m "$_spawn_lock" 2>/dev/null || echo "$now") ))
+            if [[ $_lock_age -gt 300 ]]; then
+                _daemon_log "WARN: stale spawn lock for $session_key (${_lock_age}s old) — removing"
+                rm -f "$_spawn_lock"
+            else
+                _daemon_log "SKIP: $session_key has active spawn lock — cmd_start still running"
+                continue
+            fi
+        fi
+
         local config_dir
         config_dir=$(sessions_get_key "$session_key" "workspace")
         [[ -z "$config_dir" ]] && { _daemon_log "WARN: $session_key has no workspace"; continue; }
@@ -5953,9 +6105,15 @@ print(json.dumps(data, indent=2))
 
             if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
                 if worker_is_alive "$tmux_session" "$wname"; then
+                    # Check if worker needs login — auto-send /login
+                    if worker_is_not_logged_in "$tmux_session" "$wname"; then
+                        worker_status="not-logged-in"
+                        _daemon_log "WARN: $session_key/$wname not logged in — sending /login"
+                        send_to_pane "=$tmux_session:$wname" "/login" 2>/dev/null || true
+                    fi
                     (( alive_workers++ )) || true
                     # Check for stalled (alive but no output in DAEMON_STALLED_THRESHOLD)
-                    if [[ $output_mtime -gt 0 ]]; then
+                    if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" ]]; then
                         local age_secs=$((now - output_mtime))
                         if [[ $age_secs -gt $DAEMON_STALLED_THRESHOLD ]]; then
                             worker_status="stalled"
@@ -6635,6 +6793,7 @@ case "$subcommand" in
     tmux-next)     cmd_tmux_next ;;
     tmux-prev)     cmd_tmux_prev ;;
     reconcile) cmd_reconcile "$@" ;;
+    status-bar) cmd_status_bar "$@" ;;
     help|--help|-h) usage ;;
     *) die "Unknown subcommand: $subcommand. Run 'tw help' for usage." ;;
 esac
