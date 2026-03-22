@@ -124,7 +124,15 @@ _tw_completions() {
 
     case "$subcmd" in
         # Commands that take a feature name as first arg
-        attach|stop|status|workers|feed|open|editor|claude|append|patrol|gates|spawn)
+        attach)
+            if [[ $arg_pos -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "$(_tw_features) $(_tw_session_keys)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--claude --window" -- "$cur"))
+            fi
+            ;;
+
+        stop|status|workers|feed|open|editor|claude|append|patrol|gates|spawn)
             if [[ $arg_pos -eq 1 ]]; then
                 COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
             elif [[ "$subcmd" == "workers" ]]; then
