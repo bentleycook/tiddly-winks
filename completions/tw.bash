@@ -82,7 +82,7 @@ except Exception:
 _tw_subcommands() {
     echo "init start stop list attach status open editor prune claude append"
     echo "spawn workers handoff send tasks patrol feed hook signal setup prime"
-    echo "resume reconcile onboard gates daemon config port-owner doctor nudge help completion"
+    echo "resume reconcile onboard gates daemon config port-owner pane-id doctor nudge help completion"
 }
 
 _tw_completions() {

@@ -2059,6 +2059,7 @@ with open(sys.argv[1], 'w') as f:
 
     # Allocate ports and start services
     declare -A service_data
+    declare -A service_pane_ids
 
     for svc in "${service_names[@]}"; do
         [[ -z "$svc" ]] && continue
@@ -2096,14 +2097,17 @@ with open(sys.argv[1], 'w') as f:
         local restart_cmd="bash -c 'attempt=0; max_attempts=10; delay=2; while [ \$attempt -lt \$max_attempts ]; do $shell_cmd; exit_code=\$?; attempt=\$((attempt + 1)); if [ \$attempt -lt \$max_attempts ]; then echo \"[tw] Service crashed (exit \$exit_code), restarting in \${delay}s (attempt \$attempt/\$max_attempts)...\"; sleep \$delay; delay=\$((delay < 30 ? delay * 2 : 30)); fi; done; echo \"[tw] Service failed after \$max_attempts attempts. Run tw start to restart.\"; exec bash'"
 
         # First service gets its own pane in the services window; rest split
+        # Capture pane ID for stable targeting (indices shift when panes die)
+        local _pane_id
         if [[ "${services_window_created:-0}" -eq 0 ]]; then
-            tmux new-window -d -t "=$tmux_session" -n "services" \
-                "$restart_cmd"
+            _pane_id=$(tmux new-window -d -t "=$tmux_session" -n "services" \
+                -P -F '#{pane_id}' "$restart_cmd")
             services_window_created=1
         else
-            tmux split-window -t "=$tmux_session:services" -v \
-                "$restart_cmd"
+            _pane_id=$(tmux split-window -t "=$tmux_session:services" -v \
+                -P -F '#{pane_id}' "$restart_cmd")
         fi
+        service_pane_ids[$svc]="${_pane_id:-}"
     done
 
     # Balance panes in the services window
@@ -2217,13 +2221,14 @@ with open(sys.argv[1], 'w') as f:
     local sessions_data
     sessions_data=$(sessions_read)
 
-    # Build service JSON
+    # Build service JSON (includes pane_id for stable tmux targeting)
     local services_json="{"
     local first=1
     for svc in "${service_names[@]}"; do
         [[ -z "$svc" ]] && continue
         [[ $first -eq 0 ]] && services_json+=","
-        services_json+="\"$svc\": {\"port\": ${service_data[$svc]}}"
+        local _pid="${service_pane_ids[$svc]:-}"
+        services_json+="\"$svc\": {\"port\": ${service_data[$svc]}, \"pane_id\": \"$_pid\"}"
         first=0
     done
     services_json+="}"
@@ -2719,7 +2724,9 @@ else:
     print()
     print("  Services:")
     for svc, info in s.get('services', {}).items():
-        print(f"    {svc:<20} port {info.get('port', '?')}")
+        pane_id = info.get('pane_id', '')
+        pane_str = f"  pane {pane_id}" if pane_id else ""
+        print(f"    {svc:<20} port {info.get('port', '?')}{pane_str}")
     print()
     print("  URLs:")
     for svc_name, u in urls.items():
@@ -5355,6 +5362,37 @@ tw stop <feature> [--done]       # Stop [and tear down]
 ONBOARD
 }
 
+# ─── Pane ID ───────────────────────────────────────────────────────────────────
+
+cmd_pane_id() {
+    local feature="${1:-}" service="${2:-}"
+    [[ -z "$feature" || -z "$service" ]] && die "Usage: tw pane-id <feature> <service>"
+
+    local sessions_data
+    sessions_data=$(sessions_read)
+
+    local pane_id
+    pane_id=$(python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+feature = sys.argv[2]
+service = sys.argv[3]
+for key, s in data.items():
+    if s.get('feature') == feature or key.endswith('-' + feature):
+        svcs = s.get('services', {})
+        if service in svcs:
+            pid = svcs[service].get('pane_id', '')
+            if pid:
+                print(pid)
+                break
+" "$sessions_data" "$feature" "$service" 2>/dev/null)
+
+    if [[ -z "$pane_id" ]]; then
+        die "No pane_id found for service '$service' in feature '$feature'"
+    fi
+    echo "$pane_id"
+}
+
 # ─── Port Owner ────────────────────────────────────────────────────────────────
 
 cmd_port_owner() {
@@ -6785,6 +6823,7 @@ case "$subcommand" in
     config)     cmd_config "$@" ;;
     completion) cmd_completion ;;
     port-owner) cmd_port_owner "$@" ;;
+    pane-id)    cmd_pane_id "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     mail)    cmd_mail "$@" ;;
     nudge)   cmd_nudge "$@" ;;
