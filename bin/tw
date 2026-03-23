@@ -497,42 +497,103 @@ session_apply_theme() {
     tmux set -t "=$tmux_session" status-left " [$project/$feature] " 2>/dev/null || true
     tmux set -t "=$tmux_session" status-left-length 40 2>/dev/null || true
     tmux set -t "=$tmux_session" status-right "#(tw status-bar $session_key)" 2>/dev/null || true
-    tmux set -t "=$tmux_session" status-right-length 60 2>/dev/null || true
+    tmux set -t "=$tmux_session" status-right-length 100 2>/dev/null || true
     tmux set -t "=$tmux_session" status-interval 30 2>/dev/null || true
 }
 
-# Generate status-right string with worker activity indicators
+# Generate status-right string with worker states + service health
 # Called by tmux via: #(tw status-bar <session_key>)
+# Must be fast — runs every 30s via tmux status-interval.
 cmd_status_bar() {
     local session_key="$1"
     [[ -z "$session_key" ]] && return
 
-    local agents_dir="$HOME/.tiddly-winks/agents/${session_key}"
-    [[ ! -d "$agents_dir" ]] && echo "" && return
+    local out=""
 
-    local now indicators=""
-    now=$(date +%s)
-
-    for f in "$agents_dir"/*.md; do
-        [[ -f "$f" ]] || continue
-        local wname
-        wname=$(basename "$f" .md)
-        local mtime age
-        mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
-        age=$(( now - mtime ))
-
-        local color
-        if [[ $age -lt 300 ]]; then
-            color="green"   # active: < 5min
-        elif [[ $age -lt 600 ]]; then
-            color="yellow"  # stale: 5-10min
-        else
-            color="red"     # stuck: > 10min
+    # ── Worker states from daemon health JSON ──
+    local health_file="$TW_DIR/health/${session_key}.json"
+    if [[ -f "$health_file" ]]; then
+        out+=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    icons = {
+        'working':       '#[fg=green]⚙',
+        'idle':          '#[fg=blue]◉',
+        'stalled':       '#[fg=yellow]⚠',
+        'dead':          '#[fg=red]✗',
+        'not-logged-in': '#[fg=red]🔒',
+        'circuit-broken':'#[fg=red]⊘',
+    }
+    parts = []
+    for w in d.get('workers', []):
+        name = w.get('name','?')[:3]
+        status = w.get('status','')
+        icon = icons.get(status, '#[fg=white]?')
+        parts.append(f'{icon}#[default]{name}')
+    print(' '.join(parts))
+except Exception:
+    pass
+" "$health_file" 2>/dev/null || true)
+    else
+        # Fallback: output-file mtime heuristic
+        local agents_dir="$TW_DIR/agents/${session_key}"
+        if [[ -d "$agents_dir" ]]; then
+            local now
+            now=$(date +%s)
+            for f in "$agents_dir"/*.md; do
+                [[ -f "$f" ]] || continue
+                local wname mtime age color
+                wname=$(basename "$f" .md)
+                mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+                age=$(( now - mtime ))
+                if [[ $age -lt 300 ]]; then color="green"
+                elif [[ $age -lt 600 ]]; then color="yellow"
+                else color="red"; fi
+                out+="#[fg=$color]● #[default]${wname:0:3} "
+            done
         fi
-        indicators+="#[fg=$color]● #[default]${wname} "
-    done
+    fi
 
-    echo "$indicators"
+    # ── Service health via port check ──
+    local sessions_file="$TW_DIR/sessions.json"
+    if [[ -f "$sessions_file" ]]; then
+        local svc_status
+        svc_status=$(python3 -c "
+import json, sys, subprocess
+try:
+    d = json.load(open(sys.argv[1]))
+    s = d.get(sys.argv[2], {})
+    svcs = s.get('services', {})
+    parts = []
+    for name, info in svcs.items():
+        port = info.get('port', '')
+        if not port:
+            continue
+        try:
+            r = subprocess.run(['lsof', '-i', f':{port}', '-sTCP:LISTEN'],
+                               capture_output=True, timeout=2)
+            up = r.returncode == 0
+        except Exception:
+            up = False
+        icon = '#[fg=green]●' if up else '#[fg=red]●'
+        parts.append(f'{icon}#[default]{name[:4]}')
+    if parts:
+        print(' '.join(parts))
+except Exception:
+    pass
+" "$sessions_file" "$session_key" 2>/dev/null || true)
+        if [[ -n "$svc_status" ]]; then
+            [[ -n "$out" ]] && out+=" │ "
+            out+="$svc_status"
+        fi
+    fi
+
+    # ── Time ──
+    [[ -n "$out" ]] && out+=" │ "
+    out+=$(date +"%H:%M")
+
+    echo "$out"
 }
 
 # ─── Activity Spinner ────────────────────────────────────────────────────────
@@ -6072,6 +6133,7 @@ DAEMON_LOG_FILE="$TW_DIR/logs/daemon.log"
 DAEMON_HEARTBEAT_FILE="$TW_DIR/daemon.heartbeat"
 DAEMON_HUNG_THRESHOLD=900  # 15 minutes
 DAEMON_STALLED_THRESHOLD=1800  # 30 minutes — alive tmux but no output change
+DAEMON_CHECKPOINT_INTERVAL=600  # 10 minutes — periodic WIP commits to protect worktree changes
 CRASH_COUNT_DIR="$TW_DIR/crash-counts"
 HEALTH_REPORT_DIR="$TW_DIR/health"
 
@@ -6312,6 +6374,54 @@ for name, info in svcs.items():
                     fi
                 fi
             done <<< "$services_json"
+        fi
+
+        # Checkpoint: periodic WIP commits to protect worktree changes
+        local ckpt_dir="$TW_DIR/checkpoints"
+        mkdir -p "$ckpt_dir"
+        local ckpt_file="$ckpt_dir/${session_key}.last"
+        local ckpt_last=0
+        [[ -f "$ckpt_file" ]] && ckpt_last=$(cat "$ckpt_file" 2>/dev/null || echo 0)
+        local ckpt_elapsed=$(( now - ckpt_last ))
+
+        if [[ $ckpt_elapsed -ge $DAEMON_CHECKPOINT_INTERVAL ]]; then
+            # Collect worktree paths + main workspace
+            local ckpt_paths=()
+            ckpt_paths+=("$config_dir")
+            local wt_json
+            wt_json=$(python3 -c "
+import json, sys
+d = json.loads(sys.argv[1])
+s = d.get(sys.argv[2], {})
+wt = s.get('worktrees', {})
+for path in wt.values():
+    if isinstance(path, str):
+        print(path)
+" "$(sessions_read)" "$session_key" 2>/dev/null || true)
+            while IFS= read -r wt_path; do
+                [[ -n "$wt_path" && "$wt_path" != "$config_dir" ]] && ckpt_paths+=("$wt_path")
+            done <<< "$wt_json"
+
+            local ckpt_made=0
+            for ckpt_path in "${ckpt_paths[@]}"; do
+                [[ -z "$ckpt_path" || ! -d "$ckpt_path" ]] && continue
+                [[ ! -d "$ckpt_path/.git" && ! -f "$ckpt_path/.git" ]] && continue
+
+                if ! git -C "$ckpt_path" diff --quiet 2>/dev/null || ! git -C "$ckpt_path" diff --cached --quiet 2>/dev/null; then
+                    local ckpt_ts
+                    ckpt_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                    git -C "$ckpt_path" add -A -- . ':!.claude/' ':!.beads/' ':!__pycache__/' ':!node_modules/' ':!.env*' 2>/dev/null || true
+                    if ! git -C "$ckpt_path" diff --cached --quiet 2>/dev/null; then
+                        git -C "$ckpt_path" commit -m "WIP: checkpoint $ckpt_ts" --no-verify 2>/dev/null && {
+                            _daemon_log "Checkpoint: $session_key $(basename "$ckpt_path")"
+                            (( ckpt_made++ )) || true
+                        }
+                    fi
+                fi
+            done
+
+            echo "$now" > "$ckpt_file"
+            [[ $ckpt_made -gt 0 ]] && _daemon_log "Checkpoint done: $session_key ($ckpt_made path(s))"
         fi
 
     done <<< "$session_keys"
