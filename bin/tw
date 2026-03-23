@@ -4181,21 +4181,64 @@ wait_for_idle() {
 send_to_pane() {
     local target="$1" text="$2"
 
-    # Use literal send-keys (-l) to avoid key name interpretation, chunk at 512 chars
-    local chunk_size=512
-    local len=${#text}
-    local offset=0
+    # 1. Sanitize: strip C0 control chars (except newline) and normalize whitespace
+    text=$(python3 -c "
+import sys, re
+t = sys.argv[1]
+# Strip ESC sequences (ANSI), CR, BS, TAB, and other C0 controls except newline
+t = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', t)  # ANSI escape sequences
+t = re.sub(r'[\x00-\x09\x0b-\x0c\x0e-\x1f\x7f]', '', t)  # C0 controls except \\n (0x0a) and \\r (0x0d)
+t = t.replace('\r', '')  # strip CR
+t = t.replace('\u00a0', ' ')  # non-breaking space → regular space
+print(t, end='')
+" "$text")
 
-    while [[ $offset -lt $len ]]; do
-        local chunk="${text:$offset:$chunk_size}"
-        tmux send-keys -t "$target" -l "$chunk"
-        offset=$((offset + chunk_size))
-        [[ $offset -lt $len ]] && sleep 0.01
-    done
+    # 2. Acquire flock to serialize sends to the same target
+    local lock_dir="$HOME/.tiddly-winks/locks"
+    mkdir -p "$lock_dir"
+    local lock_target="${target//[:\/]/_}"
+    local lock_file="${lock_dir}/${lock_target}.lock"
 
-    # Brief pause then Enter
-    sleep 0.1
-    tmux send-keys -t "$target" Enter
+    (
+        flock -w 2 200 || { log "send_to_pane: failed to acquire lock for $target"; return 1; }
+
+        # 3. Retry loop with backoff for transient tmux errors
+        local chunk_size=512
+        local len=${#text}
+        local offset=0
+
+        while [[ $offset -lt $len ]]; do
+            local chunk="${text:$offset:$chunk_size}"
+            local attempt=0 max_retries=3 backoff=0.5
+
+            while true; do
+                local err
+                err=$(tmux send-keys -t "$target" -l "$chunk" 2>&1) && break
+
+                # Permanent errors — don't retry
+                if [[ "$err" == *"session not found"* || "$err" == *"window not found"* || "$err" == *"no such"* || "$err" == *"can't find"* ]]; then
+                    log "send_to_pane: permanent error for $target: $err"
+                    return 1
+                fi
+
+                (( attempt++ ))
+                if [[ $attempt -ge $max_retries ]]; then
+                    log "send_to_pane: failed after $max_retries retries for $target: $err"
+                    return 1
+                fi
+                sleep "$backoff"
+                backoff=$(python3 -c "print($backoff * 1.5)")
+            done
+
+            offset=$((offset + chunk_size))
+            [[ $offset -lt $len ]] && sleep 0.01
+        done
+
+        # Brief pause then Enter
+        sleep 0.1
+        tmux send-keys -t "$target" Enter
+
+    ) 200>"$lock_file"
 }
 
 # Check if a worker window has a live Claude process (not just a bare shell).
@@ -6461,8 +6504,15 @@ _tw_install_keybindings() {
     tmux bind-key G display-popup -E -w 60 -h 20 \
         "tmux list-sessions -F '#{session_name}' | grep -E '^[a-z]+-[a-z]' | fzf --reverse --header='Switch tw session' | xargs -I{} tmux switch-client -t ={}"
 
+    # n/p = next/prev worker window (skips god, main, services)
+    tmux bind-key n run-shell "tw win-next"
+    tmux bind-key p run-shell "tw win-prev"
+
+    # g = worker menu with state
+    tmux bind-key g run-shell "tw win-menu"
+
     tmux set-environment -g TW_BINDINGS_INSTALLED 1
-    log "Installed tw tmux keybindings (N/P/G)"
+    log "Installed tw tmux keybindings (N/P/G/n/p/g)"
 }
 
 # Navigate to next tw session
@@ -6512,7 +6562,109 @@ cmd_tmux_prev() {
     [[ -n "$target" ]] && tmux switch-client -t "=$target"
 }
 
-# ─── Runtime Config ──────────────────────────────────────────────────────────
+# Navigate to next worker window (skips god, main, services)
+cmd_win_next() {
+    local session current_win
+    session=$(tmux display-message -p '#{session_name}')
+    current_win=$(tmux display-message -p '#{window_name}')
+    # Strip spinner suffix
+    current_win="${current_win%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+
+    local workers=()
+    while IFS= read -r wname; do
+        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+        case "$base" in
+            god|main|services|[0-9]*) continue ;;
+        esac
+        workers+=("$base")
+    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
+
+    [[ ${#workers[@]} -eq 0 ]] && return 0
+
+    local found=0 target=""
+    for w in "${workers[@]}"; do
+        if [[ $found -eq 1 ]]; then
+            target="$w"
+            break
+        fi
+        [[ "$w" == "$current_win" ]] && found=1
+    done
+    # Wrap around or jump to first worker if current is non-worker
+    [[ -z "$target" ]] && target="${workers[0]}"
+    tmux select-window -t "=$session:$target" 2>/dev/null || true
+}
+
+# Navigate to previous worker window (skips god, main, services)
+cmd_win_prev() {
+    local session current_win
+    session=$(tmux display-message -p '#{session_name}')
+    current_win=$(tmux display-message -p '#{window_name}')
+    current_win="${current_win%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+
+    local workers=()
+    while IFS= read -r wname; do
+        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+        case "$base" in
+            god|main|services|[0-9]*) continue ;;
+        esac
+        workers+=("$base")
+    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
+
+    [[ ${#workers[@]} -eq 0 ]] && return 0
+
+    local prev="" target=""
+    for w in "${workers[@]}"; do
+        if [[ "$w" == "$current_win" ]]; then
+            target="$prev"
+            break
+        fi
+        prev="$w"
+    done
+    # Wrap around to last worker
+    [[ -z "$target" ]] && target="${workers[-1]}"
+    tmux select-window -t "=$session:$target" 2>/dev/null || true
+}
+
+# Display a tmux menu of workers with state indicators
+cmd_win_menu() {
+    local session session_key feature
+    session=$(tmux display-message -p '#{session_name}')
+
+    # Derive session_key and feature from tmux session name
+    session_key="$session"
+    local project
+    project=$(sessions_get_key "$session_key" "project" 2>/dev/null || true)
+    [[ -z "$project" ]] && return 0
+    feature="${session_key#"${project}-"}"
+
+    # Build menu entries from worker windows with health state
+    local menu_args=()
+    while IFS= read -r wname; do
+        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
+        case "$base" in
+            god|main|services|[0-9]*) continue ;;
+        esac
+        # Check if spinning (active) based on window name having spinner char
+        local state="idle"
+        if [[ "$wname" =~ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ]]; then
+            state="active"
+        fi
+        local icon="○"
+        [[ "$state" == "active" ]] && icon="●"
+        menu_args+=("$icon $base" "" "select-window -t =$session:$base")
+    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
+
+    if [[ ${#menu_args[@]} -eq 0 ]]; then
+        tmux display-message "No worker windows"
+        return 0
+    fi
+
+    # Add god window at the bottom separated by a line
+    menu_args+=("" "" "")
+    menu_args+=("◆ god" "" "select-window -t =$session:god")
+
+    tmux display-menu -T "Workers: $feature" -x C -y C "${menu_args[@]}"
+}
 
 cmd_completion() {
     # Find the completion script relative to this script's location
@@ -6831,6 +6983,9 @@ case "$subcommand" in
     pane-respawn)  cmd_pane_respawn "$@" ;;
     tmux-next)     cmd_tmux_next ;;
     tmux-prev)     cmd_tmux_prev ;;
+    win-next)      cmd_win_next ;;
+    win-prev)      cmd_win_prev ;;
+    win-menu)      cmd_win_menu ;;
     reconcile) cmd_reconcile "$@" ;;
     status-bar) cmd_status_bar "$@" ;;
     help|--help|-h) usage ;;
