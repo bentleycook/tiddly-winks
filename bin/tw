@@ -895,6 +895,11 @@ with open(f, 'w') as fh:
     local _cv_feature="${session_key#*-}"
     cv_record_session_start "$_cv_project" "$wname" "$_cv_feature" 2>/dev/null || true
 
+    # Write spawn timestamp — daemon uses this to avoid respawning workers still booting
+    local spawn_ts_dir="$TW_DIR/spawn-timestamps/$session_key"
+    mkdir -p "$spawn_ts_dir"
+    date +%s > "$spawn_ts_dir/$wname"
+
     if [[ -n "$wrole" ]]; then
         log "Started worker: $wname (initial context: $wrole)"
     else
@@ -2250,8 +2255,9 @@ with open(sys.argv[1], 'w') as f:
         workers_str+="$wpair"$'\n'
     done
 
-    # Release spawn lock
-    rm -f "$spawn_lock"
+    # Release spawn lock after a grace period — workers take 10-15s to boot.
+    # Without this delay, the daemon may see booting workers as "dead" and respawn them.
+    (sleep 30 && rm -f "$spawn_lock") &
 
     # Seed orchestrator with worker context + worktree paths
     if [[ -n "$workers_str" ]]; then
@@ -6285,6 +6291,23 @@ print(json.dumps(data, indent=2))
             fi
 
             if [[ $is_dead -eq 1 ]]; then
+                # Check if worker was recently spawned (still booting)
+                local _spawn_ts_file="$TW_DIR/spawn-timestamps/$session_key/$wname"
+                if [[ -f "$_spawn_ts_file" ]]; then
+                    local _spawn_ts
+                    _spawn_ts=$(cat "$_spawn_ts_file" 2>/dev/null || echo 0)
+                    local _spawn_age=$((now - _spawn_ts))
+                    if [[ $_spawn_age -lt 30 ]]; then
+                        _daemon_log "SKIP respawn: $session_key/$wname spawned ${_spawn_age}s ago (still booting)"
+                        worker_status="booting"
+                        # Still count in health report but don't respawn
+                        [[ -n "$health_workers_json" ]] && health_workers_json+=","
+                        health_workers_json+=$(printf '{"name":"%s","role":"%s","tmux_alive":false,"last_output_mtime":%d,"status":"booting","crash_count":0}' \
+                            "$wname" "$wrole" "$output_mtime")
+                        continue
+                    fi
+                fi
+
                 worker_status="dead"
 
                 # Crash counter: check if circuit breaker should block respawn
