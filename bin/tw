@@ -4193,52 +4193,65 @@ t = t.replace('\u00a0', ' ')  # non-breaking space → regular space
 print(t, end='')
 " "$text")
 
-    # 2. Acquire flock to serialize sends to the same target
+    # 2. Acquire lock to serialize sends to the same target (mkdir is atomic, works on macOS)
     local lock_dir="$HOME/.tiddly-winks/locks"
-    mkdir -p "$lock_dir"
+    mkdir -p "$lock_dir" 2>/dev/null
     local lock_target="${target//[:\/]/_}"
-    local lock_file="${lock_dir}/${lock_target}.lock"
+    local lock_path="${lock_dir}/${lock_target}.lock"
+    local _lock_acquired=0
+    local _lock_deadline=$(($(date +%s) + 2))
 
-    (
-        flock -w 2 200 || { log "send_to_pane: failed to acquire lock for $target"; return 1; }
+    while [[ $(date +%s) -lt $_lock_deadline ]]; do
+        if mkdir "$lock_path" 2>/dev/null; then
+            _lock_acquired=1
+            break
+        fi
+        sleep 0.1
+    done
 
-        # 3. Retry loop with backoff for transient tmux errors
-        local chunk_size=512
-        local len=${#text}
-        local offset=0
+    if [[ $_lock_acquired -eq 0 ]]; then
+        log "send_to_pane: lock timeout for $target"
+        return 1
+    fi
 
-        while [[ $offset -lt $len ]]; do
-            local chunk="${text:$offset:$chunk_size}"
-            local attempt=0 max_retries=3 backoff=0.5
+    # 3. Retry loop with backoff for transient tmux errors
+    local chunk_size=512
+    local len=${#text}
+    local offset=0
 
-            while true; do
-                local err
-                err=$(tmux send-keys -t "$target" -l "$chunk" 2>&1) && break
+    while [[ $offset -lt $len ]]; do
+        local chunk="${text:$offset:$chunk_size}"
+        local attempt=0 max_retries=3 backoff=0.5
 
-                # Permanent errors — don't retry
-                if [[ "$err" == *"session not found"* || "$err" == *"window not found"* || "$err" == *"no such"* || "$err" == *"can't find"* ]]; then
-                    log "send_to_pane: permanent error for $target: $err"
-                    return 1
-                fi
+        while true; do
+            local err
+            err=$(tmux send-keys -t "$target" -l "$chunk" 2>&1) && break
 
-                (( attempt++ ))
-                if [[ $attempt -ge $max_retries ]]; then
-                    log "send_to_pane: failed after $max_retries retries for $target: $err"
-                    return 1
-                fi
-                sleep "$backoff"
-                backoff=$(python3 -c "print($backoff * 1.5)")
-            done
+            # Permanent errors — don't retry
+            if [[ "$err" == *"session not found"* || "$err" == *"window not found"* || "$err" == *"no such"* || "$err" == *"can't find"* ]]; then
+                log "send_to_pane: permanent error for $target: $err"
+                rmdir "$lock_path" 2>/dev/null
+                return 1
+            fi
 
-            offset=$((offset + chunk_size))
-            [[ $offset -lt $len ]] && sleep 0.01
+            (( attempt++ ))
+            if [[ $attempt -ge $max_retries ]]; then
+                log "send_to_pane: failed after $max_retries retries for $target: $err"
+                rmdir "$lock_path" 2>/dev/null
+                return 1
+            fi
+            sleep "$backoff"
+            backoff=$(python3 -c "print($backoff * 1.5)")
         done
 
-        # Brief pause then Enter
-        sleep 0.1
-        tmux send-keys -t "$target" Enter
+        offset=$((offset + chunk_size))
+        [[ $offset -lt $len ]] && sleep 0.01
+    done
 
-    ) 200>"$lock_file"
+    # Brief pause then Enter
+    sleep 0.1
+    tmux send-keys -t "$target" Enter
+    rmdir "$lock_path" 2>/dev/null
 }
 
 # Check if a worker window has a live Claude process (not just a bare shell).
