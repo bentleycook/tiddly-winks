@@ -1857,12 +1857,13 @@ reconcile_workers() {
 # ─── Subcommands ─────────────────────────────────────────────────────────────
 
 cmd_start() {
-    local feature="" mode="local"
+    local feature="" mode="local" attach_flag=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode) mode="$2"; shift 2 ;;
             --mode=*) mode="${1#--mode=}"; shift ;;
+            --attach) attach_flag=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
@@ -2407,6 +2408,47 @@ EOF
 
     # Clean up temp file if created
     [[ "$effective_config" != "$config_file" ]] && rm -f "$effective_config"
+
+    # --attach: attach to the session and auto-login the god window
+    if [[ $attach_flag -eq 1 ]]; then
+        # Wait for god window's Claude to boot, then send /login
+        (
+            sleep 12
+            # Only login if not already logged in
+            local _pane_text
+            _pane_text=$(tmux capture-pane -t "=$tmux_session:god" -p 2>/dev/null) || exit 0
+            if echo "$_pane_text" | tail -3 | grep -q "Not logged in"; then
+                tmux send-keys -t "=$tmux_session:god" "/login" Enter
+                sleep 3
+                # Select option 1 (subscription) if login menu appears
+                tmux send-keys -t "=$tmux_session:god" Enter
+                sleep 2
+                # Press Enter to dismiss "Login successful" prompt
+                tmux send-keys -t "=$tmux_session:god" Enter
+            fi
+        ) &
+
+        # Also auto-login all worker windows
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}"
+            (
+                sleep 14
+                local _pane_text
+                _pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p 2>/dev/null) || exit 0
+                if echo "$_pane_text" | tail -3 | grep -q "Not logged in"; then
+                    tmux send-keys -t "=$tmux_session:$wname" "/login" Enter
+                    sleep 3
+                    tmux send-keys -t "=$tmux_session:$wname" Enter
+                    sleep 2
+                    tmux send-keys -t "=$tmux_session:$wname" Enter
+                fi
+            ) &
+        done
+
+        tmux select-window -t "=$tmux_session:god" 2>/dev/null || true
+        exec tmux attach-session -t "=$tmux_session"
+    fi
 }
 
 cmd_stop() {

@@ -211,7 +211,7 @@ _tw_completions() {
             elif [[ "$prev" == "--mode" ]]; then
                 COMPREPLY=($(compgen -W "local staging" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "--mode --force" -- "$cur"))
+                COMPREPLY=($(compgen -W "--mode --force --attach" -- "$cur"))
             fi
             ;;
 
