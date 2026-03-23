@@ -14,7 +14,9 @@ import json, sys
 try:
     d = json.load(open('$_tw_sessions_file'))
     for k, v in d.items():
-        print(v.get('feature', k.split('-', 1)[-1] if '-' in k else k))
+        f = v.get('feature', k.split('-', 1)[-1] if '-' in k else k)
+        if ' ' not in f:
+            print(f)
 except Exception:
     pass
 " 2>/dev/null
@@ -26,7 +28,8 @@ import json
 try:
     d = json.load(open('$_tw_sessions_file'))
     for k in d:
-        print(k)
+        if ' ' not in k:
+            print(k)
 except Exception:
     pass
 " 2>/dev/null
@@ -233,4 +236,4 @@ _tw_completions() {
     return 0
 }
 
-complete -F _tw_completions tw
+complete -o nosort -F _tw_completions tw
