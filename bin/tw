@@ -792,6 +792,14 @@ agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 TW_MAX_WORKERS=${TW_MAX_WORKERS:-100}
 
 # ── Engine abstraction ──────────────────────────────────────────────
+# Check if a tmux window exists by name, accounting for spinner suffix (e.g., "test ⠼").
+# Usage: tmux_window_exists <tmux_session> <window_name>
+tmux_window_exists() {
+    local tmux_session="$1" wname="$2"
+    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
+        | grep -q "^${wname}\( [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\)\?$"
+}
+
 # Dispatch on engine name to support different AI CLI backends.
 # Currently only 'claude' is implemented. Add cases for cursor, codex, etc.
 
@@ -4302,8 +4310,7 @@ cmd_send() {
 
     tmux has-session -t "=$tmux_session" 2>/dev/null \
         || die "No tmux session '$tmux_session' — is the feature running?"
-    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
-        | grep -qx "$worker" \
+    tmux_window_exists "$tmux_session" "$worker" \
         || die "Worker window '$worker' not found — run: tw workers $feature"
 
     local ttl=30
@@ -4787,7 +4794,7 @@ worker_state() {
     local tmux_session="$1" wname="$2" agents_path="${3:-}" session_key="${4:-$tmux_session}"
 
     # 1. Check if window exists (allow spinner suffix like "test ⠼")
-    if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${wname}\( [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\)\?$"; then
+    if ! tmux_window_exists "$tmux_session" "$wname"; then
         echo "dead"; return
     fi
 
@@ -4856,8 +4863,7 @@ cmd_handoff() {
         || die "No tmux session '$tmux_session'"
 
     # Verify worker window exists
-    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
-        | grep -qx "$worker" \
+    tmux_window_exists "$tmux_session" "$worker" \
         || die "Worker window '$worker' not found in session '$tmux_session'"
 
     # 1. Save worker's output file to their identity bead
@@ -5691,8 +5697,7 @@ print(json.dumps(rows, indent=2))
         wengine=$(resolve_engine "$wengine" "$config_file")
 
         # Skip if window already exists
-        if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
-                | grep -qx "$wname"; then
+        if tmux_window_exists "$tmux_session" "$wname"; then
             log "Worker already running: $wname (skipping)"
             (( skipped++ )) || true
             continue
