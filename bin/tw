@@ -4786,8 +4786,8 @@ worker_is_alive() {
 worker_state() {
     local tmux_session="$1" wname="$2" agents_path="${3:-}" session_key="${4:-$tmux_session}"
 
-    # 1. Check if window exists
-    if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
+    # 1. Check if window exists (allow spinner suffix like "test ⠼")
+    if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${wname}\( [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\)\?$"; then
         echo "dead"; return
     fi
 
