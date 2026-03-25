@@ -1042,7 +1042,8 @@ spawn_worker() {
     # Spawn cap — refuse if too many AI workers are already running
     local active_workers _proc_pattern
     _proc_pattern=$(engine_process_pattern "$engine")
-    active_workers=$(pgrep -f "$_proc_pattern" 2>/dev/null | wc -l | tr -d ' ')
+    active_workers=$(pgrep -f "$_proc_pattern" 2>/dev/null | wc -l | tr -d '[:space:]' || echo 0)
+    [[ -z "$active_workers" ]] && active_workers=0
     if [[ "$active_workers" -ge "$TW_MAX_WORKERS" ]]; then
         log "Spawn cap reached: $active_workers active workers (max $TW_MAX_WORKERS). Refusing to spawn $wname."
         echo "  ⚡ Spawn cap: $active_workers/$TW_MAX_WORKERS workers running. Not spawning $wname." >&2
