@@ -145,11 +145,17 @@ _tw_completions() {
                 COMPREPLY=($(compgen -W "--problems" -- "$cur"))
             elif [[ "$subcmd" == "stop" ]]; then
                 COMPREPLY=($(compgen -W "--done" -- "$cur"))
-            elif [[ "$subcmd" == "spawn" && $arg_pos -eq 3 ]]; then
-                # Third arg to spawn is optional role
-                local roles_dir="$HOME/.claude/roles"
-                if [[ -d "$roles_dir" ]]; then
-                    COMPREPLY=($(compgen -W "$(ls "$roles_dir" 2>/dev/null | sed 's/\.md$//')" -- "$cur"))
+            elif [[ "$subcmd" == "spawn" ]]; then
+                if [[ "$prev" == "--engine" ]]; then
+                    COMPREPLY=($(compgen -W "claude cursor codex" -- "$cur"))
+                elif [[ "$cur" == --* ]]; then
+                    COMPREPLY=($(compgen -W "--engine" -- "$cur"))
+                elif [[ $arg_pos -eq 3 ]]; then
+                    # Third arg to spawn is optional role
+                    local roles_dir="$HOME/.claude/roles"
+                    if [[ -d "$roles_dir" ]]; then
+                        COMPREPLY=($(compgen -W "$(ls "$roles_dir" 2>/dev/null | sed 's/\.md$//')" -- "$cur"))
+                    fi
                 fi
             fi
             ;;
@@ -161,9 +167,13 @@ _tw_completions() {
             fi
             ;;
 
-        # send <feature> <worker> "<task>"
+        # send <feature> <worker> "<task>" [--engine <name>] [--urgent]
         send)
-            if [[ $arg_pos -eq 1 ]]; then
+            if [[ "$prev" == "--engine" ]]; then
+                COMPREPLY=($(compgen -W "claude cursor codex" -- "$cur"))
+            elif [[ "$cur" == --* ]]; then
+                COMPREPLY=($(compgen -W "--engine --urgent" -- "$cur"))
+            elif [[ $arg_pos -eq 1 ]]; then
                 COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
             elif [[ $arg_pos -eq 2 ]]; then
                 # Complete worker names for the selected feature

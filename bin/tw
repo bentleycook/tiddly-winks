@@ -148,17 +148,19 @@ try:
     d = yaml.safe_load(open(sys.argv[1]))
     workers = d.get('workers', None)
     pool_size = d.get('pool_size', 0)
+    default_engine = d.get('engine', '')
     if isinstance(workers, list):
         # List format: [dev-1, dev-2, ...]
         for name in workers:
-            print(f"{name}:")
+            print(f"{name}::{default_engine}")
     elif isinstance(workers, dict):
         for name, info in workers.items():
             role = (info or {}).get('role', '') if isinstance(info, dict) else ''
-            print(f"{name}:{role}")
+            engine = (info or {}).get('engine', default_engine) if isinstance(info, dict) else default_engine
+            print(f"{name}:{role}:{engine}")
     elif pool_size and int(pool_size) > 0:
         for i in range(1, int(pool_size) + 1):
-            print(f"dev-{i}:")
+            print(f"dev-{i}::{default_engine}")
 except Exception:
     pass
 EOF
@@ -352,10 +354,10 @@ sessions_list_keys() {
 
 # Add a dynamic worker to session state
 sessions_add_dynamic_worker() {
-    local session_key="$1" name="$2" role="${3:-}"
+    local session_key="$1" name="$2" role="${3:-}" engine="${4:-claude}"
     python3 -c "
 import json, sys, os, tempfile
-sk, name, role = sys.argv[1], sys.argv[2], sys.argv[3]
+sk, name, role, engine = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 target = '$SESSIONS_FILE'
 with open(target) as f:
     d = json.load(f)
@@ -363,7 +365,7 @@ session = d.get(sk, {})
 dw = session.get('dynamic_workers', [])
 # Don't add duplicates
 if not any(w['name'] == name for w in dw):
-    dw.append({'name': name, 'role': role})
+    dw.append({'name': name, 'role': role, 'engine': engine})
 session['dynamic_workers'] = dw
 d[sk] = session
 parent = os.path.dirname(target)
@@ -378,7 +380,7 @@ try:
 except:
     os.unlink(tmp)
     raise
-" "$session_key" "$name" "$role"
+" "$session_key" "$name" "$role" "$engine"
 }
 
 # Remove a dynamic worker from the session's dynamic_workers array
@@ -409,7 +411,7 @@ except:
 " "$session_key" "$name"
 }
 
-# Get dynamic workers as name:role pairs (same format as yaml_worker_pairs)
+# Get dynamic workers as name:role:engine triples (same format as yaml_worker_pairs)
 sessions_get_dynamic_workers() {
     local session_key="$1"
     python3 -c "
@@ -417,7 +419,7 @@ import json, sys
 d = json.load(open('$SESSIONS_FILE'))
 dw = d.get(sys.argv[1], {}).get('dynamic_workers', [])
 for w in dw:
-    print(f\"{w['name']}:{w['role']}\")
+    print(f\"{w['name']}:{w.get('role', '')}:{w.get('engine', '')}\")
 " "$session_key" 2>/dev/null
 }
 
@@ -642,7 +644,7 @@ spinner_start() {
                 pane_pid=$(tmux list-panes -t "=$tmux_session:$widx" -F "#{pane_pid}" 2>/dev/null | head -1)
                 [[ -z "$pane_pid" ]] && continue
 
-                child_pid=$(pgrep -P "$pane_pid" -f "claude" 2>/dev/null | head -1)
+                child_pid=$(pgrep -P "$pane_pid" -f "claude|cursor-agent|codex" 2>/dev/null | head -1)
                 active=0
                 if [[ -n "$child_pid" ]]; then
                     cpu=$(ps -p "$child_pid" -o %cpu= 2>/dev/null | xargs)
@@ -789,6 +791,238 @@ agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 # Safety net to prevent spawn storms from overwhelming the machine.
 TW_MAX_WORKERS=${TW_MAX_WORKERS:-100}
 
+# ── Engine abstraction ──────────────────────────────────────────────
+# Dispatch on engine name to support different AI CLI backends.
+# Currently only 'claude' is implemented. Add cases for cursor, codex, etc.
+
+engine_spawn_cmd() {
+    local engine="$1" worker_name="$2" prompt_file="${3:-}"
+    case "$engine" in
+        claude) echo "claude --dangerously-skip-permissions --name '$worker_name'" ;;
+        cursor)
+            if [[ -n "$prompt_file" ]]; then
+                echo "cursor-agent --force \"\$(cat '$prompt_file')\""
+            else
+                echo "cursor-agent --force"
+            fi
+            ;;
+        *) die "Unknown engine: $engine" ;;
+    esac
+}
+
+engine_process_pattern() {
+    local engine="$1"
+    case "$engine" in
+        claude) echo "claude.*--dangerously-skip-permissions" ;;
+        cursor) echo "cursor-agent" ;;
+        *) echo "$engine" ;;
+    esac
+}
+
+engine_wake_delay() {
+    case "$1" in
+        claude) echo 16 ;;
+        cursor) echo 5 ;;
+        *) echo 5 ;;
+    esac
+}
+
+engine_wake_prompt() {
+    case "$1" in
+        claude) echo "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." ;;
+        cursor) echo "You are now online. Execute your task and write progress to your output file." ;;
+        *) echo "You are now online. Execute your task and write progress to your output file." ;;
+    esac
+}
+
+engine_supports_hooks() {
+    case "$1" in
+        claude) return 0 ;;
+        cursor) return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Patterns indicating the worker is idle (at the prompt, ready for input).
+engine_idle_pattern() {
+    case "$1" in
+        claude) echo '❯|bypass permissions|hold Space to speak|Sautéed for' ;;
+        cursor) echo '❯|>' ;;
+        *) echo '❯|>' ;;
+    esac
+}
+
+# Patterns indicating the worker is busy (actively running tools).
+engine_busy_pattern() {
+    case "$1" in
+        claude) echo 'esc to interrupt' ;;
+        cursor) echo 'running|executing|processing' ;;
+        *) echo 'running|processing' ;;
+    esac
+}
+
+# Patterns indicating the worker is not authenticated.
+engine_not_logged_in_pattern() {
+    case "$1" in
+        claude) echo 'Not logged in' ;;
+        cursor) echo 'authentication required|API key invalid|unauthorized' ;;
+        *) echo 'Not logged in|authentication required|API key invalid' ;;
+    esac
+}
+
+# Command to gracefully exit the engine's session.
+engine_exit_cmd() {
+    case "$1" in
+        claude) echo "/exit" ;;
+        cursor) echo "C-c" ;;
+        *) echo "/exit" ;;
+    esac
+}
+
+# Build context preamble for non-hook engines.
+# Writes full context (bead, role, task, output file) to a prompt file.
+# Returns the prompt file path via stdout.
+# Usage: engine_context_preamble <session_key> <worker> <engine>
+engine_context_preamble() {
+    local session_key="$1" wname="$2" engine="$3"
+
+    # Only needed for non-hook engines
+    engine_supports_hooks "$engine" && return 0
+
+    local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${wname}.json"
+    [[ -f "$hooked_file" ]] || return 1
+
+    local prompt_dir="$TW_DIR/prompts/${session_key}"
+    mkdir -p "$prompt_dir"
+    local prompt_file="$prompt_dir/${wname}.txt"
+
+    # Read hooked JSON fields
+    local _preamble_bead_id _preamble_wbead_id _preamble_role _preamble_output _preamble_task
+    eval "$(python3 -c "
+import json, shlex
+d = json.load(open('$hooked_file'))
+print(f'_preamble_bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
+print(f'_preamble_wbead_id={shlex.quote(d.get(\"worker_bead_id\", \"\"))}')
+print(f'_preamble_role={shlex.quote(d.get(\"role\", \"\"))}')
+print(f'_preamble_output={shlex.quote(d.get(\"output_file\", \"\"))}')
+print(f'_preamble_task={shlex.quote(d.get(\"current_task\", \"\"))}')
+" 2>/dev/null)"
+
+    # Build prompt file
+    > "$prompt_file"
+
+    # Feature context from bead
+    if [[ -n "$_preamble_bead_id" ]]; then
+        echo "## Feature context (bead $_preamble_bead_id)" >> "$prompt_file"
+        bd show "$_preamble_bead_id" 2>/dev/null >> "$prompt_file" || true
+        echo "" >> "$prompt_file"
+    fi
+
+    # Worker identity
+    if [[ -n "$_preamble_wbead_id" ]]; then
+        echo "## Your identity (worker bead $_preamble_wbead_id)" >> "$prompt_file"
+        bd show "$_preamble_wbead_id" 2>/dev/null >> "$prompt_file" || true
+        echo "" >> "$prompt_file"
+    fi
+
+    # Role
+    if [[ -n "$_preamble_role" ]] && [[ -f "$HOME/.claude/roles/${_preamble_role}.md" ]]; then
+        echo "## Your role" >> "$prompt_file"
+        cat "$HOME/.claude/roles/${_preamble_role}.md" >> "$prompt_file"
+        echo "" >> "$prompt_file"
+    fi
+
+    # Output file instructions
+    if [[ -n "$_preamble_output" ]]; then
+        cat >> "$prompt_file" <<PREAMBLE_OUTPUT
+## Output file
+
+Your output file for this session: $_preamble_output
+
+IMPORTANT: Write to your output file incrementally — append after each discrete
+subtask, not just at the end. The orchestrator polls this file to track your
+progress. If you only write at the end, you appear stuck/stalled.
+
+Pattern:
+  echo '## <subtask title>' >> $_preamble_output
+  echo '<what you did, what you found>' >> $_preamble_output
+PREAMBLE_OUTPUT
+    fi
+
+    # Current task
+    if [[ -n "$_preamble_task" ]]; then
+        cat >> "$prompt_file" <<PREAMBLE_TASK
+
+## CURRENT TASK (execute this immediately)
+
+$_preamble_task
+
+When complete, report results to your output file.
+PREAMBLE_TASK
+    fi
+
+    echo "$prompt_file"
+}
+
+# Look up the engine for a worker from sessions.json.
+# Falls back to "claude" if not set.
+worker_engine() {
+    local session_key="$1" wname="$2"
+    python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = d.get(sys.argv[2], {})
+w = s.get('workers', {}).get(sys.argv[3], {})
+print(w.get('engine', 'claude'))
+" "$HOME/.tiddly-winks/sessions.json" "$session_key" "$wname" 2>/dev/null || echo claude
+}
+
+# Resolve engine for a session — check .tw.yml, fall back to 'claude'
+resolve_engine() {
+    local engine="$1" config_file="${2:-}"
+    [[ -n "$engine" ]] && echo "$engine" && return
+    if [[ -n "$config_file" && -f "$config_file" ]]; then
+        yaml_get "$config_file" "engine" "claude"
+    else
+        echo "claude"
+    fi
+}
+
+# Track engine spawn for load-balancing visibility.
+# Increments counter at $TW_DIR/engine-usage/<engine>/<YYYY-MM-DD>.count
+engine_track_usage() {
+    local engine="$1"
+    local date_str
+    date_str=$(date +%Y-%m-%d)
+    local usage_dir="$TW_DIR/engine-usage/$engine"
+    mkdir -p "$usage_dir"
+    local count_file="$usage_dir/$date_str.count"
+    local current=0
+    [[ -f "$count_file" ]] && current=$(cat "$count_file")
+    echo $((current + 1)) > "$count_file"
+}
+
+# Returns engine usage summary for today (e.g. "claude=5 cursor=2")
+engine_usage_summary() {
+    local date_str
+    date_str=$(date +%Y-%m-%d)
+    local usage_dir="$TW_DIR/engine-usage"
+    local summary=""
+    if [[ -d "$usage_dir" ]]; then
+        for engine_dir in "$usage_dir"/*/; do
+            [[ -d "$engine_dir" ]] || continue
+            local engine
+            engine=$(basename "$engine_dir")
+            local count=0
+            local count_file="$engine_dir/$date_str.count"
+            [[ -f "$count_file" ]] && count=$(cat "$count_file")
+            summary+="$engine=$count "
+        done
+    fi
+    [[ -z "$summary" ]] && summary="no usage tracked yet"
+    echo "$summary"
+}
+
 # Capture pane output before killing/respawning a worker.
 # Saves the last 1000 lines to agents/<session>/<worker>-last-screen.txt
 capture_pane() {
@@ -801,13 +1035,14 @@ capture_pane() {
 }
 
 # Spawn a worker window and wire up hook-based context injection.
-# Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id]
+# Usage: spawn_worker <tmux_session> <session_key> <config_dir> <wname> <wrole> [bead_id] [worker_bead_id] [engine]
 spawn_worker() {
-    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}" worker_bead_id="${7:-}"
+    local tmux_session="$1" session_key="$2" config_dir="$3" wname="$4" wrole="$5" bead_id="${6:-}" worker_bead_id="${7:-}" engine="${8:-claude}"
 
-    # Spawn cap — refuse if too many Claude workers are already running
-    local active_workers
-    active_workers=$(pgrep -f "claude.*--dangerously-skip-permissions" 2>/dev/null | wc -l | tr -d ' ')
+    # Spawn cap — refuse if too many AI workers are already running
+    local active_workers _proc_pattern
+    _proc_pattern=$(engine_process_pattern "$engine")
+    active_workers=$(pgrep -f "$_proc_pattern" 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$active_workers" -ge "$TW_MAX_WORKERS" ]]; then
         log "Spawn cap reached: $active_workers active workers (max $TW_MAX_WORKERS). Refusing to spawn $wname."
         echo "  ⚡ Spawn cap: $active_workers/$TW_MAX_WORKERS workers running. Not spawning $wname." >&2
@@ -829,9 +1064,10 @@ with open(sys.argv[1], 'w') as f:
         'worker': sys.argv[3],
         'role': sys.argv[4],
         'output_file': sys.argv[5],
-        'worker_bead_id': sys.argv[6]
+        'worker_bead_id': sys.argv[6],
+        'engine': sys.argv[7]
     }, f, indent=2)
-" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id"
+" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id" "$engine"
 
     # Recover last task from worker bead and inject into hooked file
     # so the worker resumes with context even after respawn
@@ -866,8 +1102,15 @@ with open(f, 'w') as fh:
     tmux new-window -d -t "=$tmux_session" -n "$wname"
     tmux set-option -t "=$tmux_session:$wname" allow-rename off 2>/dev/null || true
     tmux set-option -t "=$tmux_session:$wname" remain-on-exit on 2>/dev/null || true
+    # For non-hook engines, build a context preamble file with bead/role/task info
+    local _prompt_file=""
+    if ! engine_supports_hooks "$engine"; then
+        _prompt_file=$(engine_context_preamble "$session_key" "$wname" "$engine" 2>/dev/null || true)
+    fi
+    local _engine_cmd
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file")
     tmux send-keys -t "=$tmux_session:$wname" \
-        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$wname'" Enter
+        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' $_engine_cmd" Enter
 
     # Auto-respawn hook: when pane dies, capture output, check crash count, and respawn
     # tmux calls this automatically — much faster than waiting for daemon patrol
@@ -875,16 +1118,18 @@ with open(f, 'w') as fh:
     tmux set-hook -t "=$tmux_session:$wname" pane-died \
         "run-shell 'mkdir -p \"$_respawn_dir\" && \
          tw pane-capture \"$tmux_session\" \"$session_key\" \"$wname\" && \
-         tw pane-respawn \"$tmux_session\" \"$session_key\" \"$wname\" \"$_respawn_dir\" \"$config_dir\" \"$wrole\"'" \
+         tw pane-respawn \"$tmux_session\" \"$session_key\" \"$wname\" \"$_respawn_dir\" \"$config_dir\" \"$wrole\" \"$engine\"'" \
         2>/dev/null || true
 
     # Queue an initial wake prompt — delivered on the worker's first turn.
-    # Safe to send-keys here because Claude hasn't started any tool calls yet.
-    # The delay gives Claude time to fully boot (load hooks, settings, auth).
+    # The delay gives the engine time to fully boot.
+    local _wake_delay _wake_prompt
+    _wake_delay=$(engine_wake_delay "$engine")
+    _wake_prompt=$(engine_wake_prompt "$engine")
     (
-        sleep 16
+        sleep "$_wake_delay"
         tmux send-keys -t "=$tmux_session:$wname" \
-            "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
+            "$_wake_prompt" Enter
     ) &
 
     # Clear any leftover signals from previous session
@@ -901,10 +1146,12 @@ with open(f, 'w') as fh:
     date +%s > "$spawn_ts_dir/$wname"
 
     if [[ -n "$wrole" ]]; then
-        log "Started worker: $wname (initial context: $wrole)"
+        log "Started worker: $wname (initial context: $wrole, engine: $engine)"
     else
-        log "Started worker: $wname"
+        log "Started worker: $wname (engine: $engine)"
     fi
+
+    engine_track_usage "$engine"
 }
 
 # Send the orchestrator seed to the god window once agents are known.
@@ -919,7 +1166,7 @@ seed_orchestrator() {
     local worker_lines=""
     while IFS= read -r wpair; do
         [[ -z "$wpair" ]] && continue
-        local wn="${wpair%%:*}" wr="${wpair##*:}"
+        local wn="${wpair%%:*}" _wr_rest="${wpair#*:}" wr="${_wr_rest%%:*}"
         if [[ -n "$wr" ]]; then
             worker_lines+="- $wn (context: $wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
         else
@@ -991,6 +1238,12 @@ After dispatching, check worker output files periodically. Don't wait for worker
 Workers may file new beads when they discover bugs or work items. Periodically check:
   bd list --status=open
 to see what workers have found. Triage and prioritize as needed.
+
+## Engine usage
+Today: $(engine_usage_summary)
+Available engines: claude, cursor
+Workers default to the engine in .tw.yml (or claude if not set).
+Check usage: tw engine-stats
 
 ## Creating sub-beads (IMPORTANT)
 When decomposing work into sub-beads, ALWAYS include --description with the full
@@ -1345,7 +1598,7 @@ worker_wake() {
     local bead_id="${6:-}" worker_bead_id="${7:-}"
 
     # Only wake workers that are idle
-    if ! worker_is_idle "$tmux_session" "$wname"; then
+    if ! worker_is_idle "$tmux_session" "$wname" "$session_key"; then
         return 1
     fi
 
@@ -2096,9 +2349,11 @@ for name, info in svcs.items():
     fi
 
     # Start tmux session for this feature
-    # Window 0 is "god" (orchestrator) — created with the session so it's always index 0
+    # Window 0 is "god" (orchestrator) — always claude engine
     tmux new-session -d -s "$tmux_session" -n "god"
-    tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+    local _god_cmd
+    _god_cmd=$(engine_spawn_cmd "claude" "$feature")
+    tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' $_god_cmd" Enter
 
     # Apply project color theme to tmux session
     session_apply_theme "$tmux_session" "$project" "$feature" "$session_key"
@@ -2246,11 +2501,13 @@ with open(sys.argv[1], 'w') as f:
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
-        local wrole="${wpair##*:}"
+        local _wrest="${wpair#*:}"; local wrole="${_wrest%%:*}"
+        local wengine="${wpair##*:}"
+        wengine=$(resolve_engine "$wengine" "$effective_config")
         local worker_bead_id
         worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
         spawn_worker "$tmux_session" "$session_key" "$config_dir" \
-            "$wname" "$wrole" "$bead_id" "$worker_bead_id" || {
+            "$wname" "$wrole" "$bead_id" "$worker_bead_id" "$wengine" || {
             log "Worker $wname spawn failed (non-fatal, session continues)"
         }
         workers_str+="$wpair"$'\n'
@@ -2393,7 +2650,7 @@ EOF
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}"
-            local wrole="${wpair##*:}"
+            local _wr2="${wpair#*:}"; local wrole="${_wr2%%:*}"
             if [[ -n "$wrole" ]]; then
                 echo "    $wname  (context: $wrole)"
             else
@@ -2863,6 +3120,16 @@ else:
                             print(f"      {var}={val}")
         except Exception:
             pass
+
+    # Show worker engines (only when non-default engines are in use)
+    workers_data = s.get('workers', {})
+    has_non_default = any(w.get('engine', 'claude') != 'claude' for w in workers_data.values()) if workers_data else False
+    if has_non_default:
+        print()
+        print("  Engines:")
+        for wname, winfo in workers_data.items():
+            engine = winfo.get('engine', 'claude')
+            print(f"    {wname:<20} {engine}")
     print()
 EOF
 }
@@ -3355,7 +3622,9 @@ cmd_claude() {
     if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
         log "Creating god window in $tmux_session"
         tmux new-window -d -t "=$tmux_session" -n "$claude_window"
-        tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' claude --dangerously-skip-permissions --name '$feature'" Enter
+        local _god_cmd
+        _god_cmd=$(engine_spawn_cmd "claude" "$feature")
+        tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' $_god_cmd" Enter
     fi
 
     # Build context block for pasting as first Claude message
@@ -3806,6 +4075,32 @@ nudge_drain() {
     done
 }
 
+# Drain the oldest non-expired nudge for a worker. Returns content and removes the file.
+# Usage: nudge_drain_one <session_key> <worker>
+nudge_drain_one() {
+    local session_key="$1" worker="$2"
+    local dir
+    dir="$(nudge_dir "$session_key" "$worker")"
+    [[ -d "$dir" ]] || return 0
+    local now
+    now=$(date +%s)
+    for msg_file in "$dir"/*.msg; do
+        [[ -f "$msg_file" ]] || continue
+        local base ts ttl expiry
+        base=$(basename "$msg_file" .msg)
+        ts="${base%%-*}"
+        ttl="${base##*-}"
+        expiry=$((ts + ttl * 60))
+        if [[ "$now" -gt "$expiry" ]]; then
+            rm -f "$msg_file"
+            continue
+        fi
+        cat "$msg_file"
+        rm -f "$msg_file"
+        return 0
+    done
+}
+
 # ─── Mail System (beads-backed persistent messaging) ─────────────────────────
 
 cmd_mail() {
@@ -3981,11 +4276,12 @@ cmd_nudge() {
 }
 
 cmd_send() {
-    local feature="" worker="" task="" urgent=0
+    local feature="" worker="" task="" urgent=0 requested_engine=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --urgent) urgent=1; shift ;;
+            --engine) requested_engine="$2"; shift 2 ;;
             -*) die "Unknown option: $1" ;;
             *)
                 if [[ -z "$feature" ]]; then feature="$1"
@@ -3998,7 +4294,7 @@ cmd_send() {
 
     task="${task# }"
     [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
-        && die 'Usage: tw send <feature> <worker> "<task>" [--urgent]'
+        && die 'Usage: tw send <feature> <worker> "<task>" [--urgent] [--engine <name>]'
 
     local session_key project config_dir tmux_session bead_id
     resolve_session "$feature"
@@ -4090,38 +4386,113 @@ with open(f, 'w') as fh:
         fi
     fi
 
-    # Check auth state before attempting wake
-    local target="=$tmux_session:$worker"
-    if worker_is_not_logged_in "$tmux_session" "$worker"; then
-        log "WARNING: $worker is not logged in — sending /login first"
-        send_to_pane "$target" "/login"
-        # Wait for login to complete before sending the actual task
-        sleep 3
+    # ─── Engine-aware task delivery ───────────────────────────────────────────
+    local _send_engine
+    _send_engine=$(worker_engine "$session_key" "$worker")
+
+    # --engine flag: switch engine if requested
+    if [[ -n "$requested_engine" && "$requested_engine" != "$_send_engine" ]]; then
+        _send_engine="$requested_engine"
+        python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+s = d.setdefault(sys.argv[2], {})
+w = s.setdefault('workers', {})
+we = w.setdefault(sys.argv[3], {})
+we['engine'] = sys.argv[4]
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$HOME/.tiddly-winks/sessions.json" "$session_key" "$worker" "$_send_engine" 2>/dev/null || true
+        if [[ -f "$hooked_file" ]]; then
+            python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+d['engine'] = sys.argv[2]
+with open(sys.argv[1], 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$hooked_file" "$_send_engine" 2>/dev/null || true
+        fi
+        log "Switched $worker engine to $_send_engine"
     fi
 
-    # Wait for the worker to be idle before sending, so we don't inject text
-    # mid-output or mid-tool-call. If it doesn't become idle in time, send anyway
-    # (queued nudge will be picked up on next prompt turn regardless).
-    local wake_msg="You have a new task from the orchestrator. Check your additional context and execute it now."
+    if engine_supports_hooks "$_send_engine"; then
+        # ── Hook-based engines (claude): nudge + wake via send_to_pane ──
+        local target="=$tmux_session:$worker"
+        if worker_is_not_logged_in "$tmux_session" "$worker" "$session_key"; then
+            log "WARNING: $worker is not logged in — sending /login first"
+            send_to_pane "$target" "/login"
+            sleep 3
+        fi
 
-    if wait_for_idle "$tmux_session" "$worker" 15; then
-        send_to_pane "$target" "$wake_msg"
-        log "Delivered wake to $worker (idle detected)"
+        local wake_msg="You have a new task from the orchestrator. Check your additional context and execute it now."
+        if wait_for_idle "$tmux_session" "$worker" 15; then
+            send_to_pane "$target" "$wake_msg"
+            log "Delivered wake to $worker (idle detected)"
+        else
+            send_to_pane "$target" "$wake_msg"
+            log "Delivered wake to $worker (busy, best-effort)"
+        fi
+
+        local urgency_label=""
+        [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
+        if [[ -n "$task_bead_id" ]]; then
+            echo "  Task bead created: $task_bead_id (assigned to $worker)"
+        fi
+        echo "  Nudge queued for $worker${urgency_label}: $task"
+        echo "  Will be injected on next prompt turn via tw-mail-check hook."
     else
-        # Worker is busy — send anyway. The nudge file is already queued and will
-        # be drained on the next UserPromptSubmit hook. The typed text may land
-        # awkwardly but Claude will still process it on the next turn.
-        send_to_pane "$target" "$wake_msg"
-        log "Delivered wake to $worker (busy, best-effort)"
-    fi
+        # ── Non-hook engines (cursor, codex): respawn with task baked in ──
+        local _state
+        _state=$(worker_state "$tmux_session" "$worker" "$(agents_dir "$session_key")" "$session_key")
 
-    local urgency_label=""
-    [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
-    if [[ -n "$task_bead_id" ]]; then
-        echo "  Task bead created: $task_bead_id (assigned to $worker)"
+        if [[ "$_state" == "working" ]]; then
+            log "Non-hook worker $worker is busy — task queued for respawn on completion"
+            echo "  Task queued for $worker (busy, will respawn with task on completion)"
+        else
+            log "Respawning non-hook worker $worker with new task"
+
+            if [[ "$_state" != "dead" ]]; then
+                local _exit_cmd
+                _exit_cmd=$(engine_exit_cmd "$_send_engine")
+                tmux send-keys -t "=$tmux_session:$worker" "$_exit_cmd" Enter 2>/dev/null || true
+                sleep 2
+                if worker_is_alive "$tmux_session" "$worker" "$session_key"; then
+                    tmux send-keys -t "=$tmux_session:$worker" C-c 2>/dev/null || true
+                    sleep 1
+                fi
+            fi
+
+            while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$worker"; do
+                tmux kill-window -t "=$tmux_session:$worker" 2>/dev/null || break
+            done
+
+            local _wrole=""
+            if [[ -f "$hooked_file" ]]; then
+                _wrole=$(python3 -c "
+import json
+try: print(json.load(open('$hooked_file')).get('role', ''))
+except: pass
+" 2>/dev/null)
+            fi
+            local _worker_bead_id
+            _worker_bead_id=$(worker_bead_find_or_create "$worker" "$project" "$config_dir" 2>/dev/null || echo "")
+            local _bead_id
+            _bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+            spawn_worker "$tmux_session" "$session_key" "$config_dir" \
+                "$worker" "$_wrole" "$_bead_id" "$_worker_bead_id" "$_send_engine" || {
+                log "FAIL: could not respawn $worker with new task"
+            }
+
+            breaker_reset "$session_key" "$worker" 2>/dev/null || true
+
+            if [[ -n "$task_bead_id" ]]; then
+                echo "  Task bead created: $task_bead_id (assigned to $worker)"
+            fi
+            echo "  Respawned $worker ($_send_engine) with task: $task"
+        fi
     fi
-    echo "  Nudge queued for $worker${urgency_label}: $task"
-    echo "  Will be injected on next prompt turn via tw-mail-check hook."
 }
 
 cmd_tasks() {
@@ -4221,31 +4592,38 @@ Supported signals: done, clear"
     esac
 }
 
-# Check if a Claude worker is idle at the prompt (ready to receive input).
-# Inspects the tmux pane's visible content for Claude Code's prompt indicator.
+# Check if a worker is idle at the prompt (ready to receive input).
+# Inspects the tmux pane's visible content for engine-specific prompt indicators.
 # Returns 0 if idle, 1 if busy/unknown.
+# Optional 3rd arg: session_key (for engine lookup).
 worker_is_idle() {
-    local tmux_session="$1" wname="$2"
+    local tmux_session="$1" wname="$2" session_key="${3:-$tmux_session}"
 
     # Capture last 5 lines of the pane
     local pane_text
     pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p -S -5 2>/dev/null) || return 1
 
-    # Not logged in is not idle — it's a broken state (check status bar only)
-    if echo "$pane_text" | tail -3 | grep -q "Not logged in"; then
+    local engine
+    engine=$(worker_engine "$session_key" "$wname")
+
+    # Not logged in is not idle — it's a broken state
+    local not_logged_in_pat
+    not_logged_in_pat=$(engine_not_logged_in_pattern "$engine")
+    if echo "$pane_text" | tail -3 | grep -qE "$not_logged_in_pat"; then
         return 1
     fi
 
-    # Claude Code shows "esc to interrupt" in the status bar when busy with a tool call.
-    if echo "$pane_text" | grep -q "esc to interrupt"; then
+    # Check if engine is busy (actively running tools)
+    local busy_pat
+    busy_pat=$(engine_busy_pattern "$engine")
+    if echo "$pane_text" | grep -qE "$busy_pat"; then
         return 1  # busy
     fi
 
-    # Idle indicators (any of these mean the worker is at the prompt):
-    # - "❯" (U+276F) prompt character
-    # - Status bar with "bypass permissions" or "hold Space to speak"
-    # - "Sautéed for" idle timer
-    if echo "$pane_text" | grep -qE '❯|bypass permissions|hold Space to speak|Sautéed for'; then
+    # Check for idle indicators
+    local idle_pat
+    idle_pat=$(engine_idle_pattern "$engine")
+    if echo "$pane_text" | grep -qE "$idle_pat"; then
         return 0  # idle at prompt
     fi
 
@@ -4254,12 +4632,17 @@ worker_is_idle() {
 
 # Check if a worker's Claude session is not logged in.
 # Returns 0 if not logged in, 1 otherwise.
-# Checks the bottom 3 visible lines of the pane (status bar area).
+# Checks the bottom 3 visible lines of the pane for engine-specific auth failure patterns.
+# Optional 3rd arg: session_key (for engine lookup).
 worker_is_not_logged_in() {
-    local tmux_session="$1" wname="$2"
+    local tmux_session="$1" wname="$2" session_key="${3:-$tmux_session}"
     local pane_text
     pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p 2>/dev/null) || return 1
-    echo "$pane_text" | tail -3 | grep -q "Not logged in"
+    local engine
+    engine=$(worker_engine "$session_key" "$wname")
+    local pattern
+    pattern=$(engine_not_logged_in_pattern "$engine")
+    echo "$pane_text" | tail -3 | grep -qE "$pattern"
 }
 
 # Wait for a worker to become idle, with timeout.
@@ -4381,16 +4764,19 @@ print(t, end='')
     rmdir "$lock_path" 2>/dev/null
 }
 
-# Check if a worker window has a live Claude process (not just a bare shell).
+# Check if a worker window has a live engine process (not just a bare shell).
 # Returns 0 if alive, 1 if dead/missing.
+# Optional 3rd arg: session_key (for engine lookup). Falls back to tmux_session.
 worker_is_alive() {
-    local tmux_session="$1" wname="$2"
-    # Get the pane PID for this window, then check if claude/node is in its process tree
+    local tmux_session="$1" wname="$2" session_key="${3:-$tmux_session}"
     local pane_pid
     pane_pid=$(tmux list-panes -t "=$tmux_session:$wname" -F "#{pane_pid}" 2>/dev/null | head -1)
     [[ -z "$pane_pid" ]] && return 1
-    # Check if any child of the pane shell is a claude/node process
-    pgrep -P "$pane_pid" -f "claude" >/dev/null 2>&1
+    local engine
+    engine=$(worker_engine "$session_key" "$wname")
+    local pattern
+    pattern=$(engine_process_pattern "$engine")
+    pgrep -P "$pane_pid" -f "$pattern" >/dev/null 2>&1
 }
 
 # Determine worker state: working, idle, stalled, done, or dead.
@@ -4404,13 +4790,13 @@ worker_state() {
         echo "dead"; return
     fi
 
-    # 2. Check if Claude process is alive
-    if ! worker_is_alive "$tmux_session" "$wname"; then
+    # 2. Check if engine process is alive
+    if ! worker_is_alive "$tmux_session" "$wname" "$session_key"; then
         echo "dead"; return
     fi
 
     # 2.5. Check if worker is not logged in
-    if worker_is_not_logged_in "$tmux_session" "$wname"; then
+    if worker_is_not_logged_in "$tmux_session" "$wname" "$session_key"; then
         echo "not-logged-in"; return
     fi
 
@@ -4433,7 +4819,7 @@ worker_state() {
     fi
 
     # 5. Check if idle at prompt
-    if worker_is_idle "$tmux_session" "$wname"; then
+    if worker_is_idle "$tmux_session" "$wname" "$session_key"; then
         echo "idle"; return
     fi
 
@@ -4495,12 +4881,18 @@ $output_content" 2>/dev/null || log "Warning: could not append to worker bead $w
         fi
     fi
 
-    # 2. Kill the Claude process in the worker window (send /exit)
-    tmux send-keys -t "=$tmux_session:$worker" "/exit" Enter
+    # Resolve engine for this worker
+    local engine
+    engine=$(worker_engine "$session_key" "$worker")
+
+    # 2. Kill the engine process in the worker window
+    local _exit_cmd
+    _exit_cmd=$(engine_exit_cmd "$engine")
+    tmux send-keys -t "=$tmux_session:$worker" "$_exit_cmd" Enter
     sleep 2
 
-    # 3. If Claude is still running, force-kill the pane and recreate
-    if worker_is_alive "$tmux_session" "$worker"; then
+    # 3. If engine is still running, force-kill
+    if worker_is_alive "$tmux_session" "$worker" "$session_key"; then
         tmux send-keys -t "=$tmux_session:$worker" C-c
         sleep 1
     fi
@@ -4516,7 +4908,7 @@ except: pass
 " 2>/dev/null)
     fi
 
-    # 5. Respawn Claude in the same window
+    # 5. Respawn engine in the same window
     local bead_id
     bead_id=$(sessions_get_key "$session_key" "bead_id")
     [[ -z "$worker_bead_id" ]] && worker_bead_id=$(worker_bead_find_or_create "$worker" "$project" "$config_dir")
@@ -4532,12 +4924,19 @@ with open(sys.argv[1], 'w') as f:
         'worker': sys.argv[3],
         'role': sys.argv[4],
         'output_file': sys.argv[5],
-        'worker_bead_id': sys.argv[6]
+        'worker_bead_id': sys.argv[6],
+        'engine': sys.argv[7]
     }, f, indent=2)
-" "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id"
+" "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id" "$engine"
 
+    local _prompt_file=""
+    if ! engine_supports_hooks "$engine"; then
+        _prompt_file=$(engine_context_preamble "$session_key" "$worker" "$engine" 2>/dev/null || true)
+    fi
+    local _engine_cmd
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$worker" "$_prompt_file")
     tmux send-keys -t "=$tmux_session:$worker" \
-        "TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$worker'" Enter
+        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' $_engine_cmd" Enter
 
     # Voluntary handoff = healthy worker — reset circuit breaker
     breaker_reset "$session_key" "$worker"
@@ -4666,7 +5065,7 @@ cmd_patrol() {
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
-        local wrole="${wpair##*:}"
+        local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
         local state output_age="-"
 
         state=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
@@ -4767,14 +5166,18 @@ for name, info in s.items():
             if breaker_check_and_record "$session_key" "$w"; then
                 # Breaker OK — respawn this worker
                 echo "      Respawning: $w"
-                local wrole=""
+                local wrole="" wengine=""
                 for wp in "${worker_pairs[@]}"; do
-                    [[ "${wp%%:*}" == "$w" ]] && wrole="${wp##*:}" && break
+                    if [[ "${wp%%:*}" == "$w" ]]; then
+                        local _wpr="${wp#*:}"; wrole="${_wpr%%:*}"; wengine="${wp##*:}"
+                        break
+                    fi
                 done
+                wengine=$(resolve_engine "$wengine" "$config_file")
                 # wrole may be empty for generic workers — that's fine
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$w" "$project" "$config_dir" 2>/dev/null || echo "")
-                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$w" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null \
+                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$w" "$wrole" "$bead_id" "$worker_bead_id" "$wengine" 2>/dev/null \
                     && { echo "      ✓ $w respawned"; cv_record_respawn "$project" "$w" "$feature" 2>/dev/null || true; } \
                     || echo "      ✗ $w respawn failed"
             else
@@ -5043,10 +5446,11 @@ cmd_feed() {
 }
 
 cmd_spawn() {
-    local feature="" name="" role=""
+    local feature="" name="" role="" spawn_engine=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --engine) spawn_engine="$2"; shift 2 ;;
             -*) die "Unknown option: $1" ;;
             *)
                 if [[ -z "$feature" ]]; then feature="$1"
@@ -5059,7 +5463,7 @@ cmd_spawn() {
     done
 
     [[ -z "$feature" || -z "$name" ]] \
-        && die "Usage: tw spawn <feature> <name> [<role>]"
+        && die "Usage: tw spawn <feature> <name> [<role>] [--engine <name>]"
 
     local session_key project config_dir tmux_session bead_id
     resolve_session "$feature"
@@ -5088,8 +5492,13 @@ cmd_spawn() {
     local worker_bead_id
     worker_bead_id=$(worker_bead_find_or_create "$name" "$project" "$config_dir")
 
+    # Resolve engine: --engine flag > .tw.yml > 'claude'
+    local config_file="$config_dir/.tw.yml"
+    local engine
+    engine=$(resolve_engine "$spawn_engine" "$config_file")
+
     # Spawn the worker
-    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$name" "$role" "$bead_id" "$worker_bead_id"
+    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$name" "$role" "$bead_id" "$worker_bead_id" "$engine"
 
     # Persist to session state
     sessions_add_dynamic_worker "$session_key" "$name" "$role"
@@ -5097,11 +5506,28 @@ cmd_spawn() {
     # Sync metadata to bead
     bead_sync_metadata "$session_key" "$bead_id" "$config_dir"
 
+    # Persist engine to sessions.json workers entry (non-default only)
+    if [[ "$engine" != "claude" ]]; then
+        python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+s = d.setdefault(sys.argv[2], {})
+w = s.setdefault('workers', {})
+we = w.setdefault(sys.argv[3], {})
+we['engine'] = sys.argv[4]
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$HOME/.tiddly-winks/sessions.json" "$session_key" "$name" "$engine" 2>/dev/null || true
+    fi
+
     echo ""
+    local _engine_label=""
+    [[ "$engine" != "claude" ]] && _engine_label=" [engine: $engine]"
     if [[ -n "$role" ]]; then
-        echo "  Spawned worker: $name (initial context: $role)"
+        echo "  Spawned worker: $name (initial context: $role)${_engine_label}"
     else
-        echo "  Spawned worker: $name"
+        echo "  Spawned worker: $name${_engine_label}"
     fi
     echo "  Send work:  tw send $feature $name \"<task>\""
     echo "  Health:     tw workers $feature --health"
@@ -5159,14 +5585,15 @@ cmd_workers() {
     if [[ $health_flag -eq 1 ]]; then
         local agents_path
         agents_path="$(agents_dir "$session_key")"
-        # Collect worker status lines as "name:role:status"
+        # Collect worker status lines as "name:role:status:engine"
         local health_lines=()
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
-            local wname="${wpair%%:*}" wrole="${wpair##*:}"
-            local status
+            local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
+            local status wengine
             status=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
-            health_lines+=("${wname}:${wrole}:${status}")
+            wengine=$(worker_engine "$session_key" "$wname")
+            health_lines+=("${wname}:${wrole}:${status}:${wengine}")
         done
 
         if [[ $json_flag -eq 1 ]]; then
@@ -5177,20 +5604,22 @@ for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
-    parts = line.split(':', 2)
-    rows.append({'name': parts[0], 'role': parts[1], 'status': parts[2], 'window': parts[0]})
+    parts = line.split(':', 3)
+    rows.append({'name': parts[0], 'role': parts[1], 'status': parts[2], 'engine': parts[3] if len(parts) > 3 else 'claude', 'window': parts[0]})
 print(json.dumps(rows, indent=2))
 "
         else
             echo ""
-            printf "  %-20s %-12s %s\n" "WORKER" "STATUS" "CONTEXT"
-            printf "  %-20s %-12s %s\n" "--------------------" "------------" "--------------------"
+            printf "  %-20s %-10s %-12s %s\n" "WORKER" "ENGINE" "STATUS" "CONTEXT"
+            printf "  %-20s %-10s %-12s %s\n" "--------------------" "----------" "------------" "--------------------"
             for hline in "${health_lines[@]}"; do
                 local wname="${hline%%:*}"
                 local rest="${hline#*:}"
                 local wrole="${rest%%:*}"
-                local status="${rest##*:}"
-                printf "  %-20s %-12s %s\n" "$wname" "$status" "${wrole:--}"
+                rest="${rest#*:}"
+                local status="${rest%%:*}"
+                local wengine="${rest##*:}"
+                printf "  %-20s %-10s %-12s %s\n" "$wname" "$wengine" "$status" "${wrole:--}"
             done
             echo ""
         fi
@@ -5216,10 +5645,12 @@ print(json.dumps(rows, indent=2))
         local respawned=0 alive=0 blocked=0
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
-            local wname="${wpair%%:*}" wrole="${wpair##*:}"
+            local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
+            local wengine="${wpair##*:}"
+            wengine=$(resolve_engine "$wengine" "$config_file")
 
             if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
-                if worker_is_alive "$tmux_session" "$wname"; then
+                if worker_is_alive "$tmux_session" "$wname" "$session_key"; then
                     (( alive++ )) || true
                     continue
                 fi
@@ -5235,7 +5666,7 @@ print(json.dumps(rows, indent=2))
             if breaker_check_and_record "$session_key" "$wname"; then
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
-                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
+                spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" "$wengine"
                 (( respawned++ )) || true
             else
                 echo "  ⚡ $wname: circuit breaker tripped (use --force to override)"
@@ -5254,7 +5685,9 @@ print(json.dumps(rows, indent=2))
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
-        local wrole="${wpair##*:}"
+        local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
+        local wengine="${wpair##*:}"
+        wengine=$(resolve_engine "$wengine" "$config_file")
 
         # Skip if window already exists
         if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
@@ -5266,7 +5699,7 @@ print(json.dumps(rows, indent=2))
 
         local worker_bead_id
         worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
-        spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id"
+        spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" "$wengine"
         (( spawned++ )) || true
     done
 
@@ -5605,6 +6038,54 @@ for key, session in data.items():
     else
         echo "unmanaged (no tw session owns port $port)"
     fi
+}
+
+# ─── Engine Stats ─────────────────────────────────────────────────────────────
+
+cmd_engine_stats() {
+    local days=7
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    echo ""
+    echo "  Engine usage (last $days days):"
+    echo "  ─────────────────────────────────────────"
+
+    local usage_dir="$TW_DIR/engine-usage"
+    [[ -d "$usage_dir" ]] || { echo "  No usage data yet."; return 0; }
+
+    local found=0
+    for engine_dir in "$usage_dir"/*/; do
+        [[ -d "$engine_dir" ]] || continue
+        found=1
+        local engine
+        engine=$(basename "$engine_dir")
+        local total=0
+        local today_count=0
+        local today
+        today=$(date +%Y-%m-%d)
+
+        for i in $(seq 0 $((days - 1))); do
+            local d
+            d=$(date -v-${i}d +%Y-%m-%d 2>/dev/null || date -d "-$i days" +%Y-%m-%d)
+            local cf="$engine_dir/$d.count"
+            if [[ -f "$cf" ]]; then
+                local c
+                c=$(cat "$cf")
+                total=$((total + c))
+                [[ "$d" == "$today" ]] && today_count=$c
+            fi
+        done
+
+        printf "  %-12s today: %3d  |  %d-day total: %3d\n" "$engine" "$today_count" "$days" "$total"
+    done
+
+    [[ $found -eq 0 ]] && echo "  No usage data yet."
+    echo ""
 }
 
 # ─── Doctor ───────────────────────────────────────────────────────────────────
@@ -6314,7 +6795,9 @@ print(json.dumps(data, indent=2))
 
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
-            local wname="${wpair%%:*}" wrole="${wpair##*:}"
+            local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
+            local wengine="${wpair##*:}"
+            wengine=$(resolve_engine "$wengine" "$effective_config")
             local is_dead=0
             local worker_status="alive"
             local output_mtime=0
@@ -6326,9 +6809,9 @@ print(json.dumps(data, indent=2))
             fi
 
             if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
-                if worker_is_alive "$tmux_session" "$wname"; then
+                if worker_is_alive "$tmux_session" "$wname" "$session_key"; then
                     # Check if worker needs login — auto-send /login
-                    if worker_is_not_logged_in "$tmux_session" "$wname"; then
+                    if worker_is_not_logged_in "$tmux_session" "$wname" "$session_key"; then
                         worker_status="not-logged-in"
                         _daemon_log "WARN: $session_key/$wname not logged in — sending /login"
                         send_to_pane "=$tmux_session:$wname" "/login" 2>/dev/null || true
@@ -6401,7 +6884,7 @@ print(json.dumps(data, indent=2))
                     done
                     local worker_bead_id
                     worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir" 2>/dev/null || echo "")
-                    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" 2>/dev/null || {
+                    spawn_worker "$tmux_session" "$session_key" "$config_dir" "$wname" "$wrole" "$bead_id" "$worker_bead_id" "$wengine" 2>/dev/null || {
                         _daemon_log "FAIL: could not respawn $session_key/$wname"
                     }
                 fi
@@ -6651,7 +7134,7 @@ cmd_pane_capture() {
 
 # Called by tmux pane-died hook — respawn with rapid-fire safety
 cmd_pane_respawn() {
-    local tmux_session="$1" session_key="$2" wname="$3" respawn_dir="$4" config_dir="$5" wrole="${6:-}"
+    local tmux_session="$1" session_key="$2" wname="$3" respawn_dir="$4" config_dir="$5" wrole="${6:-}" engine="${7:-claude}"
 
     # Rapid respawn tracking: count respawns within 5-minute windows
     local ts_file="$respawn_dir/${wname}.timestamps"
@@ -6681,17 +7164,61 @@ cmd_pane_respawn() {
         return 0
     fi
 
+    # For non-hook engines: check for queued tasks before respawning.
+    # If no pending task, leave the pane dead to save resources.
+    if ! engine_supports_hooks "$engine"; then
+        local _next_task
+        _next_task=$(nudge_drain_one "$session_key" "$wname")
+        if [[ -z "$_next_task" ]]; then
+            # Also check hooked JSON for a current_task that hasn't been started
+            local _hooked_task=""
+            local _hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${wname}.json"
+            if [[ -f "$_hooked_file" ]]; then
+                _hooked_task=$(python3 -c "
+import json
+try: print(json.load(open('$_hooked_file')).get('current_task', ''))
+except: pass
+" 2>/dev/null)
+            fi
+            if [[ -z "$_hooked_task" ]]; then
+                _daemon_log "Non-hook worker $wname exited with no pending tasks — leaving dead" 2>/dev/null || true
+                return 0
+            fi
+        else
+            # Inject the drained task into hooked JSON so the worker boots with it
+            local _hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${wname}.json"
+            if [[ -f "$_hooked_file" ]]; then
+                python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+d['current_task'] = sys.argv[2]
+with open(sys.argv[1], 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$_hooked_file" "$_next_task" 2>/dev/null || true
+            fi
+        fi
+    fi
+
     # Safe to respawn — use tmux respawn-pane (re-uses same window)
     sleep 3
+    local _prompt_file=""
+    if ! engine_supports_hooks "$engine"; then
+        _prompt_file=$(engine_context_preamble "$session_key" "$wname" "$engine" 2>/dev/null || true)
+    fi
+    local _engine_cmd
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file")
     tmux respawn-pane -t "=$tmux_session:$wname" \
-        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' claude --dangerously-skip-permissions --name '$wname'" \
+        "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' $_engine_cmd" \
         2>/dev/null || true
 
-    # Queue wake prompt
+    # Queue wake prompt with engine-appropriate delay and text
+    local _wake_delay _wake_prompt
+    _wake_delay=$(engine_wake_delay "$engine")
+    _wake_prompt=$(engine_wake_prompt "$engine")
     (
-        sleep 16
+        sleep "$_wake_delay"
         tmux send-keys -t "=$tmux_session:$wname" \
-            "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." Enter
+            "$_wake_prompt" Enter
     ) &
 }
 
@@ -7183,6 +7710,7 @@ case "$subcommand" in
     port-owner) cmd_port_owner "$@" ;;
     pane-id)    cmd_pane_id "$@" ;;
     doctor)  cmd_doctor "$@" ;;
+    engine-stats) cmd_engine_stats "$@" ;;
     mail)    cmd_mail "$@" ;;
     nudge)   cmd_nudge "$@" ;;
     pane-capture)  cmd_pane_capture "$@" ;;
