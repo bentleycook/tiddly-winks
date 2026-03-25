@@ -1248,11 +1248,22 @@ Workers may file new beads when they discover bugs or work items. Periodically c
   bd list --status=open
 to see what workers have found. Triage and prioritize as needed.
 
-## Engine usage
-Today: $(engine_usage_summary)
+## Engine routing (spread load across subscriptions)
+Usage today: $(engine_usage_summary)
 Available engines: claude, cursor
-Workers default to the engine in .tw.yml (or claude if not set).
-Check usage: tw engine-stats
+Check full stats: tw engine-stats
+
+Override engine per task:
+  tw send $feature <worker> --engine cursor \"<task>\"
+  tw spawn $feature <name> --engine cursor
+Non-claude workers get respawned with each new task (no mid-session hooks).
+
+**When to use which engine:**
+- **claude**: orchestration, debugging, investigation, PR review, anything needing strong reasoning
+- **cursor**: refactoring, mechanical edits, test writing, code generation — good for spreading load
+
+**Goal: spread usage across subscriptions.** If claude usage is high today, prefer cursor for
+the next mechanical task. Don't overthink it — any worker can handle any task on any engine.
 
 ## Creating sub-beads (IMPORTANT)
 When decomposing work into sub-beads, ALWAYS include --description with the full
