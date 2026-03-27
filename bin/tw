@@ -166,6 +166,25 @@ except Exception:
 EOF
 }
 
+# Get review entries as "r-name:prompt_path:engine\n..." triples from reviews: section
+yaml_review_entries() {
+    local file="$1"
+    python3 - "$file" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1]))
+    reviews = d.get('reviews', None)
+    default_engine = d.get('engine', '')
+    if isinstance(reviews, dict):
+        for name, info in reviews.items():
+            prompt = (info or {}).get('prompt', '') if isinstance(info, dict) else ''
+            engine = (info or {}).get('engine', default_engine) if isinstance(info, dict) else default_engine
+            print(f"r-{name}:{prompt}:{engine}")
+except Exception:
+    pass
+EOF
+}
+
 # Get proxy map as "subdomain:service\n..." pairs
 yaml_proxy_pairs() {
     local file="$1"
@@ -1175,7 +1194,8 @@ seed_orchestrator() {
     local worker_lines=""
     while IFS= read -r wpair; do
         [[ -z "$wpair" ]] && continue
-        local wn="${wpair%%:*}" _wr_rest="${wpair#*:}" wr="${_wr_rest%%:*}"
+        local wn="${wpair%%:*}" _wr_rest="${wpair#*:}"
+        local wr="${_wr_rest%%:*}"
         if [[ -n "$wr" ]]; then
             worker_lines+="- $wn (context: $wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
         else
@@ -1225,6 +1245,12 @@ If all workers are busy, spawn more:
 Workers are generic slots — no role required. If you want to give initial context from a role file:
   tw spawn $feature <name> <role>
 Available roles: $(ls "$HOME/.claude/roles/" 2>/dev/null | sed 's/\.md$//' | tr '\n' ', ' | sed 's/, $//')
+
+## PR Review
+Spawn specialized, workspace-tailored reviewers for a PR:
+  tw review $feature <pr-number>
+This reads the reviews: config from .tw.yml and spawns one focused reviewer per configured specialty. Each reviewer posts a separate --comment review tagged with their perspective (e.g. **[Backend]**, **[Schema]**). Reviewers are idempotent — re-running skips already-running reviewers and re-sends the task.
+To set up review profiles for a new workspace: tw review init
 
 ## Monitoring worker progress
 Workers write to their output files incrementally. Poll progress:
@@ -1961,17 +1987,15 @@ for key, s in list(data.items()):
             missing.append(svc)
 
     if missing and len(missing) == len(worktrees):
-        # All worktrees gone — check if tmux session also dead
+        # All worktrees gone — clear stale paths but keep the session entry.
+        # The session record (bead, branch, ports) is needed for tw start to resume.
+        data[key]['worktrees'] = {}
         session_name = key
         r = subprocess.run(['tmux', 'has-session', '-t', session_name],
                            capture_output=True)
         if r.returncode != 0:
-            # Both worktrees and tmux gone — remove stale entry
-            del data[key]
-            print(f"RECONCILE:removed:{key}:all worktrees missing + no tmux", file=sys.stderr)
+            print(f"RECONCILE:cleared_worktrees:{key}:all worktrees missing + no tmux (session kept for resume)", file=sys.stderr)
         else:
-            # tmux alive but worktrees gone — clear worktree refs
-            data[key]['worktrees'] = {}
             print(f"RECONCILE:cleared_worktrees:{key}:worktrees missing but tmux alive", file=sys.stderr)
     elif missing:
         # Some worktrees missing — remove only the missing ones
@@ -2919,6 +2943,10 @@ for key, s in data.items():
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
     status = 'alive' if feature_alive(proj, feat) else 'stopped'
+    # Collect unique engines from workers
+    workers = s.get('workers', {})
+    engines = sorted(set(w.get('engine', 'claude') for w in workers.values())) if workers else ['claude']
+    engines_str = ','.join(engines)
     rows.append({
         "index": idx,
         "project": proj,
@@ -2928,15 +2956,16 @@ for key, s in data.items():
         "bead": bead,
         "started": started,
         "session_key": key,
+        "engines": engines_str,
     })
 
 if json_flag:
     print(json.dumps(rows, indent=2))
 else:
-    print(f"  {'#':<4}{'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'BEAD':<12} {'STARTED'}")
-    print(f"  {'─'*3} {'─'*15} {'─'*25} {'─'*8} {'─'*10} {'─'*12} {'─'*20}")
+    print(f"  {'#':<4}{'PROJECT':<15} {'FEATURE':<25} {'STATUS':<8} {'MODE':<10} {'ENGINES':<14} {'BEAD':<12} {'STARTED'}")
+    print(f"  {'─'*3} {'─'*15} {'─'*25} {'─'*8} {'─'*10} {'─'*14} {'─'*12} {'─'*20}")
     for r in rows:
-        print(f"  {r['index']:<4}{r['project']:<15} {r['feature']:<25} {r['status']:<8} {r['mode']:<10} {r['bead']:<12} {r['started']}")
+        print(f"  {r['index']:<4}{r['project']:<15} {r['feature']:<25} {r['status']:<8} {r['mode']:<10} {r['engines']:<14} {r['bead']:<12} {r['started']}")
 EOF
 }
 
@@ -4038,6 +4067,14 @@ print(text)
         echo ""
         echo "  Done. Review and adjust as needed."
         echo ""
+
+        # Offer to set up PR review profiles
+        local review_answer
+        read -r -p "Set up PR review profiles? [Y/n] " review_answer
+        review_answer="${review_answer:-Y}"
+        if [[ "$review_answer" =~ ^[Yy]$ ]]; then
+            _review_init
+        fi
 
         # Offer to start immediately
         local start_answer
@@ -5552,6 +5589,517 @@ with open(f, 'w') as fh:
     echo ""
 }
 
+# ── tw review ─────────────────────────────────────────────────────────
+# Manages per-workspace PR review profiles and dispatches multi-perspective reviews.
+#   tw review init [--force]          Generate reviewer profiles for this workspace
+#   tw review <feature> <pr-number>   Spawn reviewers and dispatch PR review tasks
+
+cmd_review() {
+    [[ $# -eq 0 ]] && die "Usage: tw review init [--force] | tw review <feature> <pr-number>"
+
+    if [[ "$1" == "init" ]]; then
+        shift
+        _review_init "$@"
+    else
+        _review_dispatch "$@"
+    fi
+}
+
+# ── tw review init ────────────────────────────────────────────────────
+_review_init() {
+    local force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force|-f) force=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) shift ;;
+        esac
+    done
+
+    local config_dir="$PWD"
+    local config_file
+    config_file=$(find_config 2>/dev/null) || die "No .tw.yml found — run 'tw init' first"
+    config_dir=$(dirname "$config_file")
+
+    local project
+    project=$(yaml_get "$config_file" "project" "") || true
+    [[ -z "$project" ]] && die ".tw.yml missing 'project' key"
+
+    local reviews_dir="$config_dir/.tw/reviews"
+    if [[ -d "$reviews_dir" ]] && [[ $force -eq 0 ]]; then
+        local existing
+        existing=$(ls "$reviews_dir"/*.md 2>/dev/null | wc -l | tr -d ' ')
+        if [[ "$existing" -gt 0 ]]; then
+            die "Review profiles already exist ($existing files in .tw/reviews/). Use --force to regenerate."
+        fi
+    fi
+
+    # ─── Fast local prescan ─────────────────────────────────────────
+    log "Scanning workspace for review profile generation..."
+
+    local prescan=""
+
+    # Include .tw.yml for context
+    prescan+="## .tw.yml
+$(cat "$config_file")
+
+"
+
+    # Directory listing
+    prescan+="## Top-level directory listing
+$(ls -1a "$config_dir" | head -50)
+
+"
+
+    # Detect sub-repos
+    local subrepos=""
+    for d in "$config_dir"/*/; do
+        [[ -d "$d" ]] || continue
+        local dname
+        dname=$(basename "$d")
+        if [[ -f "$d/package.json" || -f "$d/pyproject.toml" || -f "$d/Pipfile" || -f "$d/Cargo.toml" || -f "$d/go.mod" ]]; then
+            subrepos+="- $dname"
+            [[ -f "$d/package.json" ]] && subrepos+=" (package.json)"
+            [[ -f "$d/pyproject.toml" ]] && subrepos+=" (pyproject.toml)"
+            [[ -f "$d/Pipfile" ]] && subrepos+=" (Pipfile)"
+            [[ -f "$d/Cargo.toml" ]] && subrepos+=" (Cargo.toml)"
+            [[ -f "$d/go.mod" ]] && subrepos+=" (go.mod)"
+            subrepos+=$'\n'
+        fi
+    done
+    [[ -n "$subrepos" ]] && prescan+="## Sub-repos / service directories
+$subrepos
+"
+
+    # Key config files
+    for f in package.json pyproject.toml Pipfile docker-compose.yml docker-compose.yaml \
+             Makefile Cargo.toml go.mod; do
+        if [[ -f "$config_dir/$f" ]]; then
+            prescan+="## $f (first 30 lines)
+$(head -30 "$config_dir/$f")
+...
+
+"
+        fi
+    done
+
+    # Sub-repo package files
+    if [[ -n "$subrepos" ]]; then
+        for d in "$config_dir"/*/; do
+            local dname
+            dname=$(basename "$d")
+            for pf in package.json pyproject.toml Pipfile; do
+                if [[ -f "$d/$pf" ]]; then
+                    prescan+="## $dname/$pf (first 25 lines)
+$(head -25 "$d/$pf")
+...
+
+"
+                fi
+            done
+        done
+    fi
+
+    # Framework configs
+    for pattern in vite.config.* next.config.* nuxt.config.* svelte.config.* tailwind.config.* tsconfig.json; do
+        for f in "$config_dir"/$pattern "$config_dir"/*/$pattern; do
+            [[ -f "$f" ]] || continue
+            local relpath="${f#$config_dir/}"
+            prescan+="## $relpath (first 15 lines)
+$(head -15 "$f")
+...
+
+"
+        done
+    done
+
+    # Sample source files for patterns (up to 3 per detected language)
+    local sample_count=0
+    for ext in ts tsx js jsx py go rs; do
+        local files_found
+        files_found=$(find "$config_dir" -maxdepth 4 -name "*.${ext}" \
+            -not -path "*/node_modules/*" -not -path "*/.git/*" \
+            -not -path "*/dist/*" -not -path "*/__pycache__/*" \
+            -not -path "*/worktrees/*" \
+            2>/dev/null | head -3 || true)
+        while IFS= read -r sf; do
+            [[ -z "$sf" ]] && continue
+            local relpath="${sf#$config_dir/}"
+            prescan+="## Sample: $relpath (first 40 lines)
+$(head -40 "$sf")
+...
+
+"
+            ((sample_count++)) || true
+        done <<< "$files_found"
+    done
+
+    # Database/ORM detection
+    local db_hints=""
+    for pattern in "prisma/schema.prisma" "*/prisma/schema.prisma" \
+                   "drizzle.config.*" "*/drizzle.config.*" \
+                   "alembic.ini" "*/alembic.ini" \
+                   "migrations/" "*/migrations/"; do
+        for f in $config_dir/$pattern; do
+            [[ -e "$f" ]] || continue
+            local relpath="${f#$config_dir/}"
+            db_hints+="- $relpath"$'\n'
+            if [[ -f "$f" ]]; then
+                prescan+="## $relpath (first 20 lines)
+$(head -20 "$f")
+...
+
+"
+            fi
+        done
+    done
+    [[ -n "$db_hints" ]] && prescan+="## Database/ORM artifacts detected
+$db_hints
+"
+
+    log "Generating reviewer profiles with Claude..."
+
+    local prompt
+    prompt=$(cat <<'PROMPT_HEREDOC'
+You are analyzing a codebase to generate specialized PR reviewer profiles for tiddly-winks, a feature space manager.
+
+## Pre-scan results
+
+PRESCAN_PLACEHOLDER
+
+## Your task
+
+Based on the codebase analysis above, generate a set of specialized PR reviewer profiles. Each reviewer should have a **meaningfully distinct lens** — tailored to THIS project's actual stack, frameworks, patterns, and conventions.
+
+Generate as many reviewers as the codebase warrants. Don't artificially limit yourself, but don't create redundant ones either. Consider reviewers for areas like:
+- Backend/API patterns (if there's a backend)
+- Data modeling/schema/migrations (if there's a DB layer)
+- Logic & correctness (edge cases, race conditions — always relevant)
+- Frontend patterns & UX (if there's a frontend)
+- Security (if there are auth flows, user input, etc.)
+- Performance (if there are hot paths, large data processing, etc.)
+- Testing gaps (if there's a test framework)
+- i18n/l10n (if there's internationalization)
+- Accessibility (if there's a user-facing frontend)
+- Type safety (if TypeScript/typed language)
+- Infrastructure/DevOps (if there's IaC, Docker, CI config)
+- Any other area specific to this project's domain
+
+Each profile should reference the ACTUAL frameworks, libraries, file patterns, and conventions found in the prescan — not generic advice.
+
+## Output format
+
+Output a single JSON object (no markdown fences, no prose before or after). Start with `{` and end with `}`.
+
+```
+{
+  "reviewers": [
+    {
+      "name": "short-slug",
+      "title": "Human-readable title",
+      "content": "Full markdown content of the reviewer profile"
+    }
+  ]
+}
+```
+
+Each reviewer's `content` should follow this template (fill in project-specific details):
+
+```markdown
+# PR Reviewer — TITLE (PROJECT)
+
+You are reviewing a PR in PROJECT, BRIEF_DESCRIPTION.
+
+## Your Focus
+SPECIALTY_DESCRIPTION. This project uses:
+- SPECIFIC_TECH_1
+- SPECIFIC_TECH_2
+- SPECIFIC_PATTERNS
+
+## What to Look For
+- SPECIFIC_CHECKLIST_ITEM_1
+- SPECIFIC_CHECKLIST_ITEM_2
+- ... (be thorough and specific to this codebase)
+
+## What to Ignore
+Defer these to other reviewers — stay in your lane:
+- AREA_1 (r-OTHER handles this)
+- AREA_2 (r-OTHER handles this)
+
+## How to Review
+1. Run: gh pr diff {pr_number}
+2. Run: gh pr view {pr_number}
+3. Focus ONLY on files and changes relevant to your specialty
+4. Post your review:
+   gh pr review {pr_number} --comment --body '**[SPECIALTY_TAG]**
+
+   YOUR_REVIEW_HERE'
+5. Signal completion: tw signal {feature} {worker_name} done
+```
+
+IMPORTANT:
+- The {pr_number}, {feature}, and {worker_name} placeholders must appear literally (with braces) — they get filled at dispatch time
+- The "What to Ignore" section should reference the OTHER reviewers you're generating by their r-name
+- Keep the "How to Review" section exactly as shown — these are the mechanical steps
+- The "What to Look For" section is where your project-specific knowledge shines
+- Be concrete: "Check that Prisma migrations include down migrations" not "Check migrations"
+PROMPT_HEREDOC
+)
+
+    # Replace placeholder with actual prescan
+    prompt="${prompt/PRESCAN_PLACEHOLDER/$prescan}"
+
+    local json_out
+    json_out=$(claude -p "$prompt" 2>/dev/null) \
+        || die "Claude generation failed — check that 'claude' CLI is authenticated"
+
+    [[ -z "$json_out" ]] && die "Claude returned empty output"
+
+    # Strip markdown fences if present
+    json_out=$(echo "$json_out" | python3 -c "
+import sys, re, json
+text = sys.stdin.read().strip()
+# Strip markdown fences
+text = re.sub(r'^\`\`\`[a-z]*\n', '', text)
+text = re.sub(r'\n\`\`\`\s*$', '', text)
+# Find JSON object
+start = text.find('{')
+end = text.rfind('}')
+if start >= 0 and end > start:
+    text = text[start:end+1]
+# Validate it parses
+json.loads(text)
+print(text)
+") || die "Failed to parse reviewer profiles — Claude output was not valid JSON"
+
+    # Extract and write reviewer files
+    mkdir -p "$reviews_dir"
+
+    local reviewer_count
+    reviewer_count=$(echo "$json_out" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(len(data.get('reviewers', [])))
+")
+
+    [[ "$reviewer_count" -eq 0 ]] && die "Claude generated zero reviewer profiles"
+
+    # If --force, clear old profiles
+    if [[ $force -eq 1 ]]; then
+        rm -f "$reviews_dir"/*.md 2>/dev/null || true
+    fi
+
+    # Write each profile and build YAML config
+    local yaml_reviews="reviews:"$'\n'
+    local names_list=""
+
+    echo "$json_out" | python3 -c "
+import json, sys, os
+
+data = json.load(sys.stdin)
+reviews_dir = sys.argv[1]
+
+for r in data.get('reviewers', []):
+    name = r['name']
+    content = r['content']
+    filepath = os.path.join(reviews_dir, f'{name}.md')
+    with open(filepath, 'w') as f:
+        f.write(content)
+        if not content.endswith('\n'):
+            f.write('\n')
+    # Output name:title for the summary
+    print(f\"{name}:{r.get('title', name)}\")
+" "$reviews_dir" | while IFS=: read -r rname rtitle; do
+        echo "  $rname:"
+        echo "    prompt: .tw/reviews/${rname}.md"
+    done > "$reviews_dir/.yaml_fragment"
+
+    # Read the generated yaml fragment
+    yaml_reviews=$(printf "reviews:\n%s" "$(cat "$reviews_dir/.yaml_fragment")")
+    rm -f "$reviews_dir/.yaml_fragment"
+
+    # Display what was generated
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Generated $reviewer_count reviewer profiles in .tw/reviews/:"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    echo "$json_out" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data.get('reviewers', []):
+    print(f\"  r-{r['name']:20s} {r.get('title', r['name'])}\")
+"
+
+    echo ""
+    echo "  YAML to add to .tw.yml:"
+    echo "  ────────────────────────"
+    echo "$yaml_reviews" | sed 's/^/  /'
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # Ask to update .tw.yml
+    local answer
+    read -r -p "Add reviews: section to .tw.yml? [Y/n] " answer
+    answer="${answer:-Y}"
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        # Remove existing reviews: section if present, then append new one
+        python3 -c "
+import sys, re
+
+config_path = sys.argv[1]
+yaml_fragment = sys.argv[2]
+
+with open(config_path, 'r') as f:
+    content = f.read()
+
+# Remove existing reviews: block (top-level key and all indented lines under it)
+content = re.sub(r'\nreviews:\n(?:  .*\n)*', '\n', content)
+content = re.sub(r'^reviews:\n(?:  .*\n)*', '', content)
+
+# Ensure trailing newline
+if not content.endswith('\n'):
+    content += '\n'
+
+# Append
+content += '\n' + yaml_fragment + '\n'
+
+with open(config_path, 'w') as f:
+    f.write(content)
+" "$config_file" "$yaml_reviews"
+        log "Updated .tw.yml with reviews: section"
+    else
+        echo ""
+        echo "  Skipped. Add the reviews: section to .tw.yml manually when ready."
+    fi
+
+    echo ""
+    echo "  Review profiles saved to: $reviews_dir/"
+    echo "  To dispatch a review:     tw review <feature> <pr-number>"
+    echo "  To regenerate profiles:   tw review init --force"
+    echo ""
+}
+
+# ── tw review <feature> <pr-number> ──────────────────────────────────
+_review_dispatch() {
+    local feature="" pr_number=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$feature" ]]; then feature="$1"
+                elif [[ -z "$pr_number" ]]; then pr_number="$1"
+                else die "Too many arguments"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$feature" || -z "$pr_number" ]] \
+        && die "Usage: tw review <feature> <pr-number>"
+
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
+
+    tmux has-session -t "=$tmux_session" 2>/dev/null \
+        || die "No tmux session '$tmux_session' — is the feature running? Try: tw start $feature"
+
+    local config_file
+    config_file=$(find_config "$config_dir" 2>/dev/null) \
+        || die "No .tw.yml found in $config_dir"
+
+    # Read review entries
+    local review_pairs
+    mapfile -t review_pairs < <(yaml_review_entries "$config_file")
+    [[ ${#review_pairs[@]} -eq 0 ]] \
+        && die "No 'reviews:' section in .tw.yml — run 'tw review init' first"
+
+    # Get bead_id
+    bead_id=$(sessions_get_key "$session_key" "bead_id" 2>/dev/null || true)
+
+    # Determine repo for the PR
+    local repo
+    repo=$(yaml_get_nested "$config_file" "issue_tracker.repo" "" 2>/dev/null || true)
+    if [[ -z "$repo" ]]; then
+        repo=$(cd "$config_dir" && gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+    fi
+    [[ -z "$repo" ]] && die "Cannot determine repo — set issue_tracker.repo in .tw.yml"
+
+    local spawned=0 skipped=0 sent=0
+
+    for rpair in "${review_pairs[@]}"; do
+        [[ -z "$rpair" ]] && continue
+        local rname="${rpair%%:*}" _rrest="${rpair#*:}"
+        local rprompt="${_rrest%%:*}" rengine="${_rrest##*:}"
+        rengine=$(resolve_engine "$rengine" "$config_file")
+
+        # Build the task from the prompt file
+        local task=""
+        local prompt_path="$config_dir/$rprompt"
+        if [[ -f "$prompt_path" ]]; then
+            # Read the prompt file and fill placeholders
+            task=$(cat "$prompt_path")
+            task="${task//\{pr_number\}/$pr_number}"
+            task="${task//\{feature\}/$feature}"
+            task="${task//\{worker_name\}/$rname}"
+            task="${task//\{repo\}/$repo}"
+        else
+            # Fallback: generic task if prompt file is missing
+            log "Warning: prompt file not found: $prompt_path — using generic task"
+            local specialty="${rname#r-}"
+            task="Review PR #${pr_number} in ${repo} from a ${specialty} perspective. Run: gh pr diff ${pr_number} and gh pr view ${pr_number}. Focus on your specialty area. Post: gh pr review ${pr_number} --comment --body '**[${specialty}]** <your review>'. When done: tw signal ${feature} ${rname} done"
+        fi
+
+        # Spawn if not already running
+        if tmux_window_exists "$tmux_session" "$rname"; then
+            log "Reviewer $rname already running — re-sending task"
+            ((skipped++))
+        else
+            mkdir -p "$(agents_dir "$session_key")"
+            local worker_bead_id
+            worker_bead_id=$(worker_bead_find_or_create "$rname" "$project" "$config_dir")
+            spawn_worker "$tmux_session" "$session_key" "$config_dir" \
+                "$rname" "" "$bead_id" "$worker_bead_id" "$rengine"
+            sessions_add_dynamic_worker "$session_key" "$rname" ""
+
+            # Store engine if non-default
+            if [[ "$rengine" != "claude" ]]; then
+                python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+s = d.setdefault(sys.argv[2], {})
+w = s.setdefault('workers', {})
+we = w.setdefault(sys.argv[3], {})
+we['engine'] = sys.argv[4]
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$HOME/.tiddly-winks/sessions.json" "$session_key" "$rname" "$rengine" 2>/dev/null || true
+            fi
+            ((spawned++))
+        fi
+
+        # Send the task via cmd_send (bead-backed, handles engine differences)
+        # We call it as a function to avoid subprocess overhead
+        cmd_send "$feature" "$rname" "$task" &
+        ((sent++))
+    done
+
+    # Wait for background sends to complete
+    wait
+
+    echo ""
+    echo "  PR #${pr_number} review dispatched to ${sent} reviewers:"
+    [[ $spawned -gt 0 ]] && echo "    Spawned: $spawned new"
+    [[ $skipped -gt 0 ]] && echo "    Existing: $skipped (re-sent task)"
+    echo ""
+    echo "  Monitor: tw workers $feature --health"
+    echo "  Feed:    tw feed $feature --problems"
+    echo ""
+}
+
 cmd_workers() {
     local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0 cv_worker=""
 
@@ -5882,6 +6430,8 @@ tw signal <feature> <worker> done   # Signal task completion (available for reus
 tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
 tw patrol <feature>              # Full health check + auto-respawn + plugins
 tw spawn <feature> <name> <role> # Add a worker to a running session
+tw review init [--force]         # Generate workspace-specific PR reviewer profiles
+tw review <feature> <pr-number>  # Dispatch multi-perspective PR review
 ```
 
 ### Mail (persistent beads-backed messaging)
@@ -7708,6 +8258,7 @@ case "$subcommand" in
     claude)  cmd_claude "$@" ;;
     append)  cmd_append "$@" ;;
     spawn)   cmd_spawn "$@" ;;
+    review)  cmd_review "$@" ;;
     workers) cmd_workers "$@" ;;
     handoff) cmd_handoff "$@" ;;
     attach)  cmd_attach "$@" ;;
