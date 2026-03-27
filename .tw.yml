@@ -14,3 +14,15 @@ issue_tracker:
 workers:
   - dev
   - ops
+
+reviews:
+  shell-correctness:
+    prompt: .tw/reviews/shell-correctness.md
+  concurrency:
+    prompt: .tw/reviews/concurrency.md
+  orchestration:
+    prompt: .tw/reviews/orchestration.md
+  security:
+    prompt: .tw/reviews/security.md
+  cli-ux:
+    prompt: .tw/reviews/cli-ux.md
