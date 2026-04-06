@@ -2794,6 +2794,27 @@ cmd_stop() {
 
     # Tear down worktrees if --done
     if [[ $done_flag -eq 1 ]]; then
+        # Squash WIP checkpoint commits before removing worktrees
+        local squash_wt_json
+        squash_wt_json=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+wt = d.get('$session_key', {}).get('worktrees', {})
+seen = set()
+for svc, path in wt.items():
+    import os
+    root = path
+    # Deduplicate by git root
+    print(path)
+" 2>/dev/null || true)
+        # Squash main workspace
+        _checkpoint_squash "$config_dir" || true
+        # Squash each worktree
+        while IFS= read -r _sq_path; do
+            [[ -z "$_sq_path" ]] && continue
+            _checkpoint_squash "$_sq_path" || true
+        done <<< "$squash_wt_json"
+
         # Get unique worktree roots to remove. Multiple services may share the same
         # git worktree (e.g. potoo/server + potoo/web both live in worktrees/feat/potoo).
         # We deduplicate by finding the actual git root of each worktree path.
@@ -6436,6 +6457,7 @@ tw patrol <feature>              # Full health check + auto-respawn + plugins
 tw spawn <feature> <name> <role> # Add a worker to a running session
 tw review init [--force]         # Generate workspace-specific PR reviewer profiles
 tw review <feature> <pr-number>  # Dispatch multi-perspective PR review
+tw checkpoint squash <feature>   # Squash WIP checkpoint commits before push/PR
 ```
 
 ### Mail (persistent beads-backed messaging)
@@ -7243,6 +7265,146 @@ else:
     esac
 }
 
+
+# ─── Checkpoint squash ────────────────────────────────────────────────────────
+# Squash WIP checkpoint commits between merge-base and HEAD into a single commit.
+# Preserves non-WIP commit messages. Safe because feature branches are typically
+# squash-merged anyway.
+# Usage: _checkpoint_squash <worktree_path> [base_ref]
+_checkpoint_squash() {
+    local wt_path="$1" base_ref="${2:-}"
+
+    [[ -d "$wt_path" ]] || return 0
+    [[ -d "$wt_path/.git" || -f "$wt_path/.git" ]] || return 0
+
+    # Auto-detect base ref if not provided
+    if [[ -z "$base_ref" ]]; then
+        for candidate in origin/staging origin/main origin/master; do
+            if git -C "$wt_path" rev-parse --verify "$candidate" &>/dev/null; then
+                base_ref="$candidate"
+                break
+            fi
+        done
+        [[ -z "$base_ref" ]] && { log "Squash: no base ref found for $wt_path — skipping"; return 0; }
+    fi
+
+    # Find merge-base
+    local merge_base
+    merge_base=$(git -C "$wt_path" merge-base "$base_ref" HEAD 2>/dev/null) || {
+        log "Squash: could not find merge-base for $wt_path — skipping"
+        return 0
+    }
+
+    # List commit subjects from merge-base..HEAD
+    local log_out
+    log_out=$(git -C "$wt_path" log --format=%s "$merge_base..HEAD" 2>/dev/null) || return 0
+    [[ -z "$log_out" ]] && return 0
+
+    # Count WIP commits and collect non-WIP subjects
+    local wip_count=0
+    local non_wip_subjects=()
+    while IFS= read -r subj; do
+        if [[ "$subj" == "WIP: checkpoint"* ]]; then
+            (( wip_count++ )) || true
+        elif [[ -n "$subj" ]]; then
+            non_wip_subjects+=("$subj")
+        fi
+    done <<< "$log_out"
+
+    [[ $wip_count -eq 0 ]] && return 0
+
+    # Soft-reset to merge-base (preserves all changes as staged)
+    git -C "$wt_path" reset --soft "$merge_base" 2>/dev/null || {
+        log "Squash: soft reset failed for $wt_path"
+        return 1
+    }
+
+    # Build combined commit message
+    local msg
+    if [[ ${#non_wip_subjects[@]} -gt 0 ]]; then
+        msg="${non_wip_subjects[0]}"
+        if [[ ${#non_wip_subjects[@]} -gt 1 ]]; then
+            msg+=$'\n'
+            local i
+            for (( i=1; i<${#non_wip_subjects[@]}; i++ )); do
+                msg+=$'\n'"- ${non_wip_subjects[$i]}"
+            done
+        fi
+    else
+        msg="squashed WIP checkpoint commits"
+    fi
+
+    # Commit with combined message
+    git -C "$wt_path" commit -m "$msg" --no-verify 2>/dev/null || {
+        log "Squash: commit failed for $wt_path"
+        return 1
+    }
+
+    log "Squash: collapsed $wip_count WIP commit(s) in $(basename "$wt_path")"
+    # Return 2 to signal "squash happened" (vs 0 = no WIP commits)
+    return 2
+}
+
+# ── tw checkpoint ─────────────────────────────────────────────────────────────
+# Manage checkpoint WIP commits.
+#   tw checkpoint squash <feature>   Squash WIP commits across all worktrees
+
+cmd_checkpoint() {
+    [[ $# -eq 0 ]] && die "Usage: tw checkpoint squash <feature>"
+
+    local subcmd="$1"; shift
+    case "$subcmd" in
+        squash) _checkpoint_squash_feature "$@" ;;
+        *) die "Unknown checkpoint subcommand: $subcmd. Usage: tw checkpoint squash <feature>" ;;
+    esac
+}
+
+_checkpoint_squash_feature() {
+    local feature=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "Unknown option: $1" ;;
+            *) feature="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$feature" ]] && die "Usage: tw checkpoint squash <feature>"
+
+    local session_key project config_dir tmux_session bead_id
+    resolve_session "$feature"
+
+    # Collect worktree paths + main workspace
+    local squash_paths=()
+    squash_paths+=("$config_dir")
+
+    local wt_json
+    wt_json=$(python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = d.get(sys.argv[2], {})
+wt = s.get('worktrees', {})
+for path in wt.values():
+    if isinstance(path, str):
+        print(path)
+" "$SESSIONS_FILE" "$session_key" 2>/dev/null || true)
+
+    while IFS= read -r wt_path; do
+        [[ -n "$wt_path" && "$wt_path" != "$config_dir" ]] && squash_paths+=("$wt_path")
+    done <<< "$wt_json"
+
+    local total_squashed=0
+    for spath in "${squash_paths[@]}"; do
+        [[ -z "$spath" || ! -d "$spath" ]] && continue
+        _checkpoint_squash "$spath"
+        [[ $? -eq 2 ]] && (( total_squashed++ )) || true
+    done
+
+    if [[ $total_squashed -gt 0 ]]; then
+        echo "  Squashed WIP checkpoints in $total_squashed path(s) for $feature"
+    else
+        echo "  No WIP checkpoint commits found for $feature"
+    fi
+}
 
 # ─── Daemon ───────────────────────────────────────────────────────────────────
 
@@ -8263,6 +8425,7 @@ case "$subcommand" in
     append)  cmd_append "$@" ;;
     spawn)   cmd_spawn "$@" ;;
     review)  cmd_review "$@" ;;
+    checkpoint) cmd_checkpoint "$@" ;;
     workers) cmd_workers "$@" ;;
     handoff) cmd_handoff "$@" ;;
     attach)  cmd_attach "$@" ;;
