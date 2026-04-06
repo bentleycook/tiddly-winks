@@ -2017,15 +2017,19 @@ PYEOF
     worktrees_base=$(python3 -c "
 import json, sys, os
 data = json.loads(sys.argv[1])
-# Infer worktrees base from existing entries
+config_dir = os.path.realpath(sys.argv[2])
+# Infer worktrees base only from sessions belonging to THIS workspace
 for key, s in data.items():
+    ws = s.get('workspace', '')
+    if ws and os.path.realpath(ws) != config_dir:
+        continue
     wt = s.get('worktrees', {})
     for svc, path in wt.items():
         # worktrees are typically at <base>/<feature>/<svc>
         print(os.path.dirname(os.path.dirname(path)))
         sys.exit(0)
-# Fallback: check common location
-candidate = os.path.join(sys.argv[2], 'worktrees')
+# Fallback: check common location for THIS workspace
+candidate = os.path.join(config_dir, 'worktrees')
 if os.path.isdir(candidate):
     print(candidate)
 " "$new_data" "$config_dir" 2>/dev/null || true)
@@ -6055,7 +6059,7 @@ _review_dispatch() {
         # Spawn if not already running
         if tmux_window_exists "$tmux_session" "$rname"; then
             log "Reviewer $rname already running — re-sending task"
-            ((skipped++))
+            ((skipped++)) || true
         else
             mkdir -p "$(agents_dir "$session_key")"
             local worker_bead_id
@@ -6078,17 +6082,17 @@ with open(f, 'w') as fh:
     json.dump(d, fh, indent=2)
 " "$HOME/.tiddly-winks/sessions.json" "$session_key" "$rname" "$rengine" 2>/dev/null || true
             fi
-            ((spawned++))
+            ((spawned++)) || true
         fi
 
         # Send the task via cmd_send (bead-backed, handles engine differences)
-        # We call it as a function to avoid subprocess overhead
-        cmd_send "$feature" "$rname" "$task" &
-        ((sent++))
+        # Run in a subshell to isolate set -e failures from the main loop
+        ( cmd_send "$feature" "$rname" "$task" ) &
+        ((sent++)) || true
     done
 
-    # Wait for background sends to complete
-    wait
+    # Wait for background sends to complete (|| true: some sends may fail)
+    wait || true
 
     echo ""
     echo "  PR #${pr_number} review dispatched to ${sent} reviewers:"
