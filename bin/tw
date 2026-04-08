@@ -1260,6 +1260,11 @@ Workers write to their output files incrementally. Poll progress:
   cat ~/.tiddly-winks/health/${session_key}.json  # structured health report (updated by daemon)
 The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken) and crash counts. Check this FIRST before running patrol — it's faster and tells you who needs attention.
 
+## Cleaning up workers
+After reviews complete or when done workers pile up, clean them out:
+  tw workers $feature --cleanup   # kills done/dead workers, removes dynamic entries
+Run this proactively after review dispatches complete or when you notice idle workers accumulating.
+
 ## Mail (persistent messaging)
 For important signals (task done, help needed, handoffs), use mail instead of output file polling:
   tw mail send $feature <worker> -s \"Subject\" -m \"Body\" -f god
@@ -3983,15 +3988,10 @@ proxy:
   "": frontend              # http://{project}-{feature}.localhost → frontend port
   api: backend              # http://{project}-{feature}-api.localhost → backend port
 
-workers:
-  ci:
-    role: ci-watcher        # always include — runs tests/lint on demand
-  keeper:
-    role: services-keeper   # always include — monitors and restarts services
-  frontend:
-    role: frontend-dev      # include only if a frontend service is present
-  backend:
-    role: backend-dev       # include only if a backend service is present
+workers:                      # generic worker pool — workers are interchangeable
+  - dev                       # 2-3 generic workers is typical
+  - ops                       # god dispatches tasks with full context at send time
+  # Add more workers if the project is large or has many parallel workstreams
 
 quality_gates:                # optional: commands workers must pass before PRs
   typecheck: "tsc --noEmit"   # only if TypeScript project
@@ -4010,12 +4010,11 @@ quality_gates:                # optional: commands workers must pass before PRs
 - db_setup: only include if you see a clear setup/reset script for a local database
 - proxy: map "" to the primary web-facing service, named subdomains to APIs/other services
   Omit if no services.
-- workers: always include ci and keeper; add frontend if any frontend service exists,
-  backend if any backend service exists. For projects with no services (CLI tools, scripts,
-  libraries), include a generic dev worker with role: frontend-dev instead.
-  Use exactly these role names — they map to role files in ~/.claude/roles/.
-  If multiple frontends exist, use a single frontend worker (one agent covers all
-  frontend codebases).
+- workers: use a generic pool of 2-3 workers (e.g. dev, ops) as a simple list.
+  Do NOT assign roles — workers are interchangeable and god dispatches tasks with
+  full context at send time. Specialization (CI, service monitoring, frontend, backend)
+  happens through task descriptions, not worker identity. For larger projects with
+  many parallel workstreams, add more generic workers (dev-1, dev-2, dev-3).
 - quality_gates: include if the project has TypeScript (typecheck), a linter (lint),
   or tests (test). Use the project's actual commands (e.g. bun test, npm run lint,
   ruff check, pytest). Omit for projects with no clear quality checks.
@@ -6126,12 +6125,13 @@ with open(f, 'w') as fh:
 }
 
 cmd_workers() {
-    local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0 cv_worker=""
+    local feature="" health_flag=0 respawn_flag=0 json_flag=0 force_flag=0 cleanup_flag=0 cv_worker=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --health) health_flag=1; shift ;;
             --respawn) respawn_flag=1; shift ;;
+            --cleanup) cleanup_flag=1; shift ;;
             --json) json_flag=1; shift ;;
             --force) force_flag=1; shift ;;
             --cv) cv_worker="${2:-}"; shift; [[ -n "$cv_worker" ]] && shift ;;
@@ -6141,7 +6141,7 @@ cmd_workers() {
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--cv <worker>]"
+    [[ -z "$feature" ]] && die "Usage: tw workers <feature> [--health] [--respawn] [--cleanup] [--cv <worker>]"
 
     local session_key project config_dir tmux_session bead_id
     resolve_session "$feature"
@@ -6267,6 +6267,39 @@ print(json.dumps(rows, indent=2))
         done
         echo ""
         echo "  Workers: $respawned respawned, $alive alive${blocked:+, $blocked blocked by breaker}"
+        return 0
+    fi
+
+    # --cleanup: kill done/dead workers and remove dynamic worker entries
+    if [[ $cleanup_flag -eq 1 ]]; then
+        local agents_path
+        agents_path="$(agents_dir "$session_key")"
+        local cleaned=0 kept=0
+
+        for wpair in "${worker_pairs[@]}"; do
+            [[ -z "$wpair" ]] && continue
+            local wname="${wpair%%:*}"
+            local status
+            status=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
+
+            if [[ "$status" == "done" || "$status" == "dead" ]]; then
+                # Kill tmux window if it exists
+                if tmux_window_exists "$tmux_session" "$wname"; then
+                    tmux kill-window -t "=$tmux_session:$wname" 2>/dev/null || true
+                fi
+                # Remove from dynamic workers (no-op for static workers)
+                sessions_remove_dynamic_worker "$session_key" "$wname" 2>/dev/null || true
+                # Clear signals
+                worker_signal_clear_all "$session_key" "$wname" 2>/dev/null || true
+                log "Cleaned up worker: $wname ($status)"
+                (( cleaned++ )) || true
+            else
+                (( kept++ )) || true
+            fi
+        done
+
+        echo ""
+        echo "  Cleanup: $cleaned removed, $kept still active"
         return 0
     fi
 
@@ -6450,6 +6483,7 @@ tw resume --all                  # Resume all in-progress features
 tw workers <feature> --health    # Check worker state (working/idle/stalled/done/dead/not-logged-in)
 tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
+tw workers <feature> --cleanup            # Kill done/dead workers, remove dynamic entries
 tw send <feature> <worker> "task description"  # Queue task for a worker (clears done signal)
 tw signal <feature> <worker> done   # Signal task completion (available for reuse)
 tw handoff <feature> <worker>    # Cycle worker (save context, restart fresh)
