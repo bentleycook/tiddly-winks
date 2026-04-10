@@ -1084,6 +1084,8 @@ spawn_worker() {
     # to inject bead context + role + output file path + worker identity at session open.
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
     mkdir -p "$hooked_dir"
+    local _feature
+    _feature=$(sessions_get_key "$session_key" "feature" 2>/dev/null || echo "${session_key#*-}")
     python3 -c "
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -1093,9 +1095,10 @@ with open(sys.argv[1], 'w') as f:
         'role': sys.argv[4],
         'output_file': sys.argv[5],
         'worker_bead_id': sys.argv[6],
-        'engine': sys.argv[7]
+        'engine': sys.argv[7],
+        'feature': sys.argv[8]
     }, f, indent=2)
-" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id" "$engine"
+" "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" "$output_file" "$worker_bead_id" "$engine" "$_feature"
 
     # Recover last task from worker bead and inject into hooked file
     # so the worker resumes with context even after respawn
@@ -1659,6 +1662,8 @@ worker_wake() {
     # Update the hooked context file with fresh bead/task info
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
     mkdir -p "$hooked_dir"
+    local _feature
+    _feature=$(sessions_get_key "$session_key" "feature" 2>/dev/null || echo "${session_key#*-}")
     python3 -c "
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -1667,10 +1672,11 @@ with open(sys.argv[1], 'w') as f:
         'worker': sys.argv[3],
         'role': sys.argv[4],
         'output_file': sys.argv[5],
-        'worker_bead_id': sys.argv[6]
+        'worker_bead_id': sys.argv[6],
+        'feature': sys.argv[7]
     }, f, indent=2)
 " "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" \
-  "$(agents_dir "$session_key")/${wname}.md" "$worker_bead_id"
+  "$(agents_dir "$session_key")/${wname}.md" "$worker_bead_id" "$_feature"
 
     # Send a wake prompt to re-activate the worker
     local wake_msg="You are being re-activated for new work. Re-read your role and context from the SessionStart hook, check bd show $bead_id for the latest feature state, and report ready to your output file."
@@ -2425,9 +2431,10 @@ with open(sys.argv[1], 'w') as f:
         'worker': 'god',
         'role': 'orchestrator',
         'output_file': '',
-        'worker_bead_id': ''
+        'worker_bead_id': '',
+        'feature': sys.argv[3]
     }, f, indent=2)
-" "${hooked_dir}/god.json" "$bead_id"
+" "${hooked_dir}/god.json" "$bead_id" "$feature"
 
     tmux new-window -d -t "=$tmux_session" -n "main"
     tmux send-keys -t "=$tmux_session:main" "cd '$config_dir'" Enter
@@ -2877,6 +2884,27 @@ for svc, path in wt.items():
                     && log "Removed worktree dir: $feature_wt_dir" || true
             fi
         fi
+    fi
+
+    # Clear stale GUPP tasks from hooked files so workers don't get ghost tasks on restart
+    local _hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
+    if [[ -d "$_hooked_dir" ]]; then
+        python3 -c "
+import json, glob, sys, os
+for f in glob.glob(os.path.join(sys.argv[1], '*.json')):
+    try:
+        d = json.load(open(f))
+        changed = False
+        for key in ('current_task', 'current_task_bead'):
+            if key in d:
+                del d[key]
+                changed = True
+        if changed:
+            with open(f, 'w') as fh:
+                json.dump(d, fh, indent=2)
+    except Exception:
+        pass
+" "$_hooked_dir" 2>/dev/null || true
     fi
 
     # Only remove from sessions.json if --done; otherwise keep as "stopped"
@@ -4661,6 +4689,13 @@ Supported signals: done, clear"
             # Reset crash counter on successful completion
             rm -f "$CRASH_COUNT_DIR/$session_key/$worker" 2>/dev/null || true
             echo "  ✓ $worker signaled done (crash counter reset)"
+            # Notify god window so it picks up completion on next prompt turn
+            if tmux_window_exists "$tmux_session" "god"; then
+                nudge_enqueue "$session_key" "god" \
+                    "Worker $worker signaled DONE. Task complete. Check their output file for results." 30
+                send_to_pane "=$tmux_session:god" \
+                    "Worker $worker has completed their task." 2>/dev/null || true
+            fi
             ;;
         clear)
             worker_signal_clear_all "$session_key" "$worker"
@@ -4995,6 +5030,8 @@ except: pass
     # Write updated hooked JSON
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
     mkdir -p "$hooked_dir"
+    local _feature
+    _feature=$(sessions_get_key "$session_key" "feature" 2>/dev/null || echo "${session_key#*-}")
     python3 -c "
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -5004,9 +5041,10 @@ with open(sys.argv[1], 'w') as f:
         'role': sys.argv[4],
         'output_file': sys.argv[5],
         'worker_bead_id': sys.argv[6],
-        'engine': sys.argv[7]
+        'engine': sys.argv[7],
+        'feature': sys.argv[8]
     }, f, indent=2)
-" "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id" "$engine"
+" "${hooked_dir}/${worker}.json" "$bead_id" "$worker" "$wrole" "$output_file" "$worker_bead_id" "$engine" "$_feature"
 
     local _prompt_file=""
     if ! engine_supports_hooks "$engine"; then
