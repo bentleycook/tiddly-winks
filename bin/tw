@@ -1692,10 +1692,9 @@ with open(sys.argv[1], 'w') as f:
 
 bead_create() {
     local title="$1" bd_dir="${2:-}"
-    local err_file out rc
+    local err_file out rc=0
     err_file=$(mktemp -t tw-bead-create.XXXXXX)
-    out=$(bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>"$err_file")
-    rc=$?
+    out=$(bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>"$err_file") || rc=$?
     local err_out
     err_out=$(<"$err_file")
     rm -f "$err_file"
