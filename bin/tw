@@ -1743,6 +1743,113 @@ bead_close() {
     bd_run "$bd_dir" close "$bead_id" >/dev/null 2>&1 || true
 }
 
+# Parse the METADATA block of `bd show <id>` and print "key=value" lines.
+bead_metadata_dump() {
+    local bead_id="$1" bd_dir="${2:-}"
+    bd_run "$bd_dir" show "$bead_id" 2>/dev/null | python3 -c "
+import sys
+in_meta = False
+for line in sys.stdin:
+    if line.startswith('METADATA'):
+        in_meta = True
+        continue
+    if in_meta:
+        if not line.strip():
+            break
+        if line.startswith(' '):
+            kv = line.strip()
+            if ':' in kv:
+                k, _, v = kv.partition(':')
+                print(f'{k.strip()}={v.strip()}')
+        else:
+            break
+" 2>/dev/null || true
+}
+
+# Scan for orphaned task beads in a given session.
+#
+# An orphan is a bead where:
+#   - status = in_progress, type = task
+#   - metadata.session = <session_key>
+#   - metadata.assigned_to points at a worker that is dead / missing / whose
+#     tmux session is gone entirely.
+#
+# Prints one line per orphan: "<bead_id>\t<assigned_to>\t<reason>"
+# Reasons: tmux-dead | worker-missing | worker-dead
+#
+# Usage: orphaned_beads_scan <session_key> <config_dir>
+orphaned_beads_scan() {
+    local session_key="$1" config_dir="${2:-}"
+    [[ -z "$session_key" ]] && return 0
+
+    local bead_ids
+    bead_ids=$(bd_run "$config_dir" list \
+            --status=in_progress \
+            --type=task \
+            --metadata-field="session=$session_key" 2>/dev/null \
+        | grep -oE '[a-z][a-z0-9-]*-[a-z0-9]+' \
+        | sort -u)
+    [[ -z "$bead_ids" ]] && return 0
+
+    local tmux_alive=1
+    tmux has-session -t "=$session_key" 2>/dev/null || tmux_alive=0
+
+    local agents_path
+    agents_path="$(agents_dir "$session_key" 2>/dev/null || true)"
+
+    # The feature bead itself (same session) also carries assigned_to metadata
+    # for identifying the god's owner. Skip it — it's not a dispatched task.
+    local feature_bead_id=""
+    feature_bead_id=$(sessions_get_key "$session_key" "bead_id" 2>/dev/null || true)
+
+    local id
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        [[ -n "$feature_bead_id" && "$id" == "$feature_bead_id" ]] && continue
+
+        # Real task beads from cmd_send carry an assigned_at stamp; feature/
+        # worker-identity beads do not. Use that as an additional discriminator.
+        local meta assigned assigned_at
+        meta=$(bead_metadata_dump "$id" "$config_dir")
+        assigned=$(echo "$meta" | awk -F= '$1=="assigned_to"{print $2; exit}')
+        assigned_at=$(echo "$meta" | awk -F= '$1=="assigned_at"{print $2; exit}')
+        [[ -z "$assigned" || -z "$assigned_at" ]] && continue
+
+        local reason=""
+        if [[ $tmux_alive -eq 0 ]]; then
+            reason="tmux-dead"
+        elif ! tmux_window_exists "$session_key" "$assigned"; then
+            reason="worker-missing"
+        else
+            local ws
+            ws=$(worker_state "$session_key" "$assigned" "$agents_path" "$session_key" 2>/dev/null || echo "")
+            [[ "$ws" == "dead" ]] && reason="worker-dead"
+        fi
+
+        if [[ -n "$reason" ]]; then
+            printf '%s\t%s\t%s\n' "$id" "$assigned" "$reason"
+        fi
+    done <<< "$bead_ids"
+}
+
+# Reset orphaned task beads for a session to status=open.
+# Prints one line per reset; final line is the total count.
+# Usage: orphaned_beads_reset <session_key> <config_dir>
+orphaned_beads_reset() {
+    local session_key="$1" config_dir="${2:-}"
+    local count=0
+    local id assigned reason
+    while IFS=$'\t' read -r id assigned reason; do
+        [[ -z "$id" ]] && continue
+        bd_run "$config_dir" update "$id" --status=open >/dev/null 2>&1 || true
+        bd_run "$config_dir" update "$id" --set-metadata "orphan_reset_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null 2>&1 || true
+        bd_run "$config_dir" update "$id" --set-metadata "orphan_reset_reason=$reason" >/dev/null 2>&1 || true
+        echo "      reset $id (was $assigned, $reason)"
+        count=$((count + 1))
+    done < <(orphaned_beads_scan "$session_key" "$config_dir")
+    echo "      total reset: $count"
+}
+
 bead_get_body() {
     local bead_id="$1" bd_dir="${2:-}"
     bd_run "$bd_dir" show "$bead_id" 2>/dev/null | python3 -c "
@@ -3298,6 +3405,39 @@ cmd_prune() {
     local sessions_data removed=0
     sessions_data=$(sessions_read)
 
+    # Capture (session_key, workspace) pairs for sessions about to be pruned,
+    # BEFORE we delete them, so we can reset their orphaned task beads.
+    local prune_targets
+    prune_targets=$(python3 - "$sessions_data" <<'EOF'
+import json, sys, subprocess
+data = json.loads(sys.argv[1])
+for key, s in data.items():
+    project = s.get('project', '')
+    feature = s.get('feature', '')
+    session_key = f'{project}-{feature}'
+    r = subprocess.run(['tmux', 'has-session', '-t', session_key], capture_output=True)
+    if r.returncode != 0:
+        print(f"{session_key}\t{s.get('workspace','')}")
+EOF
+    )
+
+    # Reset orphans for each dying session before we forget its workspace.
+    local orphan_total=0
+    if [[ -n "$prune_targets" ]]; then
+        while IFS=$'\t' read -r _sk _ws; do
+            [[ -z "$_sk" || -z "$_ws" ]] && continue
+            [[ -d "$_ws/.beads" ]] || continue
+            local _reset
+            _reset=$(orphaned_beads_reset "$_sk" "$_ws" 2>/dev/null || true)
+            local _n
+            _n=$(echo "$_reset" | sed -n 's/.*total reset: //p')
+            if [[ -n "$_n" && "$_n" -gt 0 ]]; then
+                echo "  [orphans] $_sk: reset $_n task bead(s)"
+                orphan_total=$((orphan_total + _n))
+            fi
+        done <<< "$prune_targets"
+    fi
+
     local new_data
     new_data=$(python3 - "$sessions_data" <<'EOF'
 import json, sys, subprocess
@@ -3328,6 +3468,7 @@ EOF
         rm -f "$pid_file"
     done
 
+    [[ $orphan_total -gt 0 ]] && echo "  Reset $orphan_total orphaned task bead(s) total."
     echo "  Prune complete."
 }
 
@@ -3459,7 +3600,12 @@ for ws in workspaces:
             bead = json.loads(line)
             if bead["id"] in seen_ids:
                 continue
-            if bead.get("status") not in ("in_progress", "open"):
+            # Accept open/in_progress AND closed — closed is kept as a
+            # low-priority fallback for features whose bead was closed but
+            # whose tmux/sessions.json state is still live (stale close).
+            # Dedup below prefers higher-ranked statuses via status_rank.
+            status = bead.get("status", "")
+            if status not in ("in_progress", "open", "closed"):
                 continue
             if bead.get("title", "").startswith("tw:worker"):
                 continue
@@ -3512,14 +3658,29 @@ for ws in workspaces:
             meta = bead.get("metadata", {}) or {}
             dw_json = meta.get("dynamic_workers", "[]")
 
-            # Dedup by session key (project-feature) — pick the most recently updated
+            # Rank candidates so dedup can prefer the strongest match when
+            # multiple beads share the same session key. Lower rank = better.
+            #   status:  in_progress(0) < open(1) < closed(2)
+            #   marker:  has "## Feature Space" header(+0) < missing(+1)
+            # Soft signal per tw-e1h.4: beads with the marker are preferred
+            # but not required — matching on title+status is sufficient.
+            status_rank = {"in_progress": 0, "open": 1, "closed": 2}.get(status, 3)
+            marker_rank = 0 if "## Feature Space" in desc else 1
+            rank = status_rank * 2 + marker_rank
+
             sk = f"{project}-{feature}"
             seen_ids.add(bead["id"])
-            # Skip if we already have this session key
-            if any(r.get("_sk") == sk for r in results):
-                continue
-            results.append({
+
+            # Dedup by session key — replace existing entry if this one ranks
+            # better (lower), otherwise drop it.
+            existing_idx = None
+            for _i, _r in enumerate(results):
+                if _r.get("_sk") == sk:
+                    existing_idx = _i
+                    break
+            entry = {
                 "_sk": sk,
+                "_rank": rank,
                 "bead_id": bead["id"],
                 "feature": feature,
                 "project": project,
@@ -3527,7 +3688,11 @@ for ws in workspaces:
                 "workspace": actual_ws,
                 "mode": mode or "local",
                 "dynamic_workers": dw_json,
-            })
+            }
+            if existing_idx is None:
+                results.append(entry)
+            elif rank < results[existing_idx].get("_rank", 999):
+                results[existing_idx] = entry
     except Exception:
         continue
 
@@ -3707,6 +3872,18 @@ for w in dw:
                     }
                 fi
             done <<< "$dw_pairs"
+        fi
+
+        # Reset any task beads left in_progress but assigned to workers that
+        # no longer exist in the freshly-respawned roster. The session was
+        # crash-restarted, so anything still in_progress is by definition
+        # orphaned until a worker picks it back up.
+        local _orphan_reset
+        _orphan_reset=$(orphaned_beads_reset "$session_key" "$ws" 2>/dev/null || true)
+        local _orphan_n
+        _orphan_n=$(echo "$_orphan_reset" | sed -n 's/.*total reset: //p')
+        if [[ -n "$_orphan_n" && "$_orphan_n" -gt 0 ]]; then
+            echo "      ↻ reset $_orphan_n orphaned task bead(s)"
         fi
 
         echo "    ✓ $session_key resumed"
@@ -5240,16 +5417,18 @@ except: pass
 cmd_patrol() {
     local feature=""
     local sync_outputs=0
+    local reset_orphans=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --sync-outputs) sync_outputs=1; shift ;;
+            --reset-orphans) reset_orphans=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
         esac
     done
 
-    [[ -z "$feature" ]] && die "Usage: tw patrol <feature>"
+    [[ -z "$feature" ]] && die "Usage: tw patrol <feature> [--sync-outputs] [--reset-orphans]"
 
     local session_key project config_dir tmux_session bead_id
     resolve_session "$feature"
@@ -5499,6 +5678,28 @@ for name, info in s.items():
         done
         if [[ -n "$synced_workers" ]]; then
             echo "  [↑] Synced outputs to beads: $synced_workers"
+            echo ""
+        fi
+    fi
+
+    # 3d. Orphaned task beads (in_progress but assigned to dead/missing workers)
+    local orphans
+    orphans=$(orphaned_beads_scan "$session_key" "$config_dir" 2>/dev/null || true)
+    if [[ -n "$orphans" ]]; then
+        local orphan_count
+        orphan_count=$(printf '%s\n' "$orphans" | grep -c . || true)
+        (( issues += orphan_count )) || true
+        if [[ $reset_orphans -eq 1 ]]; then
+            echo "  [!] Orphaned task beads: $orphan_count — resetting to open"
+            orphaned_beads_reset "$session_key" "$config_dir" | grep -v 'total reset:' || true
+            echo ""
+        else
+            echo "  [!] Orphaned task beads: $orphan_count (in_progress, worker gone)"
+            while IFS=$'\t' read -r _oid _ow _orsn; do
+                [[ -z "$_oid" ]] && continue
+                printf '      %s → %s (%s)\n' "$_oid" "$_ow" "$_orsn"
+            done <<< "$orphans"
+            echo "      Reset with: tw patrol $feature --reset-orphans"
             echo ""
         fi
     fi
