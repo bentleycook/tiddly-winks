@@ -8,3 +8,10 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+
+# Local Claude Code state (per-workspace settings, scheduled-task locks)
+.claude/
+
+# Beads runtime locks
+.beads/*.lock
+.beads/*.pid.lock

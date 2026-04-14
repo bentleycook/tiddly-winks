@@ -4405,6 +4405,17 @@ cmd_send() {
     [[ -z "$feature" || -z "$worker" || -z "$task" ]] \
         && die 'Usage: tw send <feature> <worker> "<task>" [--urgent] [--engine <name>]'
 
+    # Append completion-signal footer so the orchestrator gets notified when
+    # the worker finishes. Skip if the task already mentions 'tw signal' to
+    # avoid duplication when callers inject their own signal instructions.
+    if [[ "$task" != *"tw signal"* ]]; then
+        task="${task}
+
+---
+When you finish this task, run: tw signal ${feature} ${worker} done
+(This notifies the orchestrator that your work is complete.)"
+    fi
+
     local session_key project config_dir tmux_session bead_id
     resolve_session "$feature"
 
