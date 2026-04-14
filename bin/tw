@@ -1692,19 +1692,40 @@ with open(sys.argv[1], 'w') as f:
 
 bead_create() {
     local title="$1" bd_dir="${2:-}"
-    bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>/dev/null | grep -oE '[a-zA-Z]+-[a-z0-9]+' | head -1 || true
+    local err_file out rc
+    err_file=$(mktemp -t tw-bead-create.XXXXXX)
+    out=$(bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>"$err_file")
+    rc=$?
+    local err_out
+    err_out=$(<"$err_file")
+    rm -f "$err_file"
+    if [[ $rc -ne 0 ]]; then
+        echo "[tw] error: bd create failed (exit $rc) for title: $title" >&2
+        [[ -n "$bd_dir" ]] && echo "[tw]        workspace: $bd_dir" >&2
+        [[ -n "$err_out" ]] && echo "$err_out" >&2
+        return 1
+    fi
+    local bead_id
+    bead_id=$(echo "$out" | grep -oE '[a-zA-Z]+-[a-z0-9]+' | head -1)
+    if [[ -z "$bead_id" ]]; then
+        echo "[tw] error: bd create returned no parseable bead id for title: $title" >&2
+        [[ -n "$out" ]] && echo "$out" >&2
+        return 1
+    fi
+    echo "$bead_id"
 }
 
 bead_find_or_create() {
     local title="$1" bd_dir="${2:-}"
     local bead_id
-    bead_id=$(bead_find_open "$title" "$bd_dir")
+    bead_id=$(bead_find_open "$title" "$bd_dir" || true)
     if [[ -z "$bead_id" ]]; then
-        bead_id=$(bead_create "$title" "$bd_dir")
+        bead_id=$(bead_create "$title" "$bd_dir") || return 1
         log "Created bead $bead_id: $title"
     else
         log "Reusing bead $bead_id: $title"
     fi
+    [[ -z "$bead_id" ]] && return 1
     echo "$bead_id"
 }
 
@@ -2259,7 +2280,11 @@ for name, info in svcs.items():
         bead_id="$existing_bead_id"
         log "Reusing existing bead: $bead_id"
     else
-        bead_id=$(bead_find_or_create "$bead_title" "$config_dir")
+        bead_id=$(bead_find_or_create "$bead_title" "$config_dir") || bead_id=""
+    fi
+
+    if [[ -z "$bead_id" ]]; then
+        die "bead creation failed for '$bead_title' — check dolt daemon state with 'bd doctor' in $config_dir, or 'rm -rf $config_dir/.beads && bd init' to reinitialize. Refusing to write a bead-less session entry."
     fi
 
     # PM issue
@@ -3513,6 +3538,87 @@ PYEOF
 
     local count
     count=$(echo "$feature_beads" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+
+    # ─── Fallback: sessions.json entry without a matching bead ────────────────
+    # Some sessions.json entries have an empty bead_id (e.g. created before
+    # bead integration, or bead creation failed silently). `tw list` happily
+    # shows them but the bead scan above returns nothing. Lazy-create a bead
+    # from the session entry so resume can proceed.
+    if [[ "$count" == "0" && $all -eq 0 && -n "$target_feature" ]]; then
+        local fb_sk
+        fb_sk=$(python3 - "$target_feature" <<'PYEOF'
+import json, os, sys
+target = sys.argv[1]
+try:
+    d = json.load(open(os.path.expanduser("~/.tiddly-winks/sessions.json")))
+except Exception:
+    sys.exit(0)
+for k, v in d.items():
+    if v.get("feature") == target or k.endswith("-" + target):
+        print(k)
+        break
+PYEOF
+        )
+        if [[ -n "$fb_sk" ]]; then
+            local fb_proj fb_ws fb_branch fb_mode fb_dw new_bead_id
+            fb_proj=$(sessions_get_key "$fb_sk" "project")
+            fb_ws=$(sessions_get_key "$fb_sk" "workspace")
+            fb_branch=$(sessions_get_key "$fb_sk" "branch")
+            fb_mode=$(sessions_get_key "$fb_sk" "mode")
+            [[ -z "$fb_mode" ]] && fb_mode="local"
+
+            if [[ ! -d "$fb_ws" ]]; then
+                die "sessions.json entry '$fb_sk' references missing workspace: $fb_ws"
+            fi
+
+            log "No bead matched '$target_feature' — falling back to sessions.json entry '$fb_sk' and lazy-creating a bead"
+
+            # Ensure bead store exists in the workspace
+            if [[ ! -d "$fb_ws/.beads" ]]; then
+                (cd "$fb_ws" && bd init --stealth --prefix "$fb_proj" --quiet 2>/dev/null) || true
+            fi
+
+            new_bead_id=$(bead_find_or_create "$target_feature ($fb_proj)" "$fb_ws" 2>/dev/null || true)
+            if [[ -z "$new_bead_id" ]]; then
+                log "WARNING: lazy bead creation failed for '$target_feature' in $fb_ws (likely broken .beads store). Proceeding in bead-less degraded mode."
+            else
+                bead_mark_in_progress "$new_bead_id" "$fb_ws"
+                # Write bead_id back into sessions.json so future resumes skip the fallback
+                python3 - "$fb_sk" "$new_bead_id" <<'PYEOF'
+import json, os, sys
+sk, bid = sys.argv[1], sys.argv[2]
+f = os.path.expanduser("~/.tiddly-winks/sessions.json")
+d = json.load(open(f))
+if sk in d:
+    d[sk]["bead_id"] = bid
+    json.dump(d, open(f, "w"), indent=2)
+PYEOF
+            fi
+
+            # Preserve dynamic_workers from sessions.json so respawn still works
+            fb_dw=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+v = d.get('$fb_sk', {}).get('dynamic_workers', [])
+print(json.dumps(v))
+" 2>/dev/null || echo "[]")
+
+            feature_beads=$(python3 -c "
+import json, sys
+print(json.dumps([{
+    '_sk': sys.argv[1],
+    'bead_id': sys.argv[2],
+    'feature': sys.argv[3],
+    'project': sys.argv[4],
+    'branch': sys.argv[5],
+    'workspace': sys.argv[6],
+    'mode': sys.argv[7],
+    'dynamic_workers': sys.argv[8],
+}]))
+" "$fb_sk" "$new_bead_id" "$target_feature" "$fb_proj" "$fb_branch" "$fb_ws" "$fb_mode" "$fb_dw")
+            count=1
+        fi
+    fi
 
     if [[ "$count" == "0" ]]; then
         if [[ $all -eq 1 ]]; then
