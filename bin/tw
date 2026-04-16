@@ -2303,7 +2303,9 @@ reconcile_workers() {
 
 # ─── Subcommands ─────────────────────────────────────────────────────────────
 
-cmd_start() {
+# Start a single feature session. Called by cmd_start for each target.
+# Parses its own flags; cmd_start passes through --mode / --attach verbatim.
+_start_one_session() {
     local feature="" mode="local" attach_flag=0
 
     while [[ $# -gt 0 ]]; do
@@ -2904,6 +2906,64 @@ EOF
 
         tmux select-window -t "=$tmux_session:god" 2>/dev/null || true
         exec tmux attach-session -t "=$tmux_session"
+    fi
+}
+
+cmd_start() {
+    # Collect targets and pass-through flags. Only the first positional arg is
+    # the (possibly comma-separated) target list; flags are forwarded verbatim.
+    local targets=""
+    local -a passthrough=()
+    local attach_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode) passthrough+=("$1" "$2"); shift 2 ;;
+            --mode=*) passthrough+=("$1"); shift ;;
+            --attach) passthrough+=("$1"); attach_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$targets" ]]; then
+                    targets="$1"
+                else
+                    die "Unexpected extra argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$targets" ]] && die "Usage: tw start <feature>[,<feature>,...] [--mode staging] [--attach]"
+
+    # Split comma-separated targets
+    local IFS=','
+    local -a target_list=($targets)
+    unset IFS
+
+    if [[ ${#target_list[@]} -gt 1 && $attach_flag -eq 1 ]]; then
+        die "--attach is only valid for a single feature (not a comma-separated list)"
+    fi
+
+    local failed=() succeeded=0
+    for target in "${target_list[@]}"; do
+        # Trim whitespace
+        target="${target## }"
+        target="${target%% }"
+        [[ -z "$target" ]] && continue
+
+        # Run in subshell so a die() inside _start_one_session (e.g. session
+        # already running, bead creation failure) only aborts that one target.
+        if ( _start_one_session "$target" "${passthrough[@]}" ); then
+            ((succeeded++)) || true
+        else
+            echo "  Error: failed to start '$target'"
+            failed+=("$target")
+        fi
+    done
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Failed to start ${#failed[@]} session(s): ${failed[*]}"
+        return 1
     fi
 }
 
@@ -8807,7 +8867,7 @@ tw — tiddly-winks: feature space manager
 
 Commands:
   tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
-  tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
+  tw start <feature>[,...] [--mode staging]  Create feature space(s) (worktrees, DB, services)
   tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
   tw list [--project=X] [--json]         List active sessions
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
