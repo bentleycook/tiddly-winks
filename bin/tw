@@ -3629,7 +3629,10 @@ cmd_reconcile() {
 
 # ─── Resume from beads after hard reset ──────────────────────────────────────
 
-cmd_resume() {
+# Resume a single feature (or all, if --all is passed). Called by cmd_resume
+# for each target in a comma-separated list. Accepts either a single feature
+# name/index or --all.
+_resume_one_session() {
     local target_feature="" all=0
 
     while [[ $# -gt 0 ]]; do
@@ -4015,6 +4018,62 @@ for item in json.load(sys.stdin):
     echo "  Resume complete. $i session(s) restarted."
     echo "  Run 'tw list' to see all sessions."
     echo ""
+}
+
+cmd_resume() {
+    local targets="" all=0
+    local -a passthrough=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=1; passthrough+=("$1"); shift ;;
+            -*) die "Unknown option: $1" ;;
+            *)
+                if [[ -z "$targets" ]]; then
+                    targets="$1"
+                else
+                    die "Unexpected extra argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -z "$targets" && $all -eq 0 ]] \
+        && die "Usage: tw resume <feature|N>[,<feature|N>,...] | tw resume --all"
+
+    # --all mode: no target list, single invocation
+    if [[ $all -eq 1 ]]; then
+        _resume_one_session --all
+        return $?
+    fi
+
+    # Split comma-separated targets
+    local IFS=','
+    local -a target_list=($targets)
+    unset IFS
+
+    local failed=() succeeded=0
+    for target in "${target_list[@]}"; do
+        # Trim whitespace
+        target="${target## }"
+        target="${target%% }"
+        [[ -z "$target" ]] && continue
+
+        # Run in subshell so a die() inside _resume_one_session (e.g. no bead
+        # found for target) only aborts that one target.
+        if ( _resume_one_session "$target" ); then
+            ((succeeded++)) || true
+        else
+            echo "  Error: failed to resume '$target'"
+            failed+=("$target")
+        fi
+    done
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Failed to resume ${#failed[@]} session(s): ${failed[*]}"
+        return 1
+    fi
 }
 
 
@@ -8896,7 +8955,7 @@ Agent commands (used by Claude workers):
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
   tw reconcile [<feature>]              Derive state from reality (filesystem, tmux, beads)
-  tw resume <feature>                   Resume a feature from bead state after hard reset
+  tw resume <feature>[,...]             Resume feature(s) from bead state after hard reset
   tw resume --all                       Resume all in-progress features from beads
   tw gates <feature> [--gate=NAME]       Run quality gates (all or specific)
   tw config proxy <feature> <sub> <svc>   Remap a proxy route at runtime
