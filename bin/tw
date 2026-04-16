@@ -752,10 +752,13 @@ allocate_port() {
 # ─── Caddyfile Generation ────────────────────────────────────────────────────
 
 regen_caddyfile() {
-    python3 - "$SESSIONS_FILE" "$CADDYFILE" <<'EOF'
-import json, sys
+    local overrides_dir="$TW_DIR/caddy-overrides"
+    mkdir -p "$overrides_dir"
+    python3 - "$SESSIONS_FILE" "$CADDYFILE" "$overrides_dir" <<'EOF'
+import json, sys, os
 
 sessions = json.load(open(sys.argv[1]))
+overrides_dir = sys.argv[3]
 lines = [
     '{',
     '    # Caddy admin API — needed for hot reload',
@@ -780,8 +783,13 @@ for session_key, session in sessions.items():
             host = f'{project}-{feature}.localhost'
         else:
             host = f'{project}-{feature}-{subdomain}.localhost'
+
+        override_file = os.path.join(overrides_dir, f'{host}.caddy')
         lines.append(f'http://{host} {{')
-        lines.append(f'    reverse_proxy localhost:{port}')
+        if os.path.isfile(override_file):
+            lines.append(f'    import {override_file}')
+        else:
+            lines.append(f'    reverse_proxy localhost:{port}')
         lines.append('}')
         lines.append('')
 
