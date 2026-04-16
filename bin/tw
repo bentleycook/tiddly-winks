@@ -3212,13 +3212,14 @@ cmd_done() {
 }
 
 cmd_list() {
-    local filter_project="" json_flag=0
+    local filter_project="" json_flag=0 sort_project=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --project=*) filter_project="${1#--project=}"; shift ;;
             --project) filter_project="$2"; shift 2 ;;
             --json) json_flag=1; shift ;;
+            -p) sort_project=1; shift ;;
             *) shift ;;
         esac
     done
@@ -3226,12 +3227,13 @@ cmd_list() {
     local sessions_data
     sessions_data=$(sessions_read)
 
-    python3 - "$sessions_data" "$filter_project" "$json_flag" <<'EOF'
+    python3 - "$sessions_data" "$filter_project" "$json_flag" "$sort_project" <<'EOF'
 import json, sys, subprocess
 
 data = json.loads(sys.argv[1])
 filter_proj = sys.argv[2]
 json_flag = sys.argv[3] == "1"
+sort_project = sys.argv[4] == "1"
 
 if not data:
     if json_flag:
@@ -3246,13 +3248,11 @@ def feature_alive(project, feature):
     return r.returncode == 0
 
 rows = []
-idx = 0
 for key, s in data.items():
     proj = s.get('project', '')
     feat = s.get('feature', '')
     if filter_proj and proj != filter_proj:
         continue
-    idx += 1
     bead = s.get('bead_id', '')
     mode = s.get('mode', '')
     started = s.get('started', '')[:16].replace('T', ' ')
@@ -3262,7 +3262,6 @@ for key, s in data.items():
     engines = sorted(set(w.get('engine', 'claude') for w in workers.values())) if workers else ['claude']
     engines_str = ','.join(engines)
     rows.append({
-        "index": idx,
         "project": proj,
         "feature": feat,
         "status": status,
@@ -3272,6 +3271,14 @@ for key, s in data.items():
         "session_key": key,
         "engines": engines_str,
     })
+
+if sort_project:
+    # Stable sort by project name so within-project order is preserved
+    rows.sort(key=lambda r: r['project'])
+
+# Number rows after any sort so indices match what the user sees
+for i, r in enumerate(rows, start=1):
+    r['index'] = i
 
 if json_flag:
     print(json.dumps(rows, indent=2))
