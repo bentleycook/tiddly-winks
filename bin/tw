@@ -2907,21 +2907,11 @@ EOF
     fi
 }
 
-cmd_stop() {
-    local feature="" done_flag=0
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --done) done_flag=1; shift ;;
-            -*) die "Unknown option: $1" ;;
-            *) feature="$1"; shift ;;
-        esac
-    done
-
-    [[ -z "$feature" ]] && die "Usage: tw stop <feature|N> [--done]"
-
-    local session_key project config_dir tmux_session bead_id
-    resolve_session "$feature"
+# Stop a single resolved session. Called by cmd_stop for each target.
+# Args: feature_name done_flag session_key project config_dir tmux_session bead_id
+_stop_one_session() {
+    local feature="$1" done_flag="$2" session_key="$3" project="$4"
+    local config_dir="$5" tmux_session="$6" bead_id="$7"
 
     # Kill activity spinner + reset circuit breakers
     spinner_stop "$session_key"
@@ -3091,6 +3081,65 @@ EOF
     else
         echo "  Bead $bead_id open. Restart with: tw start $feature"
         echo "  Remove with: tw stop $feature --done"
+    fi
+}
+
+cmd_stop() {
+    local targets="" done_flag=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --done) done_flag=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) targets="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "$targets" ]] && die "Usage: tw stop <feature|N>[,<feature|N>,...] [--done]"
+
+    # Split comma-separated targets into an array
+    local IFS=','
+    local -a target_list=($targets)
+    unset IFS
+
+    local failed=() succeeded=0
+    for target in "${target_list[@]}"; do
+        # Trim whitespace
+        target="${target## }"
+        target="${target%% }"
+        [[ -z "$target" ]] && continue
+
+        # resolve_session calls die() on failure (which exits), so run it in a
+        # subshell that prints the resolved values. This lets us catch failures
+        # without killing the whole script when processing multiple targets.
+        local _resolved
+        if ! _resolved=$(
+            resolve_session "$target"
+            printf '%s\t%s\t%s\t%s\t%s' "$session_key" "$project" "$config_dir" "$tmux_session" "$bead_id"
+        ) 2>/dev/null; then
+            echo "  Error: no session found for '$target' — skipping"
+            failed+=("$target")
+            continue
+        fi
+
+        local session_key project config_dir tmux_session bead_id
+        IFS=$'\t' read -r session_key project config_dir tmux_session bead_id <<< "$_resolved"
+
+        # Derive the feature name from session_key (strip project- prefix)
+        local feature="${session_key#"${project}-"}"
+
+        if _stop_one_session "$feature" "$done_flag" "$session_key" "$project" "$config_dir" "$tmux_session" "$bead_id"; then
+            ((succeeded++)) || true
+        else
+            echo "  Error: failed to stop '$target' ($session_key)"
+            failed+=("$target")
+        fi
+    done
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo ""
+        echo "  Failed to stop ${#failed[@]} session(s): ${failed[*]}"
+        return 1
     fi
 }
 
@@ -8759,7 +8808,7 @@ tw — tiddly-winks: feature space manager
 Commands:
   tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
   tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
-  tw stop <feature|N> [--done]           Stop session (--done tears down worktrees + closes bead)
+  tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
   tw list [--project=X] [--json]         List active sessions
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
 
