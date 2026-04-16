@@ -3203,6 +3203,14 @@ cmd_stop() {
     fi
 }
 
+# Thin wrapper: `tw done X[,Y,...]` === `tw stop X[,Y,...] --done`.
+# Explicit verb for "I'm finished with this feature" — tears down worktrees
+# and closes the bead. The --done flag on stop remains as-is for muscle memory.
+cmd_done() {
+    [[ $# -eq 0 ]] && die "Usage: tw done <feature|N>[,<feature|N>,...]"
+    cmd_stop "$@" --done
+}
+
 cmd_list() {
     local filter_project="" json_flag=0
 
@@ -8928,6 +8936,7 @@ Commands:
   tw init [--force]                     Analyze project and generate .tw.yml (uses Claude)
   tw start <feature>[,...] [--mode staging]  Create feature space(s) (worktrees, DB, services)
   tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
+  tw done <feature|N>[,...]               Stop session(s) AND tear down worktrees + close bead (explicit done)
   tw list [--project=X] [--json]         List active sessions
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
 
@@ -8980,6 +8989,7 @@ case "$subcommand" in
     init)    cmd_init "$@" ;;
     start)   cmd_start "$@" ;;
     stop)    cmd_stop "$@" ;;
+    done)    cmd_done "$@" ;;
     list)    cmd_list "$@" ;;
     status)  cmd_status "$@" ;;
     open)    cmd_open "$@" ;;
