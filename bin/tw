@@ -2303,6 +2303,62 @@ reconcile_workers() {
 
 # ─── Subcommands ─────────────────────────────────────────────────────────────
 
+# Roll back partial side effects from a failed _start_one_session.
+# Best-effort; reads captured state from arguments.
+_start_rollback_partial() {
+    local session_key="$1" tmux_session="$2" spawn_lock="$3"
+    local config_dir="$4" worktrees_base="$5" feature="$6"
+    shift 6
+    local -a worktree_paths=("$@")
+
+    [[ -z "$session_key" ]] && return 0
+    echo "[tw] rolling back partial init for '$session_key'" >&2
+
+    [[ -n "$tmux_session" ]] && tmux kill-session -t "=$tmux_session" 2>/dev/null || true
+    [[ -n "$spawn_lock" ]] && rm -f "$spawn_lock"
+
+    # For each tracked worktree path, capture the parent repo's git-common-dir
+    # *before* removal so we can prune its stale worktree registration afterward.
+    local -a common_dirs=()
+    for p in "${worktree_paths[@]}"; do
+        [[ -n "$p" && -e "$p" ]] || continue
+        local cd_
+        cd_=$(git -C "$p" rev-parse --git-common-dir 2>/dev/null) || cd_=""
+        if [[ -n "$cd_" && "$cd_" != "." ]]; then
+            # Resolve to absolute path
+            cd_=$(cd "$(dirname "$cd_")" 2>/dev/null && pwd)/$(basename "$cd_") 2>/dev/null || cd_=""
+        fi
+        [[ -n "$cd_" ]] && common_dirs+=("$cd_")
+        rm -rf "$p" 2>/dev/null || true
+    done
+    if [[ -n "$worktrees_base" && -n "$feature" && -n "$config_dir" \
+          && "$feature" != *..* && "$feature" != */* ]]; then
+        rm -rf "$config_dir/$worktrees_base/$feature" 2>/dev/null || true
+    fi
+    # Prune each unique parent repo's worktree registry
+    local seen=""
+    for cd_ in ${common_dirs[@]+"${common_dirs[@]}"}; do
+        [[ " $seen " == *" $cd_ "* ]] && continue
+        seen+=" $cd_"
+        [[ -d "$cd_" ]] && git --git-dir="$cd_" worktree prune 2>/dev/null || true
+    done
+
+    rm -f "$TW_DIR/spinner-$session_key.pid" 2>/dev/null || true
+    rm -rf "$HOME/.tiddly-winks/hooked/$session_key" 2>/dev/null || true
+
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        python3 - "$SESSIONS_FILE" "$session_key" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    if d.pop(sys.argv[2], None) is not None:
+        json.dump(d, open(sys.argv[1], 'w'), indent=2)
+except Exception:
+    pass
+PYEOF
+    fi
+}
+
 # Start a single feature session. Called by cmd_start for each target.
 # Parses its own flags; cmd_start passes through --mode / --attach verbatim.
 _start_one_session() {
@@ -2342,6 +2398,16 @@ _start_one_session() {
 
     local session_key="${project}-${feature}"
     local tmux_session="$session_key"
+
+    # State captured for rollback on mid-init failure. Populated as side effects
+    # occur; the EXIT trap below uses these to clean up on abnormal exit.
+    declare -A worktree_paths=()
+    local spawn_lock=""
+    local worktrees_base=""
+    # Install rollback trap. Fires on any exit (including die()); cleared at the
+    # success point after sessions.json has been written. The `+` expansion
+    # keeps the call safe under `set -u` when worktree_paths is empty.
+    trap '_rc=$?; if [[ $_rc -ne 0 ]]; then _start_rollback_partial "$session_key" "$tmux_session" "$spawn_lock" "$config_dir" "$worktrees_base" "$feature" ${worktree_paths[@]+"${worktree_paths[@]}"}; fi; exit $_rc' EXIT
 
     # Reconcile state before checking session existence — derive truth from reality
     reconcile_session "$config_dir"
@@ -2410,12 +2476,12 @@ for name, info in svcs.items():
     pm_display=$(pm_format_for_bead "$tracker_type" "$pm_issue")
 
     # ─── Worktree Setup ───────────────────────────────────────────────────────
-    local worktrees_base branch_prefix
+    # worktrees_base is declared earlier (for rollback visibility); populate it here.
+    local branch_prefix
     worktrees_base=$(yaml_get_nested "$effective_config" "worktrees.base" "")
     branch_prefix=$(yaml_get_nested "$effective_config" "worktrees.branch_prefix" "")
 
-    # Associative arrays for worktree paths and db name
-    declare -A worktree_paths=()
+    # worktree_paths is declared earlier (for rollback visibility).
     local db_name=""
 
     local service_names
@@ -2690,7 +2756,8 @@ with open(sys.argv[1], 'w') as f:
 
     # Lock: prevent daemon from respawning workers while cmd_start is still spawning them.
     # The daemon checks for this lock and skips worker health checks for this session.
-    local spawn_lock="$TW_DIR/spawn-locks/${session_key}"
+    # Reuses outer-scope spawn_lock so the rollback trap can clean it up on die().
+    spawn_lock="$TW_DIR/spawn-locks/${session_key}"
     mkdir -p "$TW_DIR/spawn-locks"
     echo "$$" > "$spawn_lock"
 
@@ -2799,6 +2866,10 @@ print(json.dumps(data, indent=2))
 EOF
 )
     echo "$new_sessions" | sessions_write
+
+    # Init complete — clear rollback trap. State is now persisted in sessions.json;
+    # anything that fails below is recoverable by re-running tw start.
+    trap - EXIT
 
     # Regen Caddyfile and reload
     regen_caddyfile
@@ -2943,6 +3014,17 @@ cmd_start() {
         die "--attach is only valid for a single feature (not a comma-separated list)"
     fi
 
+    # Single-target: call directly so die() aborts tw loudly with its original
+    # exit code (pre-d58f542 behavior). The rollback trap inside
+    # _start_one_session still cleans up partial state.
+    if [[ ${#target_list[@]} -eq 1 ]]; then
+        local only="${target_list[0]}"
+        only="${only## }"; only="${only%% }"
+        [[ -z "$only" ]] && die "empty target"
+        _start_one_session "$only" "${passthrough[@]}"
+        return $?
+    fi
+
     local failed=() succeeded=0
     for target in "${target_list[@]}"; do
         # Trim whitespace
@@ -2952,6 +3034,8 @@ cmd_start() {
 
         # Run in subshell so a die() inside _start_one_session (e.g. session
         # already running, bead creation failure) only aborts that one target.
+        # The rollback trap inside _start_one_session cleans up partial state
+        # before the subshell exits.
         if ( _start_one_session "$target" "${passthrough[@]}" ); then
             ((succeeded++)) || true
         else
@@ -4066,6 +4150,16 @@ cmd_resume() {
     local IFS=','
     local -a target_list=($targets)
     unset IFS
+
+    # Single-target: call directly so die() aborts tw loudly with its original
+    # exit code (pre-2cf1f6a behavior).
+    if [[ ${#target_list[@]} -eq 1 ]]; then
+        local only="${target_list[0]}"
+        only="${only## }"; only="${only%% }"
+        [[ -z "$only" ]] && die "empty target"
+        _resume_one_session "$only"
+        return $?
+    fi
 
     local failed=() succeeded=0
     for target in "${target_list[@]}"; do
