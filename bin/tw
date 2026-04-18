@@ -3151,6 +3151,12 @@ for svc, path in wt.items():
 " 2>/dev/null || true)
 
         declare -A removed_worktrees=()
+        # Collect unique parent git roots so we can `git worktree prune` each
+        # one after the loop. Needed because `worktree remove` can fail when
+        # the worktree dir is already missing from a prior broken state,
+        # which leaves the parent's .git/worktrees/<name>/ registration stale
+        # and makes the next `tw start` fail with "worktree already exists".
+        declare -A parent_git_roots=()
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
             local wt_svc="${line%%:*}"
@@ -3173,17 +3179,27 @@ for svc, path in wt.items():
             fi
 
             if [[ -n "${git_root:-}" && -e "$git_root/.git" ]]; then
+                parent_git_roots[$git_root]=1
                 local wt_err
                 if wt_err=$(git -C "$git_root" worktree remove "$wt_git_root" --force 2>&1); then
                     log "Removed worktree: $wt_git_root"
                 else
-                    log "Warning: could not remove worktree: $wt_git_root"
+                    # Stale metadata or subpath of a registered worktree —
+                    # the post-loop `worktree prune` below cleans up registry
+                    # entries that point to missing paths.
+                    log "Warning: git worktree remove failed for $wt_git_root"
                     log "  git said: $wt_err"
-                    log "  (session will still be removed — clean up worktree manually)"
+                    log "  (pruning stale metadata from $git_root after loop)"
                 fi
             fi
             removed_worktrees[$wt_git_root]=1
         done <<< "$worktrees_json"
+
+        # Always prune each parent repo's worktree registry. Cheap no-op when
+        # everything removed cleanly; fixes stale state otherwise.
+        for _pgr in "${!parent_git_roots[@]}"; do
+            git -C "$_pgr" worktree prune 2>/dev/null || true
+        done
 
         # Clean up empty worktrees/<feature>/ directory
         local worktrees_base feature_wt_dir
