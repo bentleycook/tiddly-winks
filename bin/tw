@@ -2304,38 +2304,50 @@ reconcile_workers() {
 # ─── Subcommands ─────────────────────────────────────────────────────────────
 
 # Roll back partial side effects from a failed _start_one_session.
-# Best-effort; reads captured state from arguments.
+# Only acts on state flagged as "owned this invocation" — never touches
+# pre-existing tmux sessions, worktrees, or sessions.json entries that
+# were already there when we started. Ownership flags default to "0" and
+# are only flipped to "1" right after we successfully create the resource.
 _start_rollback_partial() {
-    local session_key="$1" tmux_session="$2" spawn_lock="$3"
-    local config_dir="$4" worktrees_base="$5" feature="$6"
-    shift 6
-    local -a worktree_paths=("$@")
+    local session_key="$1" feature="$2" config_dir="$3"
+    local tmux_session="$4" spawn_lock="$5"
+    local owned_tmux="$6" owned_spawn_lock="$7"
+    local owned_sessions_entry="$8" owned_spinner="$9" owned_hooked="${10}"
+    shift 10
+    local -a owned_worktrees=("$@")
 
     [[ -z "$session_key" ]] && return 0
+
+    # Nothing to do if we created nothing.
+    if [[ "$owned_tmux" != "1" && "$owned_spawn_lock" != "1" \
+          && "$owned_sessions_entry" != "1" && "$owned_spinner" != "1" \
+          && "$owned_hooked" != "1" && ${#owned_worktrees[@]} -eq 0 ]]; then
+        return 0
+    fi
+
     echo "[tw] rolling back partial init for '$session_key'" >&2
 
-    [[ -n "$tmux_session" ]] && tmux kill-session -t "=$tmux_session" 2>/dev/null || true
-    [[ -n "$spawn_lock" ]] && rm -f "$spawn_lock"
+    [[ "$owned_tmux" == "1" && -n "$tmux_session" ]] \
+        && tmux kill-session -t "=$tmux_session" 2>/dev/null || true
+    [[ "$owned_spawn_lock" == "1" && -n "$spawn_lock" ]] && rm -f "$spawn_lock"
+    [[ "$owned_spinner" == "1" ]] \
+        && rm -f "$TW_DIR/spinner-$session_key.pid" 2>/dev/null || true
+    [[ "$owned_hooked" == "1" ]] \
+        && rm -rf "$HOME/.tiddly-winks/hooked/$session_key" 2>/dev/null || true
 
-    # For each tracked worktree path, capture the parent repo's git-common-dir
-    # *before* removal so we can prune its stale worktree registration afterward.
+    # Capture each worktree's parent git common-dir before removal so we can
+    # prune the stale registration afterward.
     local -a common_dirs=()
-    for p in "${worktree_paths[@]}"; do
+    for p in "${owned_worktrees[@]}"; do
         [[ -n "$p" && -e "$p" ]] || continue
         local cd_
         cd_=$(git -C "$p" rev-parse --git-common-dir 2>/dev/null) || cd_=""
         if [[ -n "$cd_" && "$cd_" != "." ]]; then
-            # Resolve to absolute path
             cd_=$(cd "$(dirname "$cd_")" 2>/dev/null && pwd)/$(basename "$cd_") 2>/dev/null || cd_=""
         fi
         [[ -n "$cd_" ]] && common_dirs+=("$cd_")
         rm -rf "$p" 2>/dev/null || true
     done
-    if [[ -n "$worktrees_base" && -n "$feature" && -n "$config_dir" \
-          && "$feature" != *..* && "$feature" != */* ]]; then
-        rm -rf "$config_dir/$worktrees_base/$feature" 2>/dev/null || true
-    fi
-    # Prune each unique parent repo's worktree registry
     local seen=""
     for cd_ in ${common_dirs[@]+"${common_dirs[@]}"}; do
         [[ " $seen " == *" $cd_ "* ]] && continue
@@ -2343,10 +2355,7 @@ _start_rollback_partial() {
         [[ -d "$cd_" ]] && git --git-dir="$cd_" worktree prune 2>/dev/null || true
     done
 
-    rm -f "$TW_DIR/spinner-$session_key.pid" 2>/dev/null || true
-    rm -rf "$HOME/.tiddly-winks/hooked/$session_key" 2>/dev/null || true
-
-    if [[ -f "$SESSIONS_FILE" ]]; then
+    if [[ "$owned_sessions_entry" == "1" && -f "$SESSIONS_FILE" ]]; then
         python3 - "$SESSIONS_FILE" "$session_key" <<'PYEOF' 2>/dev/null || true
 import json, sys
 try:
@@ -2404,10 +2413,18 @@ _start_one_session() {
     declare -A worktree_paths=()
     local spawn_lock=""
     local worktrees_base=""
+    # Ownership flags: flip to 1 ONLY after we actually create the resource.
+    # Rollback must never touch pre-existing state that belonged to an already-
+    # running or stopped session we were about to reuse — specifically:
+    # killing the tmux session / wiping worktrees on a `tw start <already-running>`
+    # die is catastrophic data loss. Rollback guards every action on these flags.
+    local _owned_tmux=0 _owned_spawn_lock=0 _owned_sessions_entry=0
+    local _owned_spinner=0 _owned_hooked=0
+    declare -a _owned_worktrees=()
     # Install rollback trap. Fires on any exit (including die()); cleared at the
     # success point after sessions.json has been written. The `+` expansion
-    # keeps the call safe under `set -u` when worktree_paths is empty.
-    trap '_rc=$?; if [[ $_rc -ne 0 ]]; then _start_rollback_partial "$session_key" "$tmux_session" "$spawn_lock" "$config_dir" "$worktrees_base" "$feature" ${worktree_paths[@]+"${worktree_paths[@]}"}; fi; exit $_rc' EXIT
+    # keeps the call safe under `set -u` when _owned_worktrees is empty.
+    trap '_rc=$?; if [[ $_rc -ne 0 ]]; then _start_rollback_partial "$session_key" "$feature" "$config_dir" "$tmux_session" "$spawn_lock" "$_owned_tmux" "$_owned_spawn_lock" "$_owned_sessions_entry" "$_owned_spinner" "$_owned_hooked" ${_owned_worktrees[@]+"${_owned_worktrees[@]}"}; fi; exit $_rc' EXIT
 
     # Reconcile state before checking session existence — derive truth from reality
     reconcile_session "$config_dir"
@@ -2575,6 +2592,10 @@ for name, info in svcs.items():
                 mkdir -p "$(dirname "$worktree_path")"
                 if git -C "$git_root" worktree add "$worktree_path" "$branch" 2>/dev/null; then
                     log "Created worktree: $worktree_path (repo: $repo_name)"
+                    # Track as rollback-owned: WE created this one. If init fails
+                    # later, the trap will `rm -rf` this path (but not any
+                    # pre-existing worktree we just happened to find).
+                    _owned_worktrees+=("$worktree_path")
                 else
                     log "Worktree already exists: $worktree_path"
                 fi
@@ -2617,6 +2638,7 @@ for name, info in svcs.items():
     # Start tmux session for this feature
     # Window 0 is "god" (orchestrator) — always claude engine
     tmux new-session -d -s "$tmux_session" -n "god"
+    _owned_tmux=1  # WE created this tmux session; rollback may kill it
     local _god_cmd
     _god_cmd=$(engine_spawn_cmd "claude" "$feature")
     tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' $_god_cmd" Enter
@@ -2630,6 +2652,7 @@ for name, info in svcs.items():
     # Create hooked JSON for god so it can receive nudges via tw-mail-check hook
     local hooked_dir="$HOME/.tiddly-winks/hooked/${session_key}"
     mkdir -p "$hooked_dir"
+    _owned_hooked=1  # WE own this hooked dir; rollback may rm -rf it
     python3 -c "
 import json, sys
 with open(sys.argv[1], 'w') as f:
@@ -2760,6 +2783,7 @@ with open(sys.argv[1], 'w') as f:
     spawn_lock="$TW_DIR/spawn-locks/${session_key}"
     mkdir -p "$TW_DIR/spawn-locks"
     echo "$$" > "$spawn_lock"
+    _owned_spawn_lock=1  # WE created this lock; rollback may remove it
 
     # Add worker windows (persistent Claude agents with roles)
     local worker_pairs
