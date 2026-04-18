@@ -721,32 +721,46 @@ port_in_use() {
     lsof -i ":$port" -t >/dev/null 2>&1
 }
 
+# Allocate a free port, avoiding ports already claimed in sessions.json, ports
+# allocated earlier in THIS run, and ports currently in use by the OS.
+#
+# Uses a nameref out-param rather than stdout so the function runs in the
+# caller's shell: `$(allocate_port …)` would execute in a subshell and any
+# push to ALLOCATED_THIS_RUN would be discarded on return, causing two
+# services with the same port_hint to both claim the hint.
+#
+# Usage:   allocate_port <out_var> <hint>
+# Example: local p; allocate_port p 3000
 allocate_port() {
-    local hint="$1"
-    local port=$hint
-    local claimed
-    claimed=$(claimed_ports)
+    # Internal vars prefixed with __ to avoid nameref shadow: if a local var
+    # has the same name as the caller's out-var (typical case: both named
+    # "port"), the nameref resolves to the local instead of the caller.
+    local -n __out_port="$1"
+    local __hint="$2"
+    local __port=$__hint
+    local __claimed
+    __claimed=$(claimed_ports)
 
     while true; do
         # Check not in sessions.json
-        if echo " $claimed " | grep -q " $port "; then
-            ((port++)); continue
+        if echo " $__claimed " | grep -q " $__port "; then
+            ((__port++)); continue
         fi
         # Check not allocated this run
-        local found=0
-        for p in "${ALLOCATED_THIS_RUN[@]:-}"; do
-            [[ "$p" == "$port" ]] && { found=1; break; }
+        local __found=0
+        for __p in "${ALLOCATED_THIS_RUN[@]:-}"; do
+            [[ "$__p" == "$__port" ]] && { __found=1; break; }
         done
-        [[ $found -eq 1 ]] && { ((port++)); continue; }
+        [[ $__found -eq 1 ]] && { ((__port++)); continue; }
         # Check not in use by OS
-        if port_in_use "$port"; then
-            ((port++)); continue
+        if port_in_use "$__port"; then
+            ((__port++)); continue
         fi
         break
     done
 
-    ALLOCATED_THIS_RUN+=("$port")
-    echo "$port"
+    ALLOCATED_THIS_RUN+=("$__port")
+    __out_port="$__port"
 }
 
 # ─── Caddyfile Generation ────────────────────────────────────────────────────
@@ -2681,7 +2695,7 @@ with open(sys.argv[1], 'w') as f:
         env_var=$(yaml_service_get "$effective_config" "$svc" "env" "")
 
         local port
-        port=$(allocate_port "$port_hint")
+        allocate_port port "$port_hint"
         service_data[$svc]="$port"
 
         # Substitute {port} in command and env
