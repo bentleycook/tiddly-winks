@@ -3386,7 +3386,10 @@ def feature_alive(project, feature):
     return r.returncode == 0
 
 rows = []
-for key, s in data.items():
+# Index by full sessions.json insertion order so displayed # always matches
+# what resolve_session / cmd_attach resolve for a numeric argument. Filters
+# and sorts below only reorder or drop rows — they never renumber.
+for full_idx, (key, s) in enumerate(data.items(), start=1):
     proj = s.get('project', '')
     feat = s.get('feature', '')
     if filter_proj and proj != filter_proj:
@@ -3400,6 +3403,7 @@ for key, s in data.items():
     engines = sorted(set(w.get('engine', 'claude') for w in workers.values())) if workers else ['claude']
     engines_str = ','.join(engines)
     rows.append({
+        "index": full_idx,
         "project": proj,
         "feature": feat,
         "status": status,
@@ -3411,12 +3415,10 @@ for key, s in data.items():
     })
 
 if sort_project:
-    # Stable sort by project name so within-project order is preserved
+    # Stable sort by project name so within-project order is preserved.
+    # Indices are NOT renumbered — # column stays tied to sessions.json order
+    # so `tw stop N` resolves to the same session the user sees.
     rows.sort(key=lambda r: r['project'])
-
-# Number rows after any sort so indices match what the user sees
-for i, r in enumerate(rows, start=1):
-    r['index'] = i
 
 if json_flag:
     print(json.dumps(rows, indent=2))
