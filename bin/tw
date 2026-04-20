@@ -471,6 +471,19 @@ PYEOF
             project=$(yaml_get "$_rs_config_file" "project" "")
             config_dir="$(dirname "$_rs_config_file")"
             session_key="${project}-${_rs_feature}"
+            # Verify the synthesized key exists. If not, fall back to
+            # sessions.json lookup so `tw done <feat>` from the "wrong"
+            # workspace still resolves instead of silently fabricating a
+            # non-existent key. Update project/config_dir from the match.
+            if ! sessions_list_keys | grep -Fxq "$session_key"; then
+                session_key=$(sessions_list_keys | grep -Fx "$_rs_feature" | head -1 || true)
+                if [[ -z "$session_key" ]]; then
+                    session_key=$(sessions_list_keys | grep -F "$_rs_feature" | head -1 || true)
+                fi
+                [[ -z "$session_key" ]] && die "No session for '$_rs_feature' (tried ${project}-${_rs_feature} and substring match across all projects)"
+                project=$(sessions_get_key "$session_key" "project")
+                config_dir=$(sessions_get_key "$session_key" "workspace")
+            fi
         else
             session_key=$(sessions_list_keys | grep -Fx "$_rs_feature" | head -1 || true)
             if [[ -z "$session_key" ]]; then
