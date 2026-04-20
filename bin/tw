@@ -3108,6 +3108,14 @@ _stop_one_session() {
     local feature="$1" done_flag="$2" session_key="$3" project="$4"
     local config_dir="$5" tmux_session="$6" bead_id="$7"
 
+    # Defence-in-depth: never run teardown/success messaging for a
+    # session that doesn't exist. Without this guard, data.pop(k, None)
+    # silently no-ops and the echo lines at the bottom falsely report
+    # "Stopped / Session removed".
+    if ! sessions_list_keys | grep -Fxq "$session_key"; then
+        die "No session '$session_key' in sessions.json"
+    fi
+
     # Kill activity spinner + reset circuit breakers
     spinner_stop "$session_key"
     breaker_reset_all "$session_key"
