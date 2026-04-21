@@ -3378,12 +3378,33 @@ cmd_list() {
             --project=*) filter_project="${1#--project=}"; shift ;;
             --project) filter_project="$2"; shift 2 ;;
             --name=*) filter_project="${1#--name=}"; shift ;;
-            --name|-n) filter_project="$2"; shift 2 ;;
+            --name|-n)
+                # Optional argument: bare -n (no value or next arg is another
+                # flag) means "filter to the project at cwd".
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    filter_project="__CWD__"
+                    shift
+                else
+                    filter_project="$2"; shift 2
+                fi
+                ;;
             --json) json_flag=1; shift ;;
             -p) sort_project=1; shift ;;
             *) shift ;;
         esac
     done
+
+    if [[ "$filter_project" == "__CWD__" ]]; then
+        local _cfg _proj=""
+        if _cfg=$(find_config 2>/dev/null); then
+            _proj=$(yaml_get "$_cfg" "project" "" 2>/dev/null || true)
+        fi
+        if [[ -z "$_proj" ]]; then
+            echo "tw list: -n without a value requires running inside a tw workspace" >&2
+            return 1
+        fi
+        filter_project="$_proj"
+    fi
 
     local sessions_data
     sessions_data=$(sessions_read)
@@ -9129,7 +9150,7 @@ Commands:
   tw start <feature>[,...] [--mode staging]  Create feature space(s) (worktrees, DB, services)
   tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
   tw done <feature|N>[,...]               Stop session(s) AND tear down worktrees + close bead (explicit done)
-  tw list [-n NAME|--project=X] [--json]  List active sessions (-n/--name case-insensitive alias of --project)
+  tw list [-n [NAME]|--project=X] [--json]  List sessions (bare -n: project at cwd; -n NAME: case-insensitive filter)
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
 
 Agent commands (used by Claude workers):
