@@ -5074,86 +5074,14 @@ When you finish this task, run: tw signal ${feature} ${worker} done
     # Clear done signal — worker is being re-activated
     worker_signal_clear_all "$session_key" "$worker" 2>/dev/null || true
 
-    # ─── Bead-backed task dispatch ───────────────────────────────────────────
-    # Create a task bead so the work item persists even if the worker dies.
-    # The bead is the source of truth; the nudge is just a wake-up signal.
-
     local hooked_file="$HOME/.tiddly-winks/hooked/${session_key}/${worker}.json"
-    local worker_bead_id="" bead_id="" task_bead_id=""
-    if [[ -f "$hooked_file" ]]; then
-        eval "$(python3 -c "
-import json, shlex
-d = json.load(open('$hooked_file'))
-print(f'worker_bead_id={shlex.quote(d.get(\"worker_bead_id\", \"\"))}')
-print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
-" 2>/dev/null)"
-    fi
 
-    # Create task bead with full task text as description
-    # Must run bd from the project workspace where the .beads store lives
-    local task_title
-    task_title=$(printf '%.80s' "$task")
-    task_bead_id=$(cd "$config_dir" && bd create --title="$task_title" \
-        --description="$task" \
-        --type=task \
-        --priority=2 \
-        ${bead_id:+--parent="$bead_id"} \
-        2>/dev/null | grep -oE '[a-z0-9-]+-[a-z0-9]+' | head -1 || true)
-
-    if [[ -n "$task_bead_id" ]]; then
-        # Store assignment metadata on the task bead
-        (cd "$config_dir" && bd update "$task_bead_id" --status=in_progress \
-            --set-metadata "assigned_to=$worker" \
-            --set-metadata "assigned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --set-metadata "session=$session_key") \
-            2>/dev/null || true
-
-        # Write task bead ID to hooked file so worker picks it up on restart
-        if [[ -f "$hooked_file" ]]; then
-            python3 -c "
-import json, sys
-f = sys.argv[1]
-d = json.load(open(f))
-d['current_task'] = sys.argv[2]
-d['current_task_bead'] = sys.argv[3]
-with open(f, 'w') as fh:
-    json.dump(d, fh, indent=2)
-" "$hooked_file" "$task" "$task_bead_id" 2>/dev/null || true
-        fi
-
-        # Also record on worker identity bead for history
-        if [[ -n "$worker_bead_id" ]]; then
-            (cd "$config_dir" && bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task") 2>/dev/null || true
-        fi
-
-        # Nudge is just a wake-up referencing the bead
-        nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
-    else
-        # Fallback: bead creation failed, use old nudge-only behavior
-        log "WARN: task bead creation failed for $worker, falling back to nudge-only"
-        nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
-
-        if [[ -f "$hooked_file" ]]; then
-            python3 -c "
-import json, sys
-f = sys.argv[1]
-d = json.load(open(f))
-d['current_task'] = sys.argv[2]
-with open(f, 'w') as fh:
-    json.dump(d, fh, indent=2)
-" "$hooked_file" "$task" 2>/dev/null || true
-        fi
-
-        if [[ -n "$worker_bead_id" ]]; then
-            bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task" 2>/dev/null || true
-        fi
-    fi
-
-    # ─── Engine-aware task delivery ───────────────────────────────────────────
+    # ─── Resolve engine (including optional --engine switch) upfront ─────────
+    # The final engine must be known before we touch any state so the
+    # non-hook precheck below can abort cleanly if delivery isn't possible.
     local _send_engine
     _send_engine=$(worker_engine "$session_key" "$worker")
 
-    # --engine flag: switch engine if requested
     if [[ -n "$requested_engine" && "$requested_engine" != "$_send_engine" ]]; then
         _send_engine="$requested_engine"
         python3 -c "
@@ -5179,6 +5107,88 @@ with open(sys.argv[1], 'w') as fh:
         log "Switched $worker engine to $_send_engine"
     fi
 
+    # Non-hook engines have no mid-session drain path — they can only receive
+    # a new task via respawn. If the worker is busy we'd queue a nudge that
+    # never gets delivered (no daemon arms the respawn), so fail loudly
+    # before mutating any state (beads, hooked file, queue).
+    if ! engine_supports_hooks "$_send_engine"; then
+        local _precheck_state
+        _precheck_state=$(worker_state "$tmux_session" "$worker" "$(agents_dir "$session_key")" "$session_key")
+        if [[ "$_precheck_state" == "working" ]]; then
+            die "worker $worker ($_send_engine) is busy — non-hook engines cannot accept nudges while working. Retry when idle, or dispatch with --engine claude."
+        fi
+    fi
+
+    # ─── Bead-backed task dispatch ───────────────────────────────────────────
+    # Create a task bead so the work item persists even if the worker dies.
+    # The bead is the source of truth; the nudge is just a wake-up signal.
+
+    local worker_bead_id="" bead_id="" task_bead_id=""
+    if [[ -f "$hooked_file" ]]; then
+        eval "$(python3 -c "
+import json, shlex
+d = json.load(open('$hooked_file'))
+print(f'worker_bead_id={shlex.quote(d.get(\"worker_bead_id\", \"\"))}')
+print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
+" 2>/dev/null)"
+    fi
+
+    # Create task bead with full task text as description.
+    # Must run bd from the project workspace where the .beads store lives.
+    # Parse the new bead ID from bd's "Created issue: <id>" line — anchoring
+    # on the prefix so we can't mis-scrape a bead-shaped token from the title
+    # text, a flag like --db, or a warning banner. On any parse failure we
+    # fail loudly rather than silently clobbering an unrelated bead with
+    # `bd update`.
+    local task_title bd_output bd_status
+    task_title=$(printf '%.80s' "$task")
+    set +e
+    bd_output=$(cd "$config_dir" && bd create --title="$task_title" \
+        --description="$task" \
+        --type=task \
+        --priority=2 \
+        ${bead_id:+--parent="$bead_id"} 2>&1)
+    bd_status=$?
+    set -e
+    if [[ $bd_status -ne 0 ]]; then
+        log "bd create failed (exit $bd_status): $bd_output"
+        die "failed to create task bead for $worker"
+    fi
+    task_bead_id=$(echo "$bd_output" | sed -nE 's/.*Created issue:[[:space:]]+([a-z][a-z0-9]*(-[a-z0-9]+)+(\.[0-9]+)*).*/\1/p' | head -1)
+    if [[ -z "$task_bead_id" ]]; then
+        log "bd create output did not contain 'Created issue: <id>': $bd_output"
+        die "could not parse new bead ID from bd create output for $worker"
+    fi
+
+    # Store assignment metadata on the task bead
+    (cd "$config_dir" && bd update "$task_bead_id" --status=in_progress \
+        --set-metadata "assigned_to=$worker" \
+        --set-metadata "assigned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --set-metadata "session=$session_key") \
+        2>/dev/null || true
+
+    # Write task bead ID to hooked file so worker picks it up on restart
+    if [[ -f "$hooked_file" ]]; then
+        python3 -c "
+import json, sys
+f = sys.argv[1]
+d = json.load(open(f))
+d['current_task'] = sys.argv[2]
+d['current_task_bead'] = sys.argv[3]
+with open(f, 'w') as fh:
+    json.dump(d, fh, indent=2)
+" "$hooked_file" "$task" "$task_bead_id" 2>/dev/null || true
+    fi
+
+    # Also record on worker identity bead for history
+    if [[ -n "$worker_bead_id" ]]; then
+        (cd "$config_dir" && bd comments add "$worker_bead_id" "[TASK $(date -u +%Y-%m-%dT%H:%MZ)] $task") 2>/dev/null || true
+    fi
+
+    # Nudge is just a wake-up referencing the bead
+    nudge_enqueue "$session_key" "$worker" "$task" "$ttl"
+
+    # ─── Engine-aware task delivery ───────────────────────────────────────────
     if engine_supports_hooks "$_send_engine"; then
         # ── Hook-based engines (claude): nudge + wake via send_to_pane ──
         local target="=$tmux_session:$worker"
@@ -5199,62 +5209,56 @@ with open(sys.argv[1], 'w') as fh:
 
         local urgency_label=""
         [[ "$urgent" -eq 1 ]] && urgency_label=" (urgent, 2h TTL)"
-        if [[ -n "$task_bead_id" ]]; then
-            echo "  Task bead created: $task_bead_id (assigned to $worker)"
-        fi
+        echo "  Task bead created: $task_bead_id (assigned to $worker)"
         echo "  Nudge queued for $worker${urgency_label}: $task"
         echo "  Will be injected on next prompt turn via tw-mail-check hook."
     else
         # ── Non-hook engines (cursor, codex): respawn with task baked in ──
+        # Precheck above rejected the "working" state, so only idle/dead/done
+        # reach here. Kill the pane (if alive) and respawn with a fresh
+        # engine process; spawn_worker picks the new task up from hooked_file.
+        log "Respawning non-hook worker $worker with new task"
+
         local _state
         _state=$(worker_state "$tmux_session" "$worker" "$(agents_dir "$session_key")" "$session_key")
 
-        if [[ "$_state" == "working" ]]; then
-            log "Non-hook worker $worker is busy — task queued for respawn on completion"
-            echo "  Task queued for $worker (busy, will respawn with task on completion)"
-        else
-            log "Respawning non-hook worker $worker with new task"
-
-            if [[ "$_state" != "dead" ]]; then
-                local _exit_cmd
-                _exit_cmd=$(engine_exit_cmd "$_send_engine")
-                tmux send-keys -t "=$tmux_session:$worker" "$_exit_cmd" Enter 2>/dev/null || true
-                sleep 2
-                if worker_is_alive "$tmux_session" "$worker" "$session_key"; then
-                    tmux send-keys -t "=$tmux_session:$worker" C-c 2>/dev/null || true
-                    sleep 1
-                fi
+        if [[ "$_state" != "dead" ]]; then
+            local _exit_cmd
+            _exit_cmd=$(engine_exit_cmd "$_send_engine")
+            tmux send-keys -t "=$tmux_session:$worker" "$_exit_cmd" Enter 2>/dev/null || true
+            sleep 2
+            if worker_is_alive "$tmux_session" "$worker" "$session_key"; then
+                tmux send-keys -t "=$tmux_session:$worker" C-c 2>/dev/null || true
+                sleep 1
             fi
+        fi
 
-            while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$worker"; do
-                tmux kill-window -t "=$tmux_session:$worker" 2>/dev/null || break
-            done
+        while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$worker"; do
+            tmux kill-window -t "=$tmux_session:$worker" 2>/dev/null || break
+        done
 
-            local _wrole=""
-            if [[ -f "$hooked_file" ]]; then
-                _wrole=$(python3 -c "
+        local _wrole=""
+        if [[ -f "$hooked_file" ]]; then
+            _wrole=$(python3 -c "
 import json
 try: print(json.load(open('$hooked_file')).get('role', ''))
 except: pass
 " 2>/dev/null)
-            fi
-            local _worker_bead_id
-            _worker_bead_id=$(worker_bead_find_or_create "$worker" "$project" "$config_dir" 2>/dev/null || echo "")
-            local _bead_id
-            _bead_id=$(sessions_get_key "$session_key" "bead_id")
-
-            spawn_worker "$tmux_session" "$session_key" "$config_dir" \
-                "$worker" "$_wrole" "$_bead_id" "$_worker_bead_id" "$_send_engine" || {
-                log "FAIL: could not respawn $worker with new task"
-            }
-
-            breaker_reset "$session_key" "$worker" 2>/dev/null || true
-
-            if [[ -n "$task_bead_id" ]]; then
-                echo "  Task bead created: $task_bead_id (assigned to $worker)"
-            fi
-            echo "  Respawned $worker ($_send_engine) with task: $task"
         fi
+        local _worker_bead_id
+        _worker_bead_id=$(worker_bead_find_or_create "$worker" "$project" "$config_dir" 2>/dev/null || echo "")
+        local _bead_id
+        _bead_id=$(sessions_get_key "$session_key" "bead_id")
+
+        spawn_worker "$tmux_session" "$session_key" "$config_dir" \
+            "$worker" "$_wrole" "$_bead_id" "$_worker_bead_id" "$_send_engine" || {
+            log "FAIL: could not respawn $worker with new task"
+        }
+
+        breaker_reset "$session_key" "$worker" 2>/dev/null || true
+
+        echo "  Task bead created: $task_bead_id (assigned to $worker)"
+        echo "  Respawned $worker ($_send_engine) with task: $task"
     fi
 }
 
