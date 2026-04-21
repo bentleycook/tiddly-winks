@@ -3377,6 +3377,8 @@ cmd_list() {
         case "$1" in
             --project=*) filter_project="${1#--project=}"; shift ;;
             --project) filter_project="$2"; shift 2 ;;
+            --name=*) filter_project="${1#--name=}"; shift ;;
+            --name|-n) filter_project="$2"; shift 2 ;;
             --json) json_flag=1; shift ;;
             -p) sort_project=1; shift ;;
             *) shift ;;
@@ -3413,7 +3415,7 @@ rows = []
 for full_idx, (key, s) in enumerate(data.items(), start=1):
     proj = s.get('project', '')
     feat = s.get('feature', '')
-    if filter_proj and proj != filter_proj:
+    if filter_proj and proj.lower() != filter_proj.lower():
         continue
     bead = s.get('bead_id', '')
     mode = s.get('mode', '')
@@ -9127,7 +9129,7 @@ Commands:
   tw start <feature>[,...] [--mode staging]  Create feature space(s) (worktrees, DB, services)
   tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
   tw done <feature|N>[,...]               Stop session(s) AND tear down worktrees + close bead (explicit done)
-  tw list [--project=X] [--json]         List active sessions
+  tw list [-n NAME|--project=X] [--json]  List active sessions (-n/--name case-insensitive alias of --project)
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
 
 Agent commands (used by Claude workers):
