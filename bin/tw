@@ -2125,6 +2125,88 @@ find_config() {
     return 1
 }
 
+# Scan disk for feature-level worktree directories not referenced by any
+# active session in sessions.json. Writes tab-separated lines:
+#   <feature_dir>\t<workspace>\t<project>
+# Args:
+#   $1 = filter_project (optional, case-insensitive exact match; empty = all)
+#   $2 = filter_workspace (optional, absolute path; empty = all)
+# Safe by construction: only scans worktree bases derived from sessions.json
+# workspace fields, never .git/worktrees or the main checkout.
+_find_orphan_worktrees() {
+    local filter_project="${1:-}"
+    local filter_workspace="${2:-}"
+    local sessions_data
+    sessions_data=$(sessions_read)
+    python3 - "$sessions_data" "$filter_project" "$filter_workspace" <<'PYEOF'
+import json, os, sys
+
+data = json.loads(sys.argv[1])
+filter_proj = sys.argv[2].lower()
+filter_ws = os.path.realpath(sys.argv[3]) if sys.argv[3] else ''
+
+workspaces = {}
+for _, s in data.items():
+    ws = s.get('workspace', '')
+    if not ws:
+        continue
+    ws_real = os.path.realpath(ws)
+    entry = workspaces.setdefault(ws_real, {
+        'project': s.get('project', ''),
+        'active_features': set(),
+        'tracked_paths': set(),
+        'worktree_bases': set(),
+    })
+    if not entry['project']:
+        entry['project'] = s.get('project', '')
+    entry['active_features'].add(s.get('feature', ''))
+    for _svc, p in (s.get('worktrees') or {}).items():
+        pr = os.path.realpath(p)
+        entry['tracked_paths'].add(pr)
+        d = os.path.dirname(pr)
+        while d and d != os.path.dirname(d):
+            if os.path.basename(d) == 'worktrees':
+                entry['worktree_bases'].add(d)
+                break
+            d = os.path.dirname(d)
+
+for ws_real, entry in workspaces.items():
+    fb = os.path.join(ws_real, 'worktrees')
+    if os.path.isdir(fb):
+        entry['worktree_bases'].add(fb)
+
+for ws_real, entry in sorted(workspaces.items()):
+    if filter_proj and entry['project'].lower() != filter_proj:
+        continue
+    if filter_ws and ws_real != filter_ws:
+        continue
+    for base in sorted(entry['worktree_bases']):
+        if not os.path.isdir(base):
+            continue
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for name in names:
+            if name.startswith('.'):
+                continue
+            feature_dir = os.path.join(base, name)
+            if not os.path.isdir(feature_dir):
+                continue
+            if name in entry['active_features']:
+                continue
+            dir_real = os.path.realpath(feature_dir)
+            tracked = False
+            for tp in entry['tracked_paths']:
+                if tp == dir_real or tp.startswith(dir_real + os.sep):
+                    tracked = True
+                    break
+            if tracked:
+                continue
+            print(f"{feature_dir}\t{ws_real}\t{entry['project']}")
+PYEOF
+}
+
 # ─── Reconciliation ──────────────────────────────────────────────────────────
 #
 # Derives session state from reality (filesystem, tmux, beads) rather than
@@ -2185,56 +2267,30 @@ PYEOF
         log "Reconciled sessions.json (cleaned stale entries)"
     fi
 
-    # Phase 2: Check for tw worktrees on disk not tracked in sessions.json
-    local worktrees_base
-    worktrees_base=$(python3 -c "
-import json, sys, os
-data = json.loads(sys.argv[1])
-config_dir = os.path.realpath(sys.argv[2])
-# Infer worktrees base only from sessions belonging to THIS workspace
-for key, s in data.items():
-    ws = s.get('workspace', '')
-    if ws and os.path.realpath(ws) != config_dir:
-        continue
-    wt = s.get('worktrees', {})
-    for svc, path in wt.items():
-        # worktrees are typically at <base>/<feature>/<svc>
-        print(os.path.dirname(os.path.dirname(path)))
-        sys.exit(0)
-# Fallback: check common location for THIS workspace
-candidate = os.path.join(config_dir, 'worktrees')
-if os.path.isdir(candidate):
-    print(candidate)
-" "$new_data" "$config_dir" 2>/dev/null || true)
-
-    if [[ -n "$worktrees_base" && -d "$worktrees_base" ]]; then
-        local current_keys
-        current_keys=$(echo "$new_data" | python3 -c "import json,sys; [print(k) for k in json.load(sys.stdin)]" 2>/dev/null)
-
-        for feature_dir in "$worktrees_base"/*/; do
-            [[ -d "$feature_dir" ]] || continue
-            local feature_name
-            feature_name=$(basename "$feature_dir")
-            # Check if any session key references this feature
-            if ! echo "$current_keys" | grep -qF "$feature_name"; then
-                log "Reconcile: found untracked worktree dir: $feature_dir (no session entry)"
-                # Try to find a matching bead to reconstruct
-                local project
-                project=$(yaml_get "$config_dir/.tw.yml" "project" "" 2>/dev/null || true)
-                if [[ -n "$project" ]]; then
-                    local bead_title="$feature_name ($project)"
-                    local bead_id
-                    bead_id=$(bead_find_open "$bead_title" "$config_dir" 2>/dev/null || true)
-                    if [[ -z "$bead_id" ]]; then
-                        bead_id=$(bd_run "$config_dir" list --status=in_progress 2>/dev/null \
-                            | grep -F "$bead_title" | head -1 | awk '{print $2}' | tr -d '#' || true)
-                    fi
-                    if [[ -n "$bead_id" ]]; then
-                        log "Reconcile: found bead $bead_id for untracked feature '$feature_name' — can be recovered with: tw start $feature_name"
-                    fi
+    # Phase 2: Check for tw worktrees on disk not tracked in sessions.json.
+    # Shared with `tw prune-worktrees` via _find_orphan_worktrees.
+    local orphan_lines
+    orphan_lines=$(_find_orphan_worktrees "" "$config_dir" 2>/dev/null || true)
+    if [[ -n "$orphan_lines" ]]; then
+        local project
+        project=$(yaml_get "$config_dir/.tw.yml" "project" "" 2>/dev/null || true)
+        while IFS=$'\t' read -r _orphan_dir _orphan_ws _orphan_proj; do
+            [[ -z "$_orphan_dir" ]] && continue
+            log "Reconcile: found untracked worktree dir: $_orphan_dir (no session entry)"
+            if [[ -n "$project" ]]; then
+                local _orphan_feature _bead_title _bead_id
+                _orphan_feature=$(basename "$_orphan_dir")
+                _bead_title="$_orphan_feature ($project)"
+                _bead_id=$(bead_find_open "$_bead_title" "$config_dir" 2>/dev/null || true)
+                if [[ -z "$_bead_id" ]]; then
+                    _bead_id=$(bd_run "$config_dir" list --status=in_progress 2>/dev/null \
+                        | grep -F "$_bead_title" | head -1 | awk '{print $2}' | tr -d '#' || true)
+                fi
+                if [[ -n "$_bead_id" ]]; then
+                    log "Reconcile: found bead $_bead_id for untracked feature '$_orphan_feature' — can be recovered with: tw start $_orphan_feature"
                 fi
             fi
-        done
+        done <<< "$orphan_lines"
     fi
 
     # Phase 3: Detect orphaned tmux sessions
@@ -3786,6 +3842,155 @@ EOF
 
     [[ $orphan_total -gt 0 ]] && echo "  Reset $orphan_total orphaned task bead(s) total."
     echo "  Prune complete."
+}
+
+cmd_prune_worktrees() {
+    local filter_project="" do_delete=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project=*) filter_project="${1#--project=}"; shift ;;
+            --project) filter_project="$2"; shift 2 ;;
+            --name=*) filter_project="${1#--name=}"; shift ;;
+            --name|-n)
+                if [[ -z "${2:-}" || "$2" == -* ]]; then
+                    filter_project="__CWD__"; shift
+                else
+                    filter_project="$2"; shift 2
+                fi
+                ;;
+            --dry-run) do_delete=0; shift ;;
+            --yes|-y) do_delete=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: tw prune-worktrees [--project=NAME|-n [NAME]] [--dry-run] [--yes]
+
+Scan disk for worktree directories that are not referenced by any active
+session in sessions.json and remove them.
+
+Default is DRY-RUN (prints what would be removed with sizes; exit 0, no
+deletion). Pass --yes to actually delete. No interactive prompt.
+
+Flags:
+  --project=NAME    Limit to one project (case-insensitive match).
+  -n NAME           Same as --project=NAME. Bare -n uses the project at cwd.
+  --dry-run         Explicit dry-run (default).
+  --yes, -y         Actually remove the orphans.
+EOF
+                return 0
+                ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+
+    if [[ "$filter_project" == "__CWD__" ]]; then
+        local _cfg _proj=""
+        if _cfg=$(find_config 2>/dev/null); then
+            _proj=$(yaml_get "$_cfg" "project" "" 2>/dev/null || true)
+        fi
+        if [[ -z "$_proj" ]]; then
+            echo "tw prune-worktrees: -n without a value requires running inside a tw workspace" >&2
+            return 1
+        fi
+        filter_project="$_proj"
+    fi
+
+    local orphans
+    orphans=$(_find_orphan_worktrees "$filter_project" "" || true)
+
+    if [[ -z "$orphans" ]]; then
+        echo "  No orphaned worktrees found."
+        return 0
+    fi
+
+    if [[ $do_delete -eq 0 ]]; then
+        echo "  Dry-run — pass --yes to actually remove:"
+    else
+        echo "  Removing orphaned worktrees:"
+    fi
+    printf "  %-10s %-15s %s\n" "SIZE" "PROJECT" "PATH"
+    printf "  %-10s %-15s %s\n" "----------" "---------------" "----"
+
+    local count=0 total_kb=0
+    declare -A affected_repos=()
+
+    while IFS=$'\t' read -r feature_dir ws proj; do
+        [[ -z "$feature_dir" ]] && continue
+        count=$((count + 1))
+
+        local size_h size_kb
+        size_h=$(du -sh "$feature_dir" 2>/dev/null | awk '{print $1}')
+        size_kb=$(du -sk "$feature_dir" 2>/dev/null | awk '{print $1}')
+        [[ -z "$size_h" ]] && size_h="?"
+        [[ -z "$size_kb" ]] && size_kb=0
+        printf "  %-10s %-15s %s\n" "$size_h" "$proj" "$feature_dir"
+
+        if [[ $do_delete -eq 1 ]]; then
+            # Collect candidate worktree paths: feature_dir itself if it is a
+            # git checkout, otherwise each of its immediate subdirs (multi-repo
+            # features store one worktree per repo under the feature dir).
+            local -a candidates=()
+            if [[ -e "$feature_dir/.git" ]]; then
+                candidates=("$feature_dir")
+            else
+                local sub
+                for sub in "$feature_dir"/*/; do
+                    [[ -d "$sub" ]] || continue
+                    candidates+=("${sub%/}")
+                done
+            fi
+
+            local cand main_git main_repo err
+            for cand in "${candidates[@]}"; do
+                main_git=$(git -C "$cand" rev-parse --git-common-dir 2>/dev/null || true)
+                [[ -z "$main_git" ]] && continue
+                if [[ "$main_git" != /* ]]; then
+                    main_git=$(cd "$cand" && cd "$main_git" 2>/dev/null && pwd)
+                fi
+                [[ -z "$main_git" || ! -d "$main_git" ]] && continue
+                main_repo=$(dirname "$main_git")
+                affected_repos["$main_repo"]=1
+                if err=$(git -C "$main_repo" worktree remove --force "$cand" 2>&1); then
+                    echo "    ✓ git worktree remove: $cand"
+                else
+                    echo "    ! git worktree remove failed for $cand: $err"
+                fi
+            done
+
+            # Backstop: if anything remains on disk, rm -rf. Tolerates corrupt
+            # admin dirs and pathless features that weren't git checkouts.
+            if [[ -e "$feature_dir" ]]; then
+                if rm -rf "$feature_dir" 2>/dev/null; then
+                    echo "    ✓ rm -rf: $feature_dir"
+                else
+                    echo "    ! rm -rf failed: $feature_dir"
+                fi
+            fi
+
+            total_kb=$((total_kb + size_kb))
+        fi
+    done <<< "$orphans"
+
+    if [[ $do_delete -eq 1 ]]; then
+        local _repo
+        for _repo in "${!affected_repos[@]}"; do
+            git -C "$_repo" worktree prune 2>/dev/null || true
+        done
+        local reclaimed_h
+        reclaimed_h=$(python3 -c "
+kb = int('$total_kb')
+b = kb * 1024
+units = ['B','K','M','G','T']
+f = float(b); i = 0
+while f >= 1024 and i < len(units)-1:
+    f /= 1024; i += 1
+print(f'{f:.1f}{units[i]}')
+")
+        echo ""
+        echo "  Removed $count orphaned worktree(s), reclaimed $reclaimed_h."
+    else
+        echo ""
+        echo "  $count orphaned worktree(s) would be removed. Re-run with --yes to delete."
+    fi
 }
 
 cmd_reconcile() {
@@ -9151,6 +9356,7 @@ Commands:
   tw stop <feature|N>[,...] [--done]      Stop session(s) (--done tears down worktrees + closes bead)
   tw done <feature|N>[,...]               Stop session(s) AND tear down worktrees + close bead (explicit done)
   tw list [-n [NAME]|--project=X] [--json]  List sessions (bare -n: project at cwd; -n NAME: case-insensitive filter)
+  tw prune-worktrees [-n [NAME]] [--yes]    Reclaim disk by removing untracked worktree directories (dry-run default)
   tw attach [<N>|<name>] [--window=X]    Attach to a session (defaults to god window)
 
 Agent commands (used by Claude workers):
@@ -9176,6 +9382,7 @@ Agent commands (used by Claude workers):
   tw prime                              AI workflow context (inject via hooks)
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
+  tw prune-worktrees [--project=X] [-n] [--yes]  Remove on-disk worktree dirs not tracked in sessions.json (dry-run by default)
   tw reconcile [<feature>]              Derive state from reality (filesystem, tmux, beads)
   tw resume <feature>[,...]             Resume feature(s) from bead state after hard reset
   tw resume --all                       Resume all in-progress features from beads
@@ -9208,6 +9415,7 @@ case "$subcommand" in
     open)    cmd_open "$@" ;;
     editor)  cmd_editor "$@" ;;
     prune)   cmd_prune "$@" ;;
+    prune-worktrees) cmd_prune_worktrees "$@" ;;
     resume)  cmd_resume "$@" ;;
     claude)  cmd_claude "$@" ;;
     append)  cmd_append "$@" ;;
