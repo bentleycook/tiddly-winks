@@ -134,6 +134,29 @@ except Exception:
 EOF
 }
 
+# Print one line per symlink path for a service. The effective list is the
+# per-service `symlink:` list, falling back to the top-level `symlink:` list
+# when the service has no override. Entries are returned as written (caller
+# validates safety: no absolute paths, no `..`).
+yaml_service_symlinks() {
+    local file="$1" service="$2"
+    python3 - "$file" "$service" <<'EOF'
+import yaml, sys
+try:
+    d = yaml.safe_load(open(sys.argv[1])) or {}
+    svc = (d.get('services', {}) or {}).get(sys.argv[2], {}) or {}
+    lst = svc.get('symlink')
+    if lst is None:
+        lst = d.get('symlink')
+    if isinstance(lst, list):
+        for item in lst:
+            if isinstance(item, str) and item:
+                print(item)
+except Exception:
+    pass
+EOF
+}
+
 # Get workers as "name:role\n..." pairs
 # Supports multiple formats:
 #   workers: [dev-1, dev-2]              → name-only list (generic workers)
@@ -2125,6 +2148,54 @@ find_config() {
     return 1
 }
 
+# Create opt-in symlinks inside a freshly-added worktree that point back to
+# the primary checkout's copies of heavy directories (node_modules, .next,
+# .turbo, etc.). Each symlink entry:
+#   target = <primary_service_abs>/<entry>
+#   link   = <worktree_service_abs>/<entry>
+# Skips entries whose target is missing, whose paths are unsafe (absolute
+# or contain '..'), or that already resolve to the correct target. When a
+# link already exists but points elsewhere, it is replaced. Prints the
+# absolute path of every link that ends up in place, one per line, so the
+# caller can persist them to sessions.json for later unlinking.
+_create_worktree_symlinks() {
+    local effective_config="$1" service_name="$2"
+    local primary_abs="$3" worktree_abs="$4"
+    local entry target link existing
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        if [[ "$entry" == /* || "$entry" == *..* ]]; then
+            log "skip symlink '$entry' for $service_name: unsafe path"
+            continue
+        fi
+        target="$primary_abs/$entry"
+        link="$worktree_abs/$entry"
+        if [[ ! -d "$target" ]]; then
+            log "skip symlink: $link — target $target not installed"
+            continue
+        fi
+        if [[ -L "$link" ]]; then
+            existing=$(readlink "$link" 2>/dev/null || true)
+            if [[ "$existing" == "$target" ]]; then
+                printf '%s\n' "$link"
+                continue
+            fi
+            rm -f "$link"
+        elif [[ -e "$link" ]]; then
+            if ! rm -rf "$link" 2>/dev/null; then
+                log "skip symlink: could not clear existing $link"
+                continue
+            fi
+        fi
+        if ln -s "$target" "$link" 2>/dev/null; then
+            log "Symlinked $link -> $target"
+            printf '%s\n' "$link"
+        else
+            log "Failed to create symlink $link -> $target"
+        fi
+    done < <(yaml_service_symlinks "$effective_config" "$service_name")
+}
+
 # Scan disk for feature-level worktree directories not referenced by any
 # active session in sessions.json. Writes tab-separated lines:
 #   <feature_dir>\t<workspace>\t<project>
@@ -2494,6 +2565,7 @@ _start_one_session() {
     # State captured for rollback on mid-init failure. Populated as side effects
     # occur; the EXIT trap below uses these to clean up on abnormal exit.
     declare -A worktree_paths=()
+    declare -a created_symlinks=()
     local spawn_lock=""
     local worktrees_base=""
     # Ownership flags: flip to 1 ONLY after we actually create the resource.
@@ -2693,6 +2765,26 @@ for name, info in svcs.items():
                 worktree_paths[$svc]="$wt_base/$rel"
             else
                 worktree_paths[$svc]="$wt_base"
+            fi
+
+            # Create opt-in symlinks to the primary checkout's heavy dirs
+            # (node_modules, .next, ...). Must happen before post_setup so
+            # installers see the shared target.
+            local _primary_svc_path _primary_svc_abs _sym_out
+            _primary_svc_path=$(yaml_service_get "$effective_config" "$svc" "path" "")
+            if [[ -n "$_primary_svc_path" ]]; then
+                _primary_svc_abs="$config_dir/$_primary_svc_path"
+            else
+                _primary_svc_abs="$config_dir"
+            fi
+            _sym_out=$(_create_worktree_symlinks \
+                "$effective_config" "$svc" \
+                "$_primary_svc_abs" "${worktree_paths[$svc]}" 2>/dev/null || true)
+            if [[ -n "$_sym_out" ]]; then
+                while IFS= read -r _lnk; do
+                    [[ -z "$_lnk" ]] && continue
+                    created_symlinks+=("$_lnk")
+                done <<< "$_sym_out"
             fi
 
             # Run db_setup if configured
@@ -2943,17 +3035,31 @@ with open(sys.argv[1], 'w') as f:
     done
     worktrees_json+="}"
 
+    # Build symlinks JSON (flat list of absolute link paths created by
+    # _create_worktree_symlinks for this session; tw stop --done unlinks
+    # these before git worktree remove so shared targets are preserved).
+    local symlinks_json="[]"
+    if [[ ${#created_symlinks[@]} -gt 0 ]]; then
+        symlinks_json=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
+            "${created_symlinks[@]}")
+    fi
+
     local new_sessions
     new_sessions=$(python3 - \
         "$sessions_data" "$session_key" "$project" "$feature" "$mode" "$started" \
         "$services_json" "$proxy_json" "$bead_id" "$config_dir" \
-        "$worktrees_json" "$db_name" "$branch" <<'EOF'
+        "$worktrees_json" "$db_name" "$branch" "$symlinks_json" <<'EOF'
 import json, sys
 data = json.loads(sys.argv[1])
 key = sys.argv[2]
 # Preserve dynamic_workers from previous session if resuming
 old = data.get(key, {})
 dw = old.get('dynamic_workers', [])
+prev_symlinks = old.get('symlinks', []) or []
+new_symlinks = json.loads(sys.argv[14])
+# Merge with previous resume state so we never forget links from an earlier
+# start (useful when .tw.yml symlink config shrinks between runs).
+merged = list({p: None for p in list(prev_symlinks) + list(new_symlinks)}.keys())
 data[key] = {
     "project":    sys.argv[3],
     "feature":    sys.argv[4],
@@ -2969,6 +3075,8 @@ data[key] = {
 }
 if dw:
     data[key]['dynamic_workers'] = dw
+if merged:
+    data[key]['symlinks'] = merged
 print(json.dumps(data, indent=2))
 EOF
 )
@@ -3214,6 +3322,29 @@ for svc, path in wt.items():
             [[ -z "$_sq_path" ]] && continue
             _checkpoint_squash "$_sq_path" || true
         done <<< "$squash_wt_json"
+
+        # Unlink recorded symlinks (e.g. node_modules pointing at the primary
+        # checkout) before `git worktree remove` touches the worktree, so
+        # nothing can dereference them and delete the shared target.
+        local _recorded_symlinks
+        _recorded_symlinks=$(python3 -c "
+import json, sys
+d = json.load(open('$SESSIONS_FILE'))
+for p in d.get('$session_key', {}).get('symlinks', []) or []:
+    print(p)
+" 2>/dev/null || true)
+        if [[ -n "$_recorded_symlinks" ]]; then
+            while IFS= read -r _lnk; do
+                [[ -z "$_lnk" ]] && continue
+                if [[ -L "$_lnk" ]]; then
+                    if unlink "$_lnk" 2>/dev/null; then
+                        log "Unlinked symlink: $_lnk"
+                    else
+                        log "Warning: unlink failed for $_lnk"
+                    fi
+                fi
+            done <<< "$_recorded_symlinks"
+        fi
 
         # Get unique worktree roots to remove. Multiple services may share the same
         # git worktree (e.g. potoo/server + potoo/web both live in worktrees/feat/potoo).
@@ -4868,12 +4999,18 @@ worktrees:                  # ONLY include if there are multiple sub-repos (sepa
   base: worktrees           # clearly separate frontend/backend app directories)
   branch_prefix: yourname/  # defaults to $(whoami)/ if omitted
 
+symlink: [node_modules]     # OPTIONAL top-level fallback applied to every service when the
+                            # service has no symlink key of its own. Each entry is a relative path
+                            # inside the service dir; tw symlinks that path in the worktree to the
+                            # matching path in the primary checkout (skips if target is missing).
+
 services:
   frontend:
     path: my-frontend       # path relative to workspace root (use . for single-repo)
     command: "bun run dev -- --port {port}"   # use {port} placeholder
     port_hint: 5173
     window: frontend        # tmux window name
+    symlink: [node_modules, .next]  # OPTIONAL: overrides the top-level symlink list for this service
 
   backend:
     path: my-backend
