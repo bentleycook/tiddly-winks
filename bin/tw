@@ -576,6 +576,7 @@ try:
     d = json.load(open(sys.argv[1]))
     icons = {
         'working':       '#[fg=green]⚙',
+        'working-quiet': '#[fg=cyan]⚙',
         'idle':          '#[fg=blue]◉',
         'stalled':       '#[fg=yellow]⚠',
         'dead':          '#[fg=red]✗',
@@ -1287,7 +1288,7 @@ Route and track — do not explore code, run commands, or implement anything you
 
 ## Workers
 $worker_lines
-Workers are generic — any worker can handle any task. The task message you send IS the context. Dispatch based on availability, not on worker names.
+When a worker has a role context (shown in parentheses above), PREFER dispatching tasks that match that domain — e.g., frontend tasks to frontend-dev workers, backend tasks to backend-dev workers. If no role-matched worker is available (busy or none exist), fall back to any available worker. Workers without a role context can handle any task.
 
 ## Dispatching tasks
 Send work to any available worker:
@@ -1303,7 +1304,7 @@ Prepend template content to your task message when dispatching.}${task_templates
 ## Spawning new workers
 If all workers are busy, spawn more:
   tw spawn $feature <name>
-Workers are generic slots — no role required. If you want to give initial context from a role file:
+New workers start without a role. To give initial context from a role file (recommended for domain-specific tasks):
   tw spawn $feature <name> <role>
 Available roles: $(ls "$HOME/.claude/roles/" 2>/dev/null | sed 's/\.md$//' | tr '\n' ', ' | sed 's/, $//')
 
@@ -1317,9 +1318,22 @@ To set up review profiles for a new workspace: tw review init
 Workers write to their output files incrementally. Poll progress:
   tw feed $feature --problems    # one-shot: which workers have recent/stale output
   tw feed $feature               # stream: tail all output files in real time
-  tw patrol $feature             # full health check + output tracking
+  tw patrol $feature             # full health check + output tracking + terminal activity
+  tw workers $feature --health   # quick: per-worker state + terminal activity age
   cat ~/.tiddly-winks/health/${session_key}.json  # structured health report (updated by daemon)
-The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken) and crash counts. Check this FIRST before running patrol — it's faster and tells you who needs attention.
+The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken), crash counts, and window_activity timestamps. Check this FIRST before running patrol — it's faster and tells you who needs attention.
+
+## IMPORTANT: Avoiding false re-dispatch
+A worker with status 'working' or 'working-quiet' is ALIVE and has an active Claude process.
+- **'working'**: terminal has produced output in the last 5 min — actively running tools/thinking
+- **'working-quiet'**: terminal output older than 5 min — may be stuck OR doing long-running work
+- **Stale output file does NOT mean unresponsive.** Workers investigate code, run tools, and think before writing to their output file. A worker can be very active (visible in TERM ACTIVE column) while its output file is stale.
+
+**Rules:**
+1. NEVER re-dispatch a task to another worker while the original shows 'working' status
+2. If a worker shows 'working-quiet', send it a nudge asking for a progress update FIRST
+3. Only consider re-dispatch after: (a) nudge sent, (b) 10+ minutes with no terminal activity, (c) worker confirmed stuck/unresponsive
+4. Check 'tw workers $feature --health' and look at the TERM ACTIVE column — if < 5 min, the worker is actively running commands regardless of output file age
 
 ## Cleaning up workers
 After reviews complete or when done workers pile up, clean them out:
@@ -5919,7 +5933,8 @@ worker_is_alive() {
 }
 
 # Determine worker state: working, idle, stalled, done, or dead.
-# Prints state to stdout. Uses process, prompt, signals, and output file freshness.
+# Prints state to stdout. Uses process, prompt, signals, output file freshness,
+# and tmux window activity to distinguish active work from quiet/stuck workers.
 # Usage: worker_state <tmux_session> <wname> <agents_path> [session_key]
 worker_state() {
     local tmux_session="$1" wname="$2" agents_path="${3:-}" session_key="${4:-$tmux_session}"
@@ -5944,13 +5959,15 @@ worker_state() {
         echo "done"; return
     fi
 
+    local now
+    now=$(date +%s)
+
     # 4. Check output file freshness for stall detection
     local stalled=0
     if [[ -n "$agents_path" ]]; then
         local output_file="$agents_path/${wname}.md"
         if [[ -f "$output_file" ]]; then
-            local now mtime age_secs
-            now=$(date +%s)
+            local mtime age_secs
             mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
             age_secs=$((now - mtime))
             [[ $age_secs -gt 3600 ]] && stalled=1
@@ -5962,12 +5979,33 @@ worker_state() {
         echo "idle"; return
     fi
 
-    # 6. Alive and busy — working or stalled
+    # 6. Alive and busy — use tmux window activity to distinguish active vs quiet
     if [[ $stalled -eq 1 ]]; then
         echo "stalled"; return
     fi
 
+    # window_activity updates whenever new output appears in the tmux window.
+    # A worker running tools produces terminal output even before writing to its
+    # output file, so this catches the false-negative case.
+    local win_activity win_idle_secs
+    win_activity=$(tmux list-windows -t "=$tmux_session" -F '#{window_name} #{window_activity}' 2>/dev/null \
+        | grep -E "^${wname}( |$)" | head -1 | awk '{print $NF}')
+    if [[ -n "$win_activity" && "$win_activity" -gt 0 ]] 2>/dev/null; then
+        win_idle_secs=$((now - win_activity))
+        if [[ $win_idle_secs -gt 300 ]]; then
+            echo "working-quiet"; return
+        fi
+    fi
+
     echo "working"
+}
+
+# Get the tmux window_activity timestamp (unix epoch) for a worker.
+# Returns empty string if unavailable.
+worker_window_activity() {
+    local tmux_session="$1" wname="$2"
+    tmux list-windows -t "=$tmux_session" -F '#{window_name} #{window_activity}' 2>/dev/null \
+        | grep -E "^${wname}( |$)" | head -1 | awk '{print $NF}'
 }
 
 cmd_handoff() {
@@ -6200,8 +6238,8 @@ cmd_patrol() {
     echo ""
 
     # 1. Worker state assessment
-    printf "  %-20s %-12s %-10s %s\n" "WORKER" "STATE" "CONTEXT" "OUTPUT AGE"
-    printf "  %-20s %-12s %-10s %s\n" "--------------------" "------------" "----------" "----------"
+    printf "  %-20s %-14s %-10s %-12s %s\n" "WORKER" "STATE" "CONTEXT" "TERM ACTIVE" "OUTPUT AGE"
+    printf "  %-20s %-14s %-10s %-12s %s\n" "--------------------" "--------------" "----------" "------------" "----------"
 
     local dead_workers="" stalled_workers="" done_workers=""
 
@@ -6209,7 +6247,7 @@ cmd_patrol() {
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
         local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
-        local state output_age="-"
+        local state output_age="-" term_active="-"
 
         state=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
 
@@ -6218,6 +6256,17 @@ cmd_patrol() {
             stalled) stalled_workers+="$wname "; (( issues++ )) || true ;;
             done)    done_workers+="$wname " ;;
         esac
+
+        # Terminal activity age
+        local _wa
+        _wa=$(worker_window_activity "$tmux_session" "$wname")
+        if [[ -n "$_wa" && "$_wa" -gt 0 ]] 2>/dev/null; then
+            local _wa_secs=$((now - _wa))
+            if [[ $_wa_secs -lt 60 ]]; then term_active="${_wa_secs}s"
+            elif [[ $_wa_secs -lt 3600 ]]; then term_active="$((_wa_secs / 60))m"
+            else term_active="$((_wa_secs / 3600))h"
+            fi
+        fi
 
         # Output file age for display
         local output_file="$agents_path/${wname}.md"
@@ -6236,7 +6285,7 @@ cmd_patrol() {
             output_age="none"
         fi
 
-        printf "  %-20s %-12s %-10s %s\n" "$wname" "$state" "${wrole:--}" "$output_age"
+        printf "  %-20s %-14s %-10s %-12s %s\n" "$wname" "$state" "${wrole:--}" "$term_active" "$output_age"
     done
 
     echo ""
@@ -6558,11 +6607,12 @@ cmd_feed() {
 
     if [[ $problems_flag -eq 1 ]]; then
         # One-shot: show workers with stale output (>30min) or no output
+        # Also shows terminal activity to prevent false-negative "stale" conclusions
         local now
         now=$(date +%s)
         echo ""
-        printf "  %-20s %-12s %s\n" "WORKER" "LAST OUTPUT" "STATUS"
-        printf "  %-20s %-12s %s\n" "--------------------" "------------" "----------"
+        printf "  %-20s %-12s %-12s %s\n" "WORKER" "LAST OUTPUT" "TERM ACTIVE" "STATUS"
+        printf "  %-20s %-12s %-12s %s\n" "--------------------" "------------" "------------" "----------"
         for f in "$agents_path"/*.md; do
             [[ -f "$f" ]] || continue
             local wname
@@ -6591,7 +6641,21 @@ cmd_feed() {
                 status="empty"
                 age_str="never"
             fi
-            printf "  %-20s %-12s %s\n" "$wname" "$age_str" "$status"
+            # Window activity — override "stale" if terminal is recently active
+            local _wa term_str="-"
+            _wa=$(worker_window_activity "$tmux_session" "$wname")
+            if [[ -n "$_wa" && "$_wa" -gt 0 ]] 2>/dev/null; then
+                local _wa_secs=$((now - _wa))
+                if [[ $_wa_secs -lt 60 ]]; then term_str="${_wa_secs}s ago"
+                elif [[ $_wa_secs -lt 3600 ]]; then term_str="$((_wa_secs / 60))m ago"
+                else term_str="$((_wa_secs / 3600))h ago"
+                fi
+                # If output is stale but terminal is active, worker is busy — not stuck
+                if [[ "$status" == "stale" && $_wa_secs -lt 300 ]]; then
+                    status="busy"
+                fi
+            fi
+            printf "  %-20s %-12s %-12s %s\n" "$wname" "$age_str" "$term_str" "$status"
         done
         echo ""
         return 0
@@ -7262,15 +7326,18 @@ cmd_workers() {
     if [[ $health_flag -eq 1 ]]; then
         local agents_path
         agents_path="$(agents_dir "$session_key")"
-        # Collect worker status lines as "name:role:status:engine"
+        # Collect worker status lines as "name:role:status:engine:win_activity"
         local health_lines=()
+        local now_ts
+        now_ts=$(date +%s)
         for wpair in "${worker_pairs[@]}"; do
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
-            local status wengine
+            local status wengine _wa
             status=$(worker_state "$tmux_session" "$wname" "$agents_path" "$session_key")
             wengine=$(worker_engine "$session_key" "$wname")
-            health_lines+=("${wname}:${wrole}:${status}:${wengine}")
+            _wa=$(worker_window_activity "$tmux_session" "$wname")
+            health_lines+=("${wname}:${wrole}:${status}:${wengine}:${_wa:-0}")
         done
 
         if [[ $json_flag -eq 1 ]]; then
@@ -7281,22 +7348,32 @@ for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
-    parts = line.split(':', 3)
-    rows.append({'name': parts[0], 'role': parts[1], 'status': parts[2], 'engine': parts[3] if len(parts) > 3 else 'claude', 'window': parts[0]})
+    parts = line.split(':', 4)
+    rows.append({'name': parts[0], 'role': parts[1], 'status': parts[2], 'engine': parts[3] if len(parts) > 3 else 'claude', 'window_activity': int(parts[4]) if len(parts) > 4 and parts[4] != '0' else 0, 'window': parts[0]})
 print(json.dumps(rows, indent=2))
 "
         else
             echo ""
-            printf "  %-20s %-10s %-12s %s\n" "WORKER" "ENGINE" "STATUS" "CONTEXT"
-            printf "  %-20s %-10s %-12s %s\n" "--------------------" "----------" "------------" "--------------------"
+            printf "  %-20s %-10s %-14s %-12s %s\n" "WORKER" "ENGINE" "STATUS" "TERM ACTIVE" "CONTEXT"
+            printf "  %-20s %-10s %-14s %-12s %s\n" "--------------------" "----------" "--------------" "------------" "--------------------"
             for hline in "${health_lines[@]}"; do
                 local wname="${hline%%:*}"
                 local rest="${hline#*:}"
                 local wrole="${rest%%:*}"
                 rest="${rest#*:}"
                 local status="${rest%%:*}"
-                local wengine="${rest##*:}"
-                printf "  %-20s %-10s %-12s %s\n" "$wname" "$wengine" "$status" "${wrole:--}"
+                rest="${rest#*:}"
+                local wengine="${rest%%:*}"
+                local _wa_ts="${rest##*:}"
+                local term_age="-"
+                if [[ -n "$_wa_ts" && "$_wa_ts" -gt 0 ]] 2>/dev/null; then
+                    local _wa_secs=$((now_ts - _wa_ts))
+                    if [[ $_wa_secs -lt 60 ]]; then term_age="${_wa_secs}s ago"
+                    elif [[ $_wa_secs -lt 3600 ]]; then term_age="$((_wa_secs / 60))m ago"
+                    else term_age="$((_wa_secs / 3600))h ago"
+                    fi
+                fi
+                printf "  %-20s %-10s %-14s %-12s %s\n" "$wname" "$wengine" "$status" "$term_age" "${wrole:--}"
             done
             echo ""
         fi
@@ -7566,7 +7643,7 @@ tw resume --all                  # Resume all in-progress features
 
 ### Worker Management
 ```bash
-tw workers <feature> --health    # Check worker state (working/idle/stalled/done/dead/not-logged-in)
+tw workers <feature> --health    # Check worker state (working/working-quiet/idle/stalled/done/dead/not-logged-in)
 tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
 tw workers <feature> --cleanup            # Kill done/dead workers, remove dynamic entries
@@ -8679,12 +8756,20 @@ print(json.dumps(data, indent=2))
                     fi
                     (( alive_workers++ )) || true
                     # Check for stalled (alive but no output in DAEMON_STALLED_THRESHOLD)
+                    # Only mark stalled if BOTH output file AND terminal window are inactive
                     if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" ]]; then
                         local age_secs=$((now - output_mtime))
                         if [[ $age_secs -gt $DAEMON_STALLED_THRESHOLD ]]; then
-                            worker_status="stalled"
-                            (( stalled_workers++ )) || true
-                            _daemon_log "WARN: stalled worker $session_key/$wname — no output in ${age_secs}s"
+                            local _d_win_activity
+                            _d_win_activity=$(worker_window_activity "$tmux_session" "$wname")
+                            local _d_win_age=$((now - ${_d_win_activity:-0}))
+                            if [[ $_d_win_age -gt 300 ]]; then
+                                worker_status="stalled"
+                                (( stalled_workers++ )) || true
+                                _daemon_log "WARN: stalled worker $session_key/$wname — no output in ${age_secs}s, no terminal activity in ${_d_win_age}s"
+                            else
+                                _daemon_log "INFO: $session_key/$wname output stale (${age_secs}s) but terminal active (${_d_win_age}s ago) — not stalled"
+                            fi
                         fi
                     fi
                 else
@@ -8757,8 +8842,10 @@ print(json.dumps(data, indent=2))
             [[ -n "$health_workers_json" ]] && health_workers_json+=","
             local tmux_alive="true"
             [[ "$worker_status" == "dead" || "$worker_status" == "circuit-broken" ]] && tmux_alive="false"
-            health_workers_json+=$(printf '{"name":"%s","role":"%s","tmux_alive":%s,"last_output_mtime":%d,"status":"%s","crash_count":%d}' \
-                "$wname" "$wrole" "$tmux_alive" "$output_mtime" "$worker_status" \
+            local _win_activity
+            _win_activity=$(worker_window_activity "$tmux_session" "$wname")
+            health_workers_json+=$(printf '{"name":"%s","role":"%s","tmux_alive":%s,"last_output_mtime":%d,"window_activity":%d,"status":"%s","crash_count":%d}' \
+                "$wname" "$wrole" "$tmux_alive" "$output_mtime" "${_win_activity:-0}" "$worker_status" \
                 "$(cat "$CRASH_COUNT_DIR/$session_key/$wname" 2>/dev/null || echo 0)")
         done
 
@@ -9498,7 +9585,7 @@ Commands:
 
 Agent commands (used by Claude workers):
   tw workers <feature>                  Spawn missing worker windows into a running session
-  tw workers <feature> --health [--json] Check worker state (working/idle/stalled/done/dead)
+  tw workers <feature> --health [--json] Check worker state (working/working-quiet/idle/stalled/done/dead)
   tw workers <feature> --cv <name>     Show worker CV and work history
   tw workers <feature> --respawn [--force] Respawn dead workers (--force overrides circuit breaker)
   tw handoff <feature> <worker>         Cycle a worker's session (save context, restart fresh)
