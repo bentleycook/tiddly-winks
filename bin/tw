@@ -581,6 +581,7 @@ try:
         'stalled':       '#[fg=yellow]⚠',
         'dead':          '#[fg=red]✗',
         'not-logged-in': '#[fg=red]🔒',
+        'needs-permission':'#[fg=magenta]🔑',
         'circuit-broken':'#[fg=red]⊘',
     }
     parts = []
@@ -1334,6 +1335,12 @@ A worker with status 'working' or 'working-quiet' is ALIVE and has an active Cla
 2. If a worker shows 'working-quiet', send it a nudge asking for a progress update FIRST
 3. Only consider re-dispatch after: (a) nudge sent, (b) 10+ minutes with no terminal activity, (c) worker confirmed stuck/unresponsive
 4. Check 'tw workers $feature --health' and look at the TERM ACTIVE column — if < 5 min, the worker is actively running commands regardless of output file age
+
+## Permissions-stuck workers
+If a worker shows 'needs-permission' (🔑 in status bar), it is stuck waiting for a human to approve a permissions prompt in Claude Code. Do NOT handoff or respawn — that restarts the same problem. Instead:
+1. Alert the user: \"Worker <name> is stuck on a permissions prompt. Please accept it or configure auto-allow in the project .claude/settings.json.\"
+2. The user can accept via: tw attach $feature (switch to the worker window, press shift+tab then enter)
+3. Or permanently fix by adding the blocked tool to allowedTools in .claude/settings.json
 
 ## Cleaning up workers
 After reviews complete or when done workers pile up, clean them out:
@@ -5783,6 +5790,20 @@ worker_is_idle() {
     return 1  # unknown state, assume busy
 }
 
+# Check if a worker is stuck at a permissions approval prompt.
+# Returns 0 if waiting for permission, 1 otherwise.
+# Detects the "shift+tab to cycle" or "Allow tool" prompt that blocks until human accepts.
+worker_needs_permission() {
+    local tmux_session="$1" wname="$2" session_key="${3:-$tmux_session}"
+    local engine
+    engine=$(worker_engine "$session_key" "$wname")
+    [[ "$engine" != "claude" ]] && return 1
+
+    local pane_text
+    pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p 2>/dev/null) || return 1
+    echo "$pane_text" | tail -5 | grep -qE 'shift\+tab to cycle|Allow .*(tool|once|always)|permission'
+}
+
 # Check if a worker's Claude session is not logged in.
 # Returns 0 if not logged in, 1 otherwise.
 # Checks the bottom 3 visible lines of the pane for engine-specific auth failure patterns.
@@ -5952,6 +5973,11 @@ worker_state() {
     # 2.5. Check if worker is not logged in
     if worker_is_not_logged_in "$tmux_session" "$wname" "$session_key"; then
         echo "not-logged-in"; return
+    fi
+
+    # 2.6. Check if worker is stuck at a permissions prompt
+    if worker_needs_permission "$tmux_session" "$wname" "$session_key"; then
+        echo "needs-permission"; return
     fi
 
     # 3. Check for "done" signal (self-managed completion)
@@ -7643,7 +7669,7 @@ tw resume --all                  # Resume all in-progress features
 
 ### Worker Management
 ```bash
-tw workers <feature> --health    # Check worker state (working/working-quiet/idle/stalled/done/dead/not-logged-in)
+tw workers <feature> --health    # Check worker state (working/working-quiet/idle/stalled/done/dead/not-logged-in/needs-permission)
 tw workers <feature> --cv <name> # Show worker CV and work history
 tw workers <feature> --respawn [--force]  # Respawn dead workers (--force overrides circuit breaker)
 tw workers <feature> --cleanup            # Kill done/dead workers, remove dynamic entries
@@ -8753,11 +8779,14 @@ print(json.dumps(data, indent=2))
                         worker_status="not-logged-in"
                         _daemon_log "WARN: $session_key/$wname not logged in — sending /login"
                         send_to_pane "=$tmux_session:$wname" "/login" 2>/dev/null || true
+                    elif worker_needs_permission "$tmux_session" "$wname" "$session_key"; then
+                        worker_status="needs-permission"
+                        _daemon_log "WARN: $session_key/$wname stuck at permissions prompt — needs human approval"
                     fi
                     (( alive_workers++ )) || true
                     # Check for stalled (alive but no output in DAEMON_STALLED_THRESHOLD)
                     # Only mark stalled if BOTH output file AND terminal window are inactive
-                    if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" ]]; then
+                    if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" && "$worker_status" != "needs-permission" ]]; then
                         local age_secs=$((now - output_mtime))
                         if [[ $age_secs -gt $DAEMON_STALLED_THRESHOLD ]]; then
                             local _d_win_activity
