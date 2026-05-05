@@ -1784,7 +1784,7 @@ bead_create() {
         return 1
     fi
     local bead_id
-    bead_id=$(echo "$out" | grep -oE '[a-zA-Z]+-[a-z0-9]+' | head -1)
+    bead_id=$(echo "$out" | sed -nE 's/.*Created issue:[[:space:]]+([a-z][a-z0-9]*(-[a-z0-9]+)+).*/\1/p' | head -1)
     if [[ -z "$bead_id" ]]; then
         echo "[tw] error: bd create returned no parseable bead id for title: $title" >&2
         [[ -n "$out" ]] && echo "$out" >&2
@@ -5801,7 +5801,11 @@ worker_needs_permission() {
 
     local pane_text
     pane_text=$(tmux capture-pane -t "=$tmux_session:$wname" -p 2>/dev/null) || return 1
-    echo "$pane_text" | tail -5 | grep -qE 'shift\+tab to cycle|Allow .*(tool|once|always)|permission'
+    local tail_text
+    tail_text=$(echo "$pane_text" | tail -5)
+    # "bypass permissions on" in the status bar means the worker is in --dangerously-skip-permissions mode, not stuck
+    echo "$tail_text" | grep -q 'bypass permissions on' && return 1
+    echo "$tail_text" | grep -qE 'Allow .*(tool|once|always)|Do you want to proceed|permission prompt'
 }
 
 # Check if a worker's Claude session is not logged in.
