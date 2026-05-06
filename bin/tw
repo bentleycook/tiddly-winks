@@ -1285,7 +1285,7 @@ seed_orchestrator() {
     seed="You are the orchestrator for the '$feature' feature (project: $project).
 
 ## Your role
-Route and track — do not explore code, run commands, or implement anything yourself. Workers do all hands-on work. Your job is dispatching tasks, polling output files, and reporting results to the user.
+Route and track — do not explore code, run commands, or implement anything yourself. Workers do all hands-on work. Your job is dispatching tasks, responding to daemon nudges, and reporting results to the user.
 
 ## Workers
 $worker_lines
@@ -1316,13 +1316,13 @@ This reads the reviews: config from .tw.yml and spawns one focused reviewer per 
 To set up review profiles for a new workspace: tw review init
 
 ## Monitoring worker progress
-Workers write to their output files incrementally. Poll progress:
-  tw feed $feature --problems    # one-shot: which workers have recent/stale output
-  tw feed $feature               # stream: tail all output files in real time
-  tw patrol $feature             # full health check + output tracking + terminal activity
+After dispatching, go idle. The daemon will nudge you when workers complete or need attention. Do NOT set up polling loops.
+
+When nudged (or when you want to check manually):
   tw workers $feature --health   # quick: per-worker state + terminal activity age
+  tw patrol $feature             # full health check + output tracking + terminal activity
   cat ~/.tiddly-winks/health/${session_key}.json  # structured health report (updated by daemon)
-The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken), crash counts, and window_activity timestamps. Check this FIRST before running patrol — it's faster and tells you who needs attention.
+The daemon writes a JSON health report every tick with per-worker status (alive/dead/stalled/circuit-broken), crash counts, and window_activity timestamps.
 
 ## IMPORTANT: Avoiding false re-dispatch
 A worker with status 'working' or 'working-quiet' is ALIVE and has an active Claude process.
@@ -1353,8 +1353,7 @@ For important signals (task done, help needed, handoffs), use mail instead of ou
   tw mail inbox $feature god     # check your inbox
   tw mail read <bead-id>         # read and mark as read
   tw mail ack <bead-id>          # acknowledge and close
-Workers can mail you when they complete tasks or need help. Check your inbox periodically.
-After dispatching, check worker output files periodically. Don't wait for workers to message you — poll their files.
+Workers can mail you when they complete tasks or need help. Check your inbox when nudged.
 
 ## Worker discoveries
 Workers may file new beads when they discover bugs or work items. Periodically check:
@@ -6422,8 +6421,8 @@ for name, info in s.items():
     if [[ -n "$stalled_workers" ]]; then
         echo "  [!] Stalled workers (>1h no output): $stalled_workers"
         for w in $stalled_workers; do
-            nudge_enqueue "$session_key" "$w" "Health check from patrol — your output file hasn't been updated in over 1 hour. Are you stuck? Please report your current status." 30
-            echo "      Nudged: $w"
+            nudge_enqueue "$session_key" "god" "Worker $w appears stalled — no output or terminal activity in over 1 hour. Consider: tw handoff $feature $w" 300
+            echo "      Notified god: $w"
         done
         echo ""
     fi
@@ -8646,7 +8645,7 @@ DAEMON_PID_FILE="$TW_DIR/daemon.pid"
 DAEMON_LOG_FILE="$TW_DIR/logs/daemon.log"
 DAEMON_HEARTBEAT_FILE="$TW_DIR/daemon.heartbeat"
 DAEMON_HUNG_THRESHOLD=900  # 15 minutes
-DAEMON_STALLED_THRESHOLD=1800  # 30 minutes — alive tmux but no output change
+DAEMON_STALLED_THRESHOLD=3600  # 60 minutes — alive tmux but no output change
 DAEMON_CHECKPOINT_INTERVAL=600  # 10 minutes — periodic WIP commits to protect worktree changes
 CRASH_COUNT_DIR="$TW_DIR/crash-counts"
 HEALTH_REPORT_DIR="$TW_DIR/health"
@@ -8793,11 +8792,20 @@ print(json.dumps(data, indent=2))
                     elif worker_needs_permission "$tmux_session" "$wname" "$session_key"; then
                         worker_status="needs-permission"
                         _daemon_log "WARN: $session_key/$wname stuck at permissions prompt — needs human approval"
+                        nudge_enqueue "$session_key" god "Worker $wname status changed to needs-permission. Check: tw workers $feature --health" 300 2>/dev/null || true
                     fi
+
+                    # Check for done signal
+                    if [[ "$worker_status" == "alive" ]] && worker_signal_check "$session_key" "$wname" "done"; then
+                        worker_status="done"
+                        _daemon_log "DONE: $session_key/$wname signaled completion"
+                        nudge_enqueue "$session_key" god "Worker $wname status changed to done. Check: tw workers $feature --health" 300 2>/dev/null || true
+                    fi
+
                     (( alive_workers++ )) || true
                     # Check for stalled (alive but no output in DAEMON_STALLED_THRESHOLD)
                     # Only mark stalled if BOTH output file AND terminal window are inactive
-                    if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" && "$worker_status" != "needs-permission" ]]; then
+                    if [[ $output_mtime -gt 0 && "$worker_status" != "not-logged-in" && "$worker_status" != "needs-permission" && "$worker_status" != "done" ]]; then
                         local age_secs=$((now - output_mtime))
                         if [[ $age_secs -gt $DAEMON_STALLED_THRESHOLD ]]; then
                             local _d_win_activity
@@ -8807,8 +8815,9 @@ print(json.dumps(data, indent=2))
                                 worker_status="stalled"
                                 (( stalled_workers++ )) || true
                                 _daemon_log "WARN: stalled worker $session_key/$wname — no output in ${age_secs}s, no terminal activity in ${_d_win_age}s"
+                                nudge_enqueue "$session_key" god "Worker $wname appears stalled — no output or terminal activity in ${age_secs}s. Consider: tw handoff $feature $wname" 300 2>/dev/null || true
                             else
-                                _daemon_log "INFO: $session_key/$wname output stale (${age_secs}s) but terminal active (${_d_win_age}s ago) — not stalled"
+                                _daemon_log "INFO: $wname output stale but terminal active — no nudge needed"
                             fi
                         fi
                     fi
@@ -8864,6 +8873,7 @@ print(json.dumps(data, indent=2))
                     fi
                 else
                     _daemon_log "DEAD worker: $session_key/$wname (crash #$crash_count) — respawning"
+                    nudge_enqueue "$session_key" god "Worker $wname status changed to dead (crash #$crash_count, respawning). Check: tw workers $feature --health" 300 2>/dev/null || true
                     # Kill ALL windows matching this name (tmux allows duplicates)
                     while tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; do
                         tmux kill-window -t "=$tmux_session:$wname" 2>/dev/null || break
