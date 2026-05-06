@@ -5180,6 +5180,13 @@ nudge_enqueue() {
     local dir ts msg_file
     dir="$(nudge_dir "$session_key" "$worker")"
     mkdir -p "$dir"
+    # Dedup: replace any pending nudge for this (session, worker) slot
+    local existing
+    for existing in "$dir"/*.msg; do
+        [[ -f "$existing" ]] || continue
+        log "Dedup: replacing pending nudge for $worker"
+        rm -f "$existing"
+    done
     ts=$(date +%s)
     msg_file="${dir}/${ts}-${ttl}.msg"
     # Atomic write: temp file + rename to avoid partial reads
@@ -5737,7 +5744,7 @@ Supported signals: done, clear"
             # Notify god window so it picks up completion on next prompt turn
             if tmux_window_exists "$tmux_session" "god"; then
                 nudge_enqueue "$session_key" "god" \
-                    "Worker $worker signaled DONE. Task complete. Check their output file for results." 30
+                    "Worker $worker signaled done for task. Check output: cat $(agents_dir "$session_key")/${worker}.md" 300
                 send_to_pane "=$tmux_session:god" \
                     "Worker $worker has completed their task." 2>/dev/null || true
             fi
