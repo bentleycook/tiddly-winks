@@ -250,17 +250,19 @@ EOF
 #
 # service_ports_json: JSON object like {"backend": 5006, "frontend": 5173}
 template_env_files() {
-    local config_file="$1" config_dir="$2" service_ports_json="$3"
-    python3 - "$config_file" "$config_dir" "$service_ports_json" <<'PYEOF'
+    local config_file="$1" config_dir="$2" service_ports_json="$3" session_key="$4"
+    python3 - "$config_file" "$config_dir" "$service_ports_json" "$session_key" <<'PYEOF'
 import yaml, sys, os, re, json
 
 config_file = sys.argv[1]
 config_dir = sys.argv[2]
 service_ports = json.loads(sys.argv[3])
+session_key = sys.argv[4]
 
 try:
     d = yaml.safe_load(open(config_file))
     env_files = d.get('env_files', {}) or {}
+    proxy_map = d.get('proxy', {}) or {}
 except Exception:
     sys.exit(0)
 
@@ -293,6 +295,10 @@ for target_file, vars_dict in env_files.items():
         # Replace {{service.port}} with actual port
         for svc_name, port in service_ports.items():
             value = value.replace('{{' + svc_name + '.port}}', str(port))
+        for name in proxy_map:
+            host = f'{session_key}-{name}.localhost' if name else f'{session_key}.localhost'
+            value = value.replace('{{proxy.' + name + '}}', host)
+        value = value.replace('{{session}}', session_key)
         existing[var_name] = value
 
     # Write the file
@@ -2932,7 +2938,7 @@ with open(sys.argv[1], 'w') as f:
     done
     service_ports_json+="}"
     local env_output
-    env_output=$(template_env_files "$effective_config" "$config_dir" "$service_ports_json" 2>/dev/null)
+    env_output=$(template_env_files "$effective_config" "$config_dir" "$service_ports_json" "$session_key" 2>/dev/null)
     if [[ -n "$env_output" ]]; then
         while IFS= read -r line; do
             log "$line"
