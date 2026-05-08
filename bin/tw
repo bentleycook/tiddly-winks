@@ -1377,14 +1377,7 @@ Workers may file new beads when they discover bugs or work items. Periodically c
 to see what workers have found. Triage and prioritize as needed.
 
 ## Engine routing
-Cost tier: $(tw_config_get cost_tier standard)  (change: tw config set cost_tier <standard|economy|budget>)
-Available engines: claude, cursor
-
-The active tier controls which engine is auto-selected for workers, reviews, and orchestration.
-Override per task with --engine:
-  tw send $feature <worker> --engine cursor \"<task>\"
-  tw spawn $feature <name> --engine cursor
-Non-claude workers get respawned with each new task (no mid-session hooks).
+Engine routing is automatic via the cost tier system. Current tier: $(tw_config_get cost_tier standard). Override per-task with --engine if needed. Check tiers: tw config get cost_tier
 
 ## Creating sub-beads (IMPORTANT)
 When decomposing work into sub-beads, ALWAYS include --description with the full
