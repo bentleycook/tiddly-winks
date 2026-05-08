@@ -885,91 +885,71 @@ tmux_window_exists() {
         | grep -q "^${wname}\( [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\)\?$"
 }
 
-# Dispatch on engine name to support different AI CLI backends.
-# Currently only 'claude' is implemented. Add cases for cursor, codex, etc.
+# Engine preset registry — reads from ~/.tiddly-winks/engines.json instead of hardcoded cases.
+
+engine_preset_field() {
+    local engine="$1" field="$2"
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get(sys.argv[2],{}).get(sys.argv[3],''))" \
+        "$HOME/.tiddly-winks/engines.json" "$engine" "$field" 2>/dev/null
+}
 
 engine_spawn_cmd() {
     local engine="$1" worker_name="$2" prompt_file="${3:-}"
-    case "$engine" in
-        claude) echo "claude --dangerously-skip-permissions --name '$worker_name'" ;;
-        cursor)
-            if [[ -n "$prompt_file" ]]; then
-                echo "cursor-agent --force \"\$(cat '$prompt_file')\""
-            else
-                echo "cursor-agent --force"
-            fi
-            ;;
-        *) die "Unknown engine: $engine" ;;
-    esac
+    local cmd
+    cmd="$(engine_preset_field "$engine" command)"
+    [[ -z "$cmd" ]] && die "Unknown engine: $engine"
+    cmd="${cmd//\{name\}/$worker_name}"
+    if [[ -n "$prompt_file" ]] && ! engine_supports_hooks "$engine"; then
+        echo "$cmd \"\$(cat '$prompt_file')\""
+    else
+        echo "$cmd"
+    fi
 }
 
 engine_process_pattern() {
-    local engine="$1"
-    case "$engine" in
-        claude) echo "claude.*--dangerously-skip-permissions" ;;
-        cursor) echo "cursor-agent" ;;
-        *) echo "$engine" ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" process_pattern)"
+    echo "${val:-$1}"
 }
 
 engine_wake_delay() {
-    case "$1" in
-        claude) echo 16 ;;
-        cursor) echo 5 ;;
-        *) echo 5 ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" wake_delay)"
+    echo "${val:-5}"
 }
 
 engine_wake_prompt() {
-    case "$1" in
-        claude) echo "You are now online. Read your role and context from the SessionStart hook above, then report ready to your output file." ;;
-        cursor) echo "You are now online. Execute your task and write progress to your output file." ;;
-        *) echo "You are now online. Execute your task and write progress to your output file." ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" wake_prompt)"
+    echo "${val:-You are now online. Execute your task and write progress to your output file.}"
 }
 
 engine_supports_hooks() {
-    case "$1" in
-        claude) return 0 ;;
-        cursor) return 1 ;;
-        *) return 1 ;;
-    esac
+    [[ "$(engine_preset_field "$1" supports_hooks)" == "True" ]]
 }
 
-# Patterns indicating the worker is idle (at the prompt, ready for input).
 engine_idle_pattern() {
-    case "$1" in
-        claude) echo '❯|bypass permissions|hold Space to speak|Sautéed for' ;;
-        cursor) echo '❯|>' ;;
-        *) echo '❯|>' ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" idle_pattern)"
+    echo "${val:-❯|>}"
 }
 
-# Patterns indicating the worker is busy (actively running tools).
 engine_busy_pattern() {
-    case "$1" in
-        claude) echo 'esc to interrupt' ;;
-        cursor) echo 'running|executing|processing' ;;
-        *) echo 'running|processing' ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" busy_pattern)"
+    echo "${val:-running|processing}"
 }
 
-# Patterns indicating the worker is not authenticated.
 engine_not_logged_in_pattern() {
-    case "$1" in
-        claude) echo 'Not logged in' ;;
-        cursor) echo 'authentication required|API key invalid|unauthorized' ;;
-        *) echo 'Not logged in|authentication required|API key invalid' ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" not_logged_in_pattern)"
+    echo "${val:-Not logged in|authentication required|API key invalid}"
 }
 
-# Command to gracefully exit the engine's session.
 engine_exit_cmd() {
-    case "$1" in
-        claude) echo "/exit" ;;
-        cursor) echo "C-c" ;;
-        *) echo "/exit" ;;
-    esac
+    local val
+    val="$(engine_preset_field "$1" exit_cmd)"
+    echo "${val:-/exit}"
 }
 
 # Build context preamble for non-hook engines.
