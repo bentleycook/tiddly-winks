@@ -894,11 +894,12 @@ engine_preset_field() {
 }
 
 engine_spawn_cmd() {
-    local engine="$1" worker_name="$2" prompt_file="${3:-}"
+    local engine="$1" worker_name="$2" prompt_file="${3:-}" workdir="${4:-}"
     local cmd
     cmd="$(engine_preset_field "$engine" command)"
     [[ -z "$cmd" ]] && die "Unknown engine: $engine"
     cmd="${cmd//\{name\}/$worker_name}"
+    cmd="${cmd//\{workdir\}/$workdir}"
     if [[ -n "$prompt_file" ]] && ! engine_supports_hooks "$engine"; then
         echo "$cmd \"\$(cat '$prompt_file')\""
     else
@@ -1215,7 +1216,7 @@ with open(f, 'w') as fh:
         _prompt_file=$(engine_context_preamble "$session_key" "$wname" "$engine" 2>/dev/null || true)
     fi
     local _engine_cmd
-    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file")
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file" "$config_dir")
     tmux send-keys -t "=$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' $_engine_cmd" Enter
 
@@ -2837,7 +2838,7 @@ for name, info in svcs.items():
     tmux new-session -d -s "$tmux_session" -n "god"
     _owned_tmux=1  # WE created this tmux session; rollback may kill it
     local _god_cmd
-    _god_cmd=$(engine_spawn_cmd "claude" "$feature")
+    _god_cmd=$(engine_spawn_cmd "claude" "$feature" "" "$config_dir")
     tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' $_god_cmd" Enter
 
     # Apply project color theme to tmux session
@@ -4755,7 +4756,7 @@ cmd_claude() {
         log "Creating god window in $tmux_session"
         tmux new-window -d -t "=$tmux_session" -n "$claude_window"
         local _god_cmd
-        _god_cmd=$(engine_spawn_cmd "claude" "$feature")
+        _god_cmd=$(engine_spawn_cmd "claude" "$feature" "" "$config_dir")
         tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='god' $_god_cmd" Enter
     fi
 
@@ -6151,7 +6152,7 @@ with open(sys.argv[1], 'w') as f:
         _prompt_file=$(engine_context_preamble "$session_key" "$worker" "$engine" 2>/dev/null || true)
     fi
     local _engine_cmd
-    _engine_cmd=$(engine_spawn_cmd "$engine" "$worker" "$_prompt_file")
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$worker" "$_prompt_file" "$config_dir")
     tmux send-keys -t "=$tmux_session:$worker" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$worker' TW_ROLE='$wrole' $_engine_cmd" Enter
 
@@ -9206,7 +9207,7 @@ with open(sys.argv[1], 'w') as fh:
         _prompt_file=$(engine_context_preamble "$session_key" "$wname" "$engine" 2>/dev/null || true)
     fi
     local _engine_cmd
-    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file")
+    _engine_cmd=$(engine_spawn_cmd "$engine" "$wname" "$_prompt_file" "$config_dir")
     tmux respawn-pane -t "=$tmux_session:$wname" \
         "cd '$config_dir' && TW_SESSION='$session_key' TW_WORKER='$wname' TW_ROLE='$wrole' $_engine_cmd" \
         2>/dev/null || true
