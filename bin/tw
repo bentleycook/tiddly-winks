@@ -1050,15 +1050,45 @@ print(w.get('engine', 'claude'))
 " "$HOME/.tiddly-winks/sessions.json" "$session_key" "$wname" 2>/dev/null || echo claude
 }
 
-# Resolve engine for a session — check .tw.yml, fall back to 'claude'
+tw_config_get() {
+    local key="$1" default="${2:-}"
+    local config_file="$HOME/.tiddly-winks/config.json"
+    if [[ -f "$config_file" ]]; then
+        local val
+        val=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$config_file" "$key" 2>/dev/null)
+        echo "${val:-$default}"
+    else
+        echo "$default"
+    fi
+}
+
+tw_config_set() {
+    local key="$1" value="$2"
+    local config_file="$HOME/.tiddly-winks/config.json"
+    python3 -c "
+import json, sys, os
+f = sys.argv[1]
+d = json.load(open(f)) if os.path.exists(f) else {}
+d[sys.argv[2]] = sys.argv[3]
+json.dump(d, open(f, 'w'), indent=2)
+" "$config_file" "$key" "$value"
+}
+
+# Resolve engine: --engine flag > .tw.yml engine > cost_tier mapping > 'claude'
 resolve_engine() {
-    local engine="$1" config_file="${2:-}"
+    local engine="$1" config_file="${2:-}" kind="${3:-workers}"
     [[ -n "$engine" ]] && echo "$engine" && return
     if [[ -n "$config_file" && -f "$config_file" ]]; then
-        yaml_get "$config_file" "engine" "claude"
-    else
-        echo "claude"
+        local yml_engine
+        yml_engine=$(yaml_get "$config_file" "engine" "")
+        [[ -n "$yml_engine" ]] && echo "$yml_engine" && return
     fi
+    local tier
+    tier=$(tw_config_get cost_tier "standard")
+    local tier_engine
+    tier_engine=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('_tiers',{}).get(sys.argv[2],{}).get(sys.argv[3],''))" \
+        "$HOME/.tiddly-winks/engines.json" "$tier" "$kind" 2>/dev/null)
+    echo "${tier_engine:-claude}"
 }
 
 # Track engine spawn for load-balancing visibility.
@@ -1346,22 +1376,15 @@ Workers may file new beads when they discover bugs or work items. Periodically c
   bd list --status=open
 to see what workers have found. Triage and prioritize as needed.
 
-## Engine routing (spread load across subscriptions)
-Usage today: $(engine_usage_summary)
+## Engine routing
+Cost tier: $(tw_config_get cost_tier standard)  (change: tw config set cost_tier <standard|economy|budget>)
 Available engines: claude, cursor
-Check full stats: tw engine-stats
 
-Override engine per task:
+The active tier controls which engine is auto-selected for workers, reviews, and orchestration.
+Override per task with --engine:
   tw send $feature <worker> --engine cursor \"<task>\"
   tw spawn $feature <name> --engine cursor
 Non-claude workers get respawned with each new task (no mid-session hooks).
-
-**When to use which engine:**
-- **claude**: orchestration, debugging, investigation, PR review, anything needing strong reasoning
-- **cursor**: refactoring, mechanical edits, test writing, code generation — good for spreading load
-
-**Goal: spread usage across subscriptions.** If claude usage is high today, prefer cursor for
-the next mechanical task. Don't overthink it — any worker can handle any task on any engine.
 
 ## Creating sub-beads (IMPORTANT)
 When decomposing work into sub-beads, ALWAYS include --description with the full
@@ -2976,7 +2999,7 @@ with open(sys.argv[1], 'w') as f:
         local wname="${wpair%%:*}"
         local _wrest="${wpair#*:}"; local wrole="${_wrest%%:*}"
         local wengine="${wpair##*:}"
-        wengine=$(resolve_engine "$wengine" "$effective_config")
+        wengine=$(resolve_engine "$wengine" "$effective_config" "workers")
         local worker_bead_id
         worker_bead_id=$(worker_bead_find_or_create "$wname" "$project" "$config_dir")
         spawn_worker "$tmux_session" "$session_key" "$config_dir" \
@@ -6387,7 +6410,7 @@ for name, info in s.items():
                         break
                     fi
                 done
-                wengine=$(resolve_engine "$wengine" "$config_file")
+                wengine=$(resolve_engine "$wengine" "$config_file" "workers")
                 # wrole may be empty for generic workers — that's fine
                 local worker_bead_id
                 worker_bead_id=$(worker_bead_find_or_create "$w" "$project" "$config_dir" 2>/dev/null || echo "")
@@ -6746,7 +6769,7 @@ cmd_spawn() {
     # Resolve engine: --engine flag > .tw.yml > 'claude'
     local config_file="$config_dir/.tw.yml"
     local engine
-    engine=$(resolve_engine "$spawn_engine" "$config_file")
+    engine=$(resolve_engine "$spawn_engine" "$config_file" "workers")
 
     # Spawn the worker
     spawn_worker "$tmux_session" "$session_key" "$config_dir" "$name" "$role" "$bead_id" "$worker_bead_id" "$engine"
@@ -7229,7 +7252,7 @@ _review_dispatch() {
         [[ -z "$rpair" ]] && continue
         local rname="${rpair%%:*}" _rrest="${rpair#*:}"
         local rprompt="${_rrest%%:*}" rengine="${_rrest##*:}"
-        rengine=$(resolve_engine "$rengine" "$config_file")
+        rengine=$(resolve_engine "$rengine" "$config_file" "reviews")
 
         # Build the task from the prompt file
         local task=""
@@ -7423,7 +7446,7 @@ print(json.dumps(rows, indent=2))
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
             local wengine="${wpair##*:}"
-            wengine=$(resolve_engine "$wengine" "$config_file")
+            wengine=$(resolve_engine "$wengine" "$config_file" "workers")
 
             if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "$wname"; then
                 if worker_is_alive "$tmux_session" "$wname" "$session_key"; then
@@ -7496,7 +7519,7 @@ print(json.dumps(rows, indent=2))
         local wname="${wpair%%:*}"
         local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
         local wengine="${wpair##*:}"
-        wengine=$(resolve_engine "$wengine" "$config_file")
+        wengine=$(resolve_engine "$wengine" "$config_file" "workers")
 
         # Skip if window already exists
         if tmux_window_exists "$tmux_session" "$wname"; then
@@ -8757,7 +8780,7 @@ print(json.dumps(data, indent=2))
             [[ -z "$wpair" ]] && continue
             local wname="${wpair%%:*}"; local _wpr="${wpair#*:}"; local wrole="${_wpr%%:*}"
             local wengine="${wpair##*:}"
-            wengine=$(resolve_engine "$wengine" "$effective_config")
+            wengine=$(resolve_engine "$wengine" "$effective_config" "workers")
             local is_dead=0
             local worker_status="alive"
             local output_mtime=0
@@ -9409,20 +9432,35 @@ cmd_config() {
         proxy)   _config_proxy "$@" ;;
         service) _config_service "$@" ;;
         show)    _config_show "$@" ;;
+        get)
+            local key="${1:-}"
+            [[ -z "$key" ]] && die "Usage: tw config get <key>"
+            tw_config_get "$key"
+            ;;
+        set)
+            local key="${1:-}" value="${2:-}"
+            [[ -z "$key" || -z "$value" ]] && die "Usage: tw config set <key> <value>"
+            tw_config_set "$key" "$value"
+            echo "Set $key=$value"
+            ;;
         *)
             cat <<'EOF'
-tw config — modify runtime session configuration
+tw config — modify runtime and global configuration
 
-  tw config proxy <feature> <subdomain> <service>   Remap a proxy route
-  tw config service <feature> <name> port <port>    Change a service's port
-  tw config service <feature> <name> add <port>     Register a new service
-  tw config show <feature>                          Show current runtime config
+  tw config get <key>                                Read a global config value
+  tw config set <key> <value>                        Set a global config value
+  tw config proxy <feature> <subdomain> <service>    Remap a proxy route
+  tw config service <feature> <name> port <port>     Change a service's port
+  tw config service <feature> <name> add <port>      Register a new service
+  tw config show <feature>                           Show current runtime config
+
+Global keys:
+  cost_tier   Engine selection tier (standard, economy, budget)
 
 Examples:
-  tw config proxy my-feature "" frontend      # route primary URL to frontend
-  tw config proxy my-feature api backend      # route -api subdomain to backend
-  tw config service my-feature web port 5173  # set web service port
-  tw config service my-feature web add 5173   # register new service "web" on port 5173
+  tw config set cost_tier economy
+  tw config get cost_tier
+  tw config proxy my-feature "" frontend
 EOF
             ;;
     esac
