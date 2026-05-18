@@ -606,16 +606,32 @@ except Exception:
         if [[ -d "$agents_dir" ]]; then
             local now
             now=$(date +%s)
-            for f in "$agents_dir"/*.md; do
-                [[ -f "$f" ]] || continue
-                local wname mtime age color
-                wname=$(basename "$f" .md)
-                mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+            local _emit_dot
+            _emit_dot() {
+                local wname="$1" mtime="$2" age color
                 age=$(( now - mtime ))
                 if [[ $age -lt 300 ]]; then color="green"
                 elif [[ $age -lt 600 ]]; then color="yellow"
                 else color="red"; fi
                 out+="#[fg=$color]● #[default]${wname:0:3} "
+            }
+            # Per-bead layout: agents/<session>/<wname>/<bead>.md — newest per worker.
+            for d in "$agents_dir"/*/; do
+                [[ -d "$d" ]] || continue
+                local wname newest mtime
+                wname=$(basename "$d")
+                newest=$(ls -t "$d"*.md 2>/dev/null | head -1)
+                [[ -n "$newest" ]] || continue
+                mtime=$(stat -f %m "$newest" 2>/dev/null || echo 0)
+                _emit_dot "$wname" "$mtime"
+            done
+            # Legacy flat files from pre-namespacing sessions.
+            for f in "$agents_dir"/*.md; do
+                [[ -f "$f" ]] || continue
+                local wname mtime
+                wname=$(basename "$f" .md)
+                mtime=$(stat -f %m "$f" 2>/dev/null || echo 0)
+                _emit_dot "$wname" "$mtime"
             done
         fi
     fi
@@ -872,6 +888,62 @@ caddy_reload() {
 
 agents_dir() { echo "$HOME/.tiddly-winks/agents/$1"; }
 
+# Compute the per-task-bead output path for a worker:
+#   agents/<session>/<wname>/<task_bead>.md
+# Falls back to <wname>/_unassigned.md before a task bead exists.
+# Does not create the directory — callers that write must mkdir -p first.
+worker_output_path() {
+    local session_key="$1" wname="$2" task_bead="${3:-}"
+    local base
+    base="$(agents_dir "$session_key")/${wname}"
+    if [[ -n "$task_bead" ]]; then
+        echo "${base}/${task_bead}.md"
+    else
+        echo "${base}/_unassigned.md"
+    fi
+}
+
+# Resolve a worker's CURRENT active output file. The hooked json
+# (written at spawn and on every `tw send`) is the single source of
+# truth. Falls back to the legacy flat path for pre-existing sessions
+# created before per-bead namespacing.
+worker_output_file() {
+    local session_key="$1" wname="$2"
+    local hf="$HOME/.tiddly-winks/hooked/${session_key}/${wname}.json"
+    local of=""
+    if [[ -f "$hf" ]]; then
+        of=$(python3 -c "
+import json, sys
+try: print(json.load(open(sys.argv[1])).get('output_file', '') or '')
+except Exception: pass
+" "$hf" 2>/dev/null || true)
+    fi
+    if [[ -z "$of" ]]; then
+        of="$(agents_dir "$session_key")/${wname}.md"
+    fi
+    echo "$of"
+}
+
+# Extract the most recent "## Session handoff" block from a worker's
+# identity bead. Used to seed a fresh session's output file so a
+# successor worker does not re-derive what a predecessor already found.
+worker_latest_handoff() {
+    local worker_bead_id="$1" config_dir="${2:-}"
+    [[ -z "$worker_bead_id" ]] && return 0
+    local bead_text
+    bead_text=$( { [[ -n "$config_dir" ]] && cd "$config_dir"; bd show "$worker_bead_id"; } 2>/dev/null || true)
+    [[ -z "$bead_text" ]] && return 0
+    printf '%s' "$bead_text" | python3 -c "
+import sys, re
+t = sys.stdin.read()
+# Split on the handoff marker; take the last non-empty segment.
+parts = re.split(r'(?=## Session handoff)', t)
+hand = [p for p in parts if p.strip().startswith('## Session handoff')]
+if hand:
+    sys.stdout.write(hand[-1].strip())
+"
+}
+
 # Maximum concurrent Claude worker processes across all sessions.
 # Safety net to prevent spawn storms from overwhelming the machine.
 TW_MAX_WORKERS=${TW_MAX_WORKERS:-100}
@@ -1021,6 +1093,21 @@ Pattern:
   echo '## <subtask title>' >> $_preamble_output
   echo '<what you did, what you found>' >> $_preamble_output
 PREAMBLE_OUTPUT
+        # Prime-seed the actual output file with the latest handoff so a
+        # successor (non-hook engine) starts from predecessor context.
+        mkdir -p "$(dirname "$_preamble_output")" 2>/dev/null || true
+        if [[ -n "$_preamble_wbead_id" && ! -s "$_preamble_output" ]]; then
+            local _seed
+            _seed="$(worker_latest_handoff "$_preamble_wbead_id")"
+            if [[ -n "$_seed" ]]; then
+                {
+                    echo "## Prior session (seeded — do not re-derive this)"
+                    echo ""
+                    echo "$_seed"
+                    echo ""
+                } > "$_preamble_output"
+            fi
+        fi
     fi
 
     # Current task
@@ -1154,8 +1241,20 @@ spawn_worker() {
         return 1
     fi
 
+    # Per-task-bead output path. If a prior `tw send` already wrote a
+    # task bead into the hooked json (non-hook respawn path), inherit it
+    # so spawn and send agree on the active file.
+    local _existing_task_bead=""
+    if [[ -f "${HOME}/.tiddly-winks/hooked/${session_key}/${wname}.json" ]]; then
+        _existing_task_bead=$(python3 -c "
+import json, sys
+try: print(json.load(open(sys.argv[1])).get('current_task_bead', '') or '')
+except Exception: pass
+" "${HOME}/.tiddly-winks/hooked/${session_key}/${wname}.json" 2>/dev/null || true)
+    fi
     local output_file
-    output_file="$(agents_dir "$session_key")/${wname}.md"
+    output_file="$(worker_output_path "$session_key" "$wname" "$_existing_task_bead")"
+    mkdir -p "$(dirname "$output_file")"
 
     # Write hooked work file — consumed by the SessionStart hook (tw-prime.sh)
     # to inject bead context + role + output file path + worker identity at session open.
@@ -1277,9 +1376,9 @@ seed_orchestrator() {
         local wn="${wpair%%:*}" _wr_rest="${wpair#*:}"
         local wr="${_wr_rest%%:*}"
         if [[ -n "$wr" ]]; then
-            worker_lines+="- $wn (context: $wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+            worker_lines+="- $wn (context: $wr): tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn/*.md"$'\n'
         else
-            worker_lines+="- $wn: tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn.md"$'\n'
+            worker_lines+="- $wn: tw send $feature $wn \"<task>\"  →  cat $agents_path/$wn/*.md"$'\n'
         fi
     done <<< "$workers_str"
 
@@ -1757,7 +1856,7 @@ with open(sys.argv[1], 'w') as f:
         'feature': sys.argv[7]
     }, f, indent=2)
 " "${hooked_dir}/${wname}.json" "$bead_id" "$wname" "$wrole" \
-  "$(agents_dir "$session_key")/${wname}.md" "$worker_bead_id" "$_feature"
+  "$(worker_output_file "$session_key" "$wname")" "$worker_bead_id" "$_feature"
 
     # Send a wake prompt to re-activate the worker
     local wake_msg="You are being re-activated for new work. Re-read your role and context from the SessionStart hook, check bd show $bead_id for the latest feature state, and report ready to your output file."
@@ -5562,7 +5661,11 @@ print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
         --set-metadata "session=$session_key") \
         2>/dev/null || true
 
-    # Write task bead ID to hooked file so worker picks it up on restart
+    # Write task bead ID + per-bead output path to hooked file so the
+    # worker (and every poller) picks up the new active file on restart.
+    local _new_output_file
+    _new_output_file="$(worker_output_path "$session_key" "$worker" "$task_bead_id")"
+    mkdir -p "$(dirname "$_new_output_file")"
     if [[ -f "$hooked_file" ]]; then
         python3 -c "
 import json, sys
@@ -5570,9 +5673,10 @@ f = sys.argv[1]
 d = json.load(open(f))
 d['current_task'] = sys.argv[2]
 d['current_task_bead'] = sys.argv[3]
+d['output_file'] = sys.argv[4]
 with open(f, 'w') as fh:
     json.dump(d, fh, indent=2)
-" "$hooked_file" "$task" "$task_bead_id" 2>/dev/null || true
+" "$hooked_file" "$task" "$task_bead_id" "$_new_output_file" 2>/dev/null || true
     fi
 
     # Also record on worker identity bead for history
@@ -5746,7 +5850,7 @@ Supported signals: done, clear"
             # Notify god window so it picks up completion on next prompt turn
             if tmux_window_exists "$tmux_session" "god"; then
                 nudge_enqueue "$session_key" "god" \
-                    "Worker $worker signaled done for task. Check output: cat $(agents_dir "$session_key")/${worker}.md" 300
+                    "Worker $worker signaled done for task. Check output: cat $(worker_output_file "$session_key" "$worker")" 300
                 send_to_pane "=$tmux_session:god" \
                     "Worker $worker has completed their task." 2>/dev/null || true
             fi
@@ -6004,7 +6108,8 @@ worker_state() {
     # 4. Check output file freshness for stall detection
     local stalled=0
     if [[ -n "$agents_path" ]]; then
-        local output_file="$agents_path/${wname}.md"
+        local output_file
+        output_file="$(worker_output_file "$session_key" "$wname")"
         if [[ -f "$output_file" ]]; then
             local mtime age_secs
             mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
@@ -6076,7 +6181,7 @@ cmd_handoff() {
 
     # 1. Save worker's output file to their identity bead
     local output_file
-    output_file="$(agents_dir "$session_key")/${worker}.md"
+    output_file="$(worker_output_file "$session_key" "$worker")"
 
     local worker_bead_id
     worker_bead_id=$(worker_bead_find "$worker" "$project" "$config_dir")
@@ -6177,11 +6282,16 @@ with open(sys.argv[1], 'w') as f:
 # ─── Sync Worker Outputs to Beads ────────────────────────────────────────────
 sync_worker_output_to_bead() {
     local session_key="$1" wname="$2" agents_path="$3" project="$4" config_dir="$5" force="${6:-0}"
-    local output_file="$agents_path/${wname}.md"
+    local output_file
+    output_file="$(worker_output_file "$session_key" "$wname")"
     [[ -f "$output_file" ]] || return 0
     local sync_dir="$HOME/.tiddly-winks/sync-offsets/${session_key}"
     mkdir -p "$sync_dir"
-    local offset_file="$sync_dir/${wname}.last-sync-offset"
+    # Offset is keyed by the active file (task bead), so a new task
+    # starts syncing from byte 0 instead of inheriting a stale offset.
+    local _of_key
+    _of_key=$(basename "$output_file" .md)
+    local offset_file="$sync_dir/${wname}.${_of_key}.last-sync-offset"
     local prev_offset=0
     [[ -f "$offset_file" ]] && prev_offset=$(cat "$offset_file" 2>/dev/null || echo 0)
     local current_size
@@ -6308,7 +6418,8 @@ cmd_patrol() {
         fi
 
         # Output file age for display
-        local output_file="$agents_path/${wname}.md"
+        local output_file
+        output_file="$(worker_output_file "$session_key" "$wname")"
         if [[ -f "$output_file" ]]; then
             local mtime
             mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
@@ -6461,7 +6572,8 @@ for name, info in s.items():
     for wpair in "${worker_pairs[@]}"; do
         [[ -z "$wpair" ]] && continue
         local wname="${wpair%%:*}"
-        local output_file="$agents_path/${wname}.md"
+        local output_file
+        output_file="$(worker_output_file "$session_key" "$wname")"
         local mtime_file="$patrol_state_dir/${wname}.mtime"
 
         [[ -f "$output_file" ]] || continue
@@ -6652,10 +6764,23 @@ cmd_feed() {
         echo ""
         printf "  %-20s %-12s %-12s %s\n" "WORKER" "LAST OUTPUT" "TERM ACTIVE" "STATUS"
         printf "  %-20s %-12s %-12s %s\n" "--------------------" "------------" "------------" "----------"
-        for f in "$agents_path"/*.md; do
+        # Active file per worker: newest .md in agents/<session>/<wname>/.
+        # Plus legacy flat files from pre-namespacing sessions.
+        local _feed_files=()
+        for d in "$agents_path"/*/; do
+            [[ -d "$d" ]] || continue
+            local _newest
+            _newest=$(ls -t "$d"*.md 2>/dev/null | head -1)
+            [[ -n "$_newest" ]] && _feed_files+=("$_newest")
+        done
+        for _flat in "$agents_path"/*.md; do
+            [[ -f "$_flat" ]] && _feed_files+=("$_flat")
+        done
+        for f in "${_feed_files[@]}"; do
             [[ -f "$f" ]] || continue
             local wname
-            wname=$(basename "$f" .md)
+            wname=$(basename "$(dirname "$f")")
+            [[ "$wname" == "$(basename "$agents_path")" ]] && wname=$(basename "$f" .md)
             local mtime age_secs age_str status
             mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
             age_secs=$((now - mtime))
@@ -6706,9 +6831,18 @@ cmd_feed() {
     echo "  Press Ctrl-C to stop"
     echo ""
 
-    # Use tail -f on all .md files, prefixing each line with the worker name
-    # fswatch would be nicer but tail -F works everywhere
-    tail -F "$agents_path"/*.md 2>/dev/null | while IFS= read -r line; do
+    # Use tail -F on all .md files (per-bead nested + legacy flat).
+    # Note: only files present at invocation are followed; re-run feed
+    # to pick up files created for task beads dispatched later.
+    local _tail_files=()
+    while IFS= read -r _tf; do
+        [[ -n "$_tf" ]] && _tail_files+=("$_tf")
+    done < <(find "$agents_path" -maxdepth 2 -name '*.md' -type f 2>/dev/null)
+    if [[ ${#_tail_files[@]} -eq 0 ]]; then
+        echo "  (no worker output files yet)"
+        return 0
+    fi
+    tail -F "${_tail_files[@]}" 2>/dev/null | while IFS= read -r line; do
         echo "$line"
     done
 }
@@ -8780,7 +8914,8 @@ print(json.dumps(data, indent=2))
             local output_mtime=0
 
             # Check output file mtime
-            local output_file="$agents_path/${wname}.md"
+            local output_file
+            output_file="$(worker_output_file "$session_key" "$wname")"
             if [[ -f "$output_file" ]]; then
                 output_mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo 0)
             fi

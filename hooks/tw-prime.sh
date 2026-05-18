@@ -25,9 +25,39 @@ except Exception:
     pass
 " 2>/dev/null)"
 
-# Default output_file derivation if not stored in hooked file
+# Default output_file derivation if not stored in hooked file.
+# Matches the per-task-bead layout written by `tw spawn`/`tw send`.
 if [[ -z "$output_file" ]]; then
-    output_file="$HOME/.tiddly-winks/agents/${SESSION_KEY}/${WORKER}.md"
+    _base="$HOME/.tiddly-winks/agents/${SESSION_KEY}/${WORKER}"
+    if [[ -n "$current_task_bead" ]]; then
+        output_file="${_base}/${current_task_bead}.md"
+    else
+        output_file="${_base}/_unassigned.md"
+    fi
+fi
+mkdir -p "$(dirname "$output_file")" 2>/dev/null || true
+
+# Prime-seed: if this is a fresh session (output file missing or empty)
+# and the worker has an identity bead, seed the file with the most
+# recent "## Session handoff" block so a successor does not re-derive
+# what a predecessor already produced.
+if [[ -n "$worker_bead_id" ]] && { [[ ! -s "$output_file" ]]; }; then
+    _seed=$(bd show "$worker_bead_id" 2>/dev/null | python3 -c "
+import sys, re
+t = sys.stdin.read()
+parts = re.split(r'(?=## Session handoff)', t)
+hand = [p for p in parts if p.strip().startswith('## Session handoff')]
+if hand:
+    sys.stdout.write(hand[-1].strip())
+" 2>/dev/null || true)
+    if [[ -n "$_seed" ]]; then
+        {
+            echo "## Prior session (seeded — do not re-derive this)"
+            echo ""
+            echo "$_seed"
+            echo ""
+        } > "$output_file"
+    fi
 fi
 
 context=""
