@@ -335,6 +335,71 @@ print(f.name)
 EOF
 }
 
+# Workspace topology
+#
+# multi-repo: services span >1 git repo (e.g. fairglow-next + fairglow-platform).
+# monorepo:   services share a single git repo (e.g. potoo/server + potoo/web).
+#
+# In multi-repo workspaces features have per-repo branches and only touch a
+# subset of repos; in monorepo workspaces every feature gets a single branch.
+# Reads workspace.kind from .tw.yml; falls back to scanning git roots so
+# configs that predate the workspace block keep working.
+workspace_is_multi_repo() {
+    local effective_config="$1" config_dir="$2"
+    local kind
+    kind=$(yaml_get_nested "$effective_config" "workspace.kind" "")
+    case "$kind" in
+        multi-repo) return 0 ;;
+        monorepo)   return 1 ;;
+    esac
+    # Auto-detect from services.
+    local -A roots=()
+    local -a svc_names=()
+    mapfile -t svc_names < <(yaml_service_names "$effective_config")
+    local svc svc_path svc_abs root
+    for svc in "${svc_names[@]}"; do
+        [[ -z "$svc" ]] && continue
+        svc_path=$(yaml_service_get "$effective_config" "$svc" "path" "")
+        [[ -z "$svc_path" ]] && continue
+        svc_abs="$config_dir/$svc_path"
+        root=$(git -C "$svc_abs" rev-parse --show-toplevel 2>/dev/null) || continue
+        roots[$root]=1
+    done
+    [[ ${#roots[@]} -gt 1 ]]
+}
+
+# Print one repo name per line: basename of each distinct git root reachable
+# from any service path. Used to populate /feature prompts and validate
+# --repo arguments against the workspace's known repos.
+workspace_repo_names() {
+    local effective_config="$1" config_dir="$2"
+    python3 - "$effective_config" "$config_dir" <<'EOF'
+import os, subprocess, sys, yaml
+cfg, base = sys.argv[1], sys.argv[2]
+try:
+    d = yaml.safe_load(open(cfg)) or {}
+except Exception:
+    sys.exit(0)
+seen = []
+for svc, info in (d.get('services') or {}).items():
+    p = (info or {}).get('path') if isinstance(info, dict) else None
+    if not p:
+        continue
+    abs_path = os.path.join(base, p)
+    try:
+        root = subprocess.run(
+            ['git', '-C', abs_path, 'rev-parse', '--show-toplevel'],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except Exception:
+        continue
+    name = os.path.basename(root)
+    if name and name not in seen:
+        seen.append(name)
+print('\n'.join(seen))
+EOF
+}
+
 # JSON helpers
 json_get() { python3 -c "import json,sys; d=json.load(open('$SESSIONS_FILE')); print(d.get('$1', {}).get('$2', ''))" 2>/dev/null; }
 
@@ -1362,10 +1427,12 @@ with open(f, 'w') as fh:
 }
 
 # Send the orchestrator seed to the god window once agents are known.
-# Usage: seed_orchestrator <tmux_session> <session_key> <feature> <project> <bead_id> <branch> <worker_pairs_str> <worktrees_json>
+# Usage: seed_orchestrator <tmux_session> <session_key> <feature> <project> <bead_id> <branch> <worker_pairs_str> <worktrees_json> [repos_kv]
+# repos_kv: optional, newline-separated "repo:branch" entries for multi-repo workspaces.
 seed_orchestrator() {
     local tmux_session="$1" session_key="$2" feature="$3" project="$4"
     local bead_id="$5" branch="$6" workers_str="$7" worktrees_json="$8"
+    local repos_kv="${9:-}"
     local agents_path
     agents_path="$(agents_dir "$session_key")"
 
@@ -1391,6 +1458,27 @@ seed_orchestrator() {
         done <<< "$worktrees_json"
     fi
 
+    # Build repos block — explicit per-repo branch table for multi-repo
+    # workspaces, single-branch line for monorepos. The "ignore other branches"
+    # rule is critical for multi-repo: a stray same-named branch in an unlisted
+    # repo is unrelated work, not this feature.
+    local repos_block=""
+    if [[ -n "$repos_kv" ]]; then
+        repos_block="## Repositories in scope
+This feature touches exactly the repos listed below. Each row is (repo, branch). Any same-named branch in a repo NOT listed here is unrelated work — ignore it.
+
+"
+        while IFS=: read -r _rname _rbranch; do
+            [[ -z "$_rname" ]] && continue
+            repos_block+="- $_rname → $_rbranch"$'\n'
+        done <<< "$repos_kv"
+        repos_block+=$'\n'"When asking workers to read git state, give them the specific (repo, branch) pair from the table above. Do NOT instruct them to search for branches by feature name."$'\n'
+    else
+        repos_block="## Branch
+$branch (single branch across the workspace)
+"
+    fi
+
     # Load task templates list if available
     local task_templates=""
     if [[ -d "$HOME/.claude/task-templates" ]]; then
@@ -1403,6 +1491,7 @@ seed_orchestrator() {
 ## Your role
 Route and track — do not explore code, run commands, or implement anything yourself. Workers do all hands-on work. Your job is dispatching tasks, responding to daemon nudges, and reporting results to the user.
 
+$repos_block
 ## Workers
 $worker_lines
 When a worker has a role context (shown in parentheses above), PREFER dispatching tasks that match that domain — e.g., frontend tasks to frontend-dev workers, backend tasks to backend-dev workers. If no role-matched worker is available (busy or none exist), fall back to any available worker. Workers without a role context can handle any task.
@@ -2648,11 +2737,17 @@ PYEOF
 # Parses its own flags; cmd_start passes through --mode / --attach verbatim.
 _start_one_session() {
     local feature="" mode="local" attach_flag=0
+    # CLI-supplied repo overrides for multi-repo workspaces. Each entry is
+    # "name" or "name:branch"; the branch defaults to ${prefix}${feature} when
+    # omitted. Flag is ignored in monorepo workspaces.
+    local -a cli_repos=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mode) mode="$2"; shift 2 ;;
             --mode=*) mode="${1#--mode=}"; shift ;;
+            --repo) cli_repos+=("$2"); shift 2 ;;
+            --repo=*) cli_repos+=("${1#--repo=}"); shift ;;
             --attach) attach_flag=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *) feature="$1"; shift ;;
@@ -2720,6 +2815,7 @@ _start_one_session() {
     # Check for stopped session — resume instead of starting fresh
     local resuming=0
     local existing_bead_id="" existing_worktrees="" existing_services="" existing_branch=""
+    local existing_repos_json="[]"
     if sessions_get_key "$session_key" "project" 2>/dev/null | grep -q .; then
         log "Found stopped session for $session_key — resuming"
         resuming=1
@@ -2739,6 +2835,11 @@ svcs = d.get('$session_key', {}).get('services', {})
 for name, info in svcs.items():
     print(f'{name}:{info.get(\"port\", \"\")}')
 " 2>/dev/null || true)
+        existing_repos_json=$(python3 -c "
+import json
+d = json.load(open('$SESSIONS_FILE'))
+print(json.dumps(d.get('$session_key', {}).get('repos', [])))
+" 2>/dev/null || echo "[]")
     fi
 
     log "Starting feature: $session_key (mode=$mode${resuming:+, resuming})"
@@ -2784,6 +2885,79 @@ for name, info in svcs.items():
     local branch="${branch_prefix}${feature}"
     if [[ $resuming -eq 1 && -n "$existing_branch" ]]; then
         branch="$existing_branch"
+    fi
+
+    # ─── Repository scoping (multi-repo workspaces) ────────────────────────────
+    # In multi-repo workspaces a feature only touches a subset of the
+    # workspace's repos, and each repo may have its own branch name. We resolve
+    # those bindings here so the worktree loop only creates worktrees for the
+    # repos this feature actually touches (worktrees aren't free — every one
+    # duplicates the working tree on disk).
+    declare -A feature_repo_branch=()      # repo_name → branch
+    declare -a feature_repos_ordered=()    # preserves user/resume order
+    local is_multi_repo=0
+    if workspace_is_multi_repo "$effective_config" "$config_dir"; then
+        is_multi_repo=1
+    fi
+
+    local default_branch="${branch_prefix:-$(whoami)/}${feature}"
+
+    if [[ $is_multi_repo -eq 1 ]]; then
+        if [[ $resuming -eq 1 && "$existing_repos_json" != "[]" && -n "$existing_repos_json" ]]; then
+            # Resume: replay the session's stored repos verbatim.
+            while IFS=$'\t' read -r _r _b; do
+                [[ -z "$_r" ]] && continue
+                feature_repo_branch[$_r]="$_b"
+                feature_repos_ordered+=("$_r")
+            done < <(python3 -c "
+import json, sys
+for e in json.loads(sys.argv[1]):
+    print(f\"{e['repo']}\t{e.get('branch','')}\")
+" "$existing_repos_json")
+        elif [[ $resuming -eq 1 && -n "$existing_branch" && ${#cli_repos[@]} -eq 0 ]]; then
+            # Legacy resume: session predates the workspace.repos record. Treat
+            # every workspace repo as in-scope with the recorded single branch
+            # so 'tw resume' / nudge-triggered re-seeds don't block on a prompt.
+            local -a _all_repos=()
+            mapfile -t _all_repos < <(workspace_repo_names "$effective_config" "$config_dir")
+            local _r
+            for _r in "${_all_repos[@]}"; do
+                feature_repo_branch[$_r]="$existing_branch"
+                feature_repos_ordered+=("$_r")
+            done
+            log "Resuming legacy multi-repo session: applying branch '$existing_branch' to all repos"
+        elif [[ ${#cli_repos[@]} -gt 0 ]]; then
+            local _spec _r _b
+            for _spec in "${cli_repos[@]}"; do
+                if [[ "$_spec" == *:* ]]; then
+                    _r="${_spec%%:*}"; _b="${_spec#*:}"
+                else
+                    _r="$_spec"; _b="$default_branch"
+                fi
+                feature_repo_branch[$_r]="$_b"
+                feature_repos_ordered+=("$_r")
+            done
+        elif [[ -t 0 && -t 1 ]]; then
+            local -a _all_repos=()
+            mapfile -t _all_repos < <(workspace_repo_names "$effective_config" "$config_dir")
+            [[ ${#_all_repos[@]} -eq 0 ]] && die "No repos discovered in workspace. Pass --repo <name>[:<branch>] explicitly."
+            echo ""
+            echo "  Multi-repo workspace. Which repos does feature '$feature' touch?"
+            echo "  (default branch: $default_branch; enter custom, blank to accept default, '-' to skip)"
+            echo ""
+            local _r _b
+            for _r in "${_all_repos[@]}"; do
+                read -r -p "    $_r  [branch=$default_branch, '-' to skip]: " _b
+                [[ "$_b" == "-" ]] && continue
+                [[ -z "$_b" ]] && _b="$default_branch"
+                feature_repo_branch[$_r]="$_b"
+                feature_repos_ordered+=("$_r")
+            done
+            [[ ${#feature_repos_ordered[@]} -eq 0 ]] && die "No repos selected — aborting."
+        else
+            die "Multi-repo workspace: pass --repo <name>[:<branch>] (repeatable) or run interactively."
+        fi
+        log "Feature repos: ${feature_repos_ordered[*]}"
     fi
 
     # When resuming, try to reuse existing worktrees from the stopped session
@@ -2856,19 +3030,34 @@ for name, info in svcs.items():
             [[ -z "$svc" || -z "${svc_git_root[$svc]:-}" ]] && continue
             local git_root="${svc_git_root[$svc]}"
 
+            local repo_name
+            repo_name=$(basename "$git_root")
+
+            # Multi-repo: skip git roots not in this feature's repo list.
+            # Service still launches — it just runs from the primary checkout
+            # (worktree_paths[$svc] stays unset, service launcher falls back to
+            # the configured path).
+            if [[ $is_multi_repo -eq 1 && -z "${feature_repo_branch[$repo_name]+x}" ]]; then
+                continue
+            fi
+
+            # Per-repo branch in multi-repo mode; single branch in monorepo.
+            local repo_branch="$branch"
+            if [[ $is_multi_repo -eq 1 ]]; then
+                repo_branch="${feature_repo_branch[$repo_name]}"
+            fi
+
             if [[ -z "${repo_worktree[$git_root]:-}" ]]; then
                 # First service using this repo — create branch + worktree
-                local repo_name
-                repo_name=$(basename "$git_root")
                 local worktree_path="$config_dir/$worktrees_base/$feature/$repo_name"
 
                 git -C "$git_root" fetch origin staging --quiet 2>/dev/null || true
-                git -C "$git_root" branch "$branch" origin/staging 2>/dev/null \
-                    || log "Branch $branch already exists in $repo_name"
+                git -C "$git_root" branch "$repo_branch" origin/staging 2>/dev/null \
+                    || log "Branch $repo_branch already exists in $repo_name"
 
                 mkdir -p "$(dirname "$worktree_path")"
-                if git -C "$git_root" worktree add "$worktree_path" "$branch" 2>/dev/null; then
-                    log "Created worktree: $worktree_path (repo: $repo_name)"
+                if git -C "$git_root" worktree add "$worktree_path" "$repo_branch" 2>/dev/null; then
+                    log "Created worktree: $worktree_path (repo: $repo_name, branch: $repo_branch)"
                     # Track as rollback-owned: WE created this one. If init fails
                     # later, the trap will `rm -rf` this path (but not any
                     # pre-existing worktree we just happened to find).
@@ -3106,6 +3295,34 @@ with open(sys.argv[1], 'w') as f:
     # Without this delay, the daemon may see booting workers as "dead" and respawn them.
     (sleep 30 && rm -f "$spawn_lock") &
 
+    # Build repos JSON ([{repo, branch, pr}, ...]) for the session record and
+    # the orchestrator seed. Empty array in monorepo mode. Preserves any 'pr'
+    # value previously recorded for the same repo on resume.
+    local repos_json="[]"
+    local repos_kv=""
+    if [[ $is_multi_repo -eq 1 && ${#feature_repos_ordered[@]} -gt 0 ]]; then
+        local _pairs=""
+        local _r
+        for _r in "${feature_repos_ordered[@]}"; do
+            _pairs+="$_r=${feature_repo_branch[$_r]}"$'\n'
+        done
+        repos_json=$(python3 -c "
+import json, sys
+existing = {e['repo']: e for e in json.loads(sys.argv[1])}
+out = []
+for line in sys.argv[2].splitlines():
+    if not line or '=' not in line:
+        continue
+    r, b = line.split('=', 1)
+    prev = existing.get(r, {})
+    out.append({'repo': r, 'branch': b, 'pr': prev.get('pr')})
+print(json.dumps(out))
+" "$existing_repos_json" "$_pairs")
+        for _r in "${feature_repos_ordered[@]}"; do
+            repos_kv+="$_r:${feature_repo_branch[$_r]}"$'\n'
+        done
+    fi
+
     # Seed orchestrator with worker context + worktree paths
     if [[ -n "$workers_str" ]]; then
         local worktrees_kv=""
@@ -3113,7 +3330,7 @@ with open(sys.argv[1], 'w') as f:
             worktrees_kv+="$svc:${worktree_paths[$svc]}"$'\n'
         done
         seed_orchestrator "$tmux_session" "$session_key" "$feature" "$project" \
-            "$bead_id" "$branch" "$workers_str" "$worktrees_kv"
+            "$bead_id" "$branch" "$workers_str" "$worktrees_kv" "$repos_kv"
     fi
 
     # Focus orchestrator window
@@ -3170,7 +3387,7 @@ with open(sys.argv[1], 'w') as f:
     new_sessions=$(python3 - \
         "$sessions_data" "$session_key" "$project" "$feature" "$mode" "$started" \
         "$services_json" "$proxy_json" "$bead_id" "$config_dir" \
-        "$worktrees_json" "$db_name" "$branch" "$symlinks_json" <<'EOF'
+        "$worktrees_json" "$db_name" "$branch" "$symlinks_json" "$repos_json" <<'EOF'
 import json, sys
 data = json.loads(sys.argv[1])
 key = sys.argv[2]
@@ -3182,6 +3399,7 @@ new_symlinks = json.loads(sys.argv[14])
 # Merge with previous resume state so we never forget links from an earlier
 # start (useful when .tw.yml symlink config shrinks between runs).
 merged = list({p: None for p in list(prev_symlinks) + list(new_symlinks)}.keys())
+repos = json.loads(sys.argv[15])
 data[key] = {
     "project":    sys.argv[3],
     "feature":    sys.argv[4],
@@ -3199,6 +3417,8 @@ if dw:
     data[key]['dynamic_workers'] = dw
 if merged:
     data[key]['symlinks'] = merged
+if repos:
+    data[key]['repos'] = repos
 print(json.dumps(data, indent=2))
 EOF
 )
@@ -3328,6 +3548,8 @@ cmd_start() {
         case "$1" in
             --mode) passthrough+=("$1" "$2"); shift 2 ;;
             --mode=*) passthrough+=("$1"); shift ;;
+            --repo) passthrough+=("$1" "$2"); shift 2 ;;
+            --repo=*) passthrough+=("$1"); shift ;;
             --attach) passthrough+=("$1"); attach_flag=1; shift ;;
             -*) die "Unknown option: $1" ;;
             *)
@@ -5117,6 +5339,10 @@ issue_tracker:
   repo: owner/repo          # only for type: github (from git remote)
   # team: FAI               # only for type: linear
 
+workspace:                  # ONLY include when services live in multiple SEPARATE git repos
+  kind: multi-repo          # set to multi-repo when sub-repos each have their own .git directory
+                            # (cross-repo features have per-repo branches + PRs). Omit otherwise.
+
 worktrees:                  # ONLY include if there are multiple sub-repos (separate git repos or
   base: worktrees           # clearly separate frontend/backend app directories)
   branch_prefix: yourname/  # defaults to $(whoami)/ if omitted
@@ -5162,6 +5388,10 @@ quality_gates:                # optional: commands workers must pass before PRs
 
 - project: lowercase slug from git remote repo name or directory name
 - issue_tracker: if remote is github.com, use type github + repo; otherwise none
+- workspace: emit workspace.kind: multi-repo ONLY when the "Sub-repos detected" pre-scan
+  shows >1 entry with "(separate git repo)" — i.e. two or more sub-directories each
+  with their own .git. Omit entirely otherwise. This unlocks per-repo branch tracking
+  and prevents agents from getting confused by stray same-named branches.
 - worktrees: omit entirely for single-repo or pure tooling/script projects
 - services: one entry per runnable service. Prefer bun over npm if bun.lock exists.
   For Python prefer uvicorn/gunicorn/flask run patterns. Check the actual start scripts.
