@@ -89,6 +89,19 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     warn "Add to ~/.zshrc or ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
+# ─── Claude hooks ─────────────────────────────────────────────────────────────
+# Symlink every tw hook into ~/.claude/hooks and register them in
+# ~/.claude/settings.json. Without this the orchestrator can queue nudges that
+# workers never drain (the wake-up keystroke lands but tw-mail-check.sh isn't
+# wired), so it must be part of install — not a manual step. Invoked via the
+# symlink we just created so it resolves the repo's hooks/ dir.
+info "Installing Claude hooks..."
+if "$BIN_DIR/tw" setup claude; then
+    ok "Claude hooks installed + registered"
+else
+    warn "Hook setup failed — run 'tw doctor --fix' after fixing PATH"
+fi
+
 # ─── Caddy LaunchDaemon plist ─────────────────────────────────────────────────
 PLIST_DEST="$TW_DIR/com.tw.caddy.plist"
 # Find Caddy binary: env override > PATH > common locations

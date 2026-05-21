@@ -8322,7 +8322,14 @@ cmd_engine_stats() {
 # ─── Doctor ───────────────────────────────────────────────────────────────────
 
 cmd_doctor() {
-    local errors=0 warnings=0
+    local errors=0 warnings=0 fix=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fix) fix=1; shift ;;
+            -*) die "Unknown option: $1 (tw doctor [--fix])" ;;
+            *) shift ;;
+        esac
+    done
 
     _ok()   { echo "  ✓ $*"; }
     _warn() { echo "  ⚠ $*"; (( warnings++ )) || true; }
@@ -8331,6 +8338,14 @@ cmd_doctor() {
 
     echo "tw doctor — checking environment"
     echo
+
+    # 0. Self-heal hooks first when --fix is set, so the checks below verify
+    #    the repaired state rather than just reporting the same problems.
+    if [[ "$fix" -eq 1 ]]; then
+        echo "  Repairing Claude hooks (tw setup claude)..."
+        setup_claude
+        echo
+    fi
 
     # 1. tmux
     if command -v tmux &>/dev/null; then
@@ -8427,17 +8442,77 @@ print(dead)
         _warn "sessions.json does not exist (will be created on first tw start)"
     fi
 
-    # 6. Hooks
+    # 6. Hooks — installed (symlinked from repo) AND registered in settings.json.
+    #    This is the check that would have caught the silent nudge-delivery
+    #    failure: a worker wakes on the tmux keystroke but never drains its
+    #    queue because tw-mail-check.sh was missing or unregistered.
     local hooks_dir="$HOME/.claude/hooks"
-    local hook_names=("tw-prime.sh" "tw-mail-check.sh" "tw-notify.sh")
-    for hook in "${hook_names[@]}"; do
-        if [[ -f "$hooks_dir/$hook" ]]; then
-            _ok "Hook present: $hook"
+    local settings_file="$HOME/.claude/settings.json"
+    local repo_hooks
+    repo_hooks="$(_tw_repo_dir)/hooks"
+
+    if [[ ! -d "$repo_hooks" ]]; then
+        _warn "Cannot locate repo hooks dir (expected $repo_hooks) — skipping hook checks"
+    else
+        # 6a. Each file installed and pointing at the repo copy
+        local hf src dst
+        while IFS= read -r hf; do
+            [[ -z "$hf" ]] && continue
+            src="$repo_hooks/$hf"
+            dst="$hooks_dir/$hf"
+            if [[ ! -e "$dst" ]]; then
+                _fail "Hook not installed: $hf"
+                _hint "Install with: tw doctor --fix"
+            elif [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+                _ok "Hook linked: $hf"
+            elif [[ -f "$dst" ]]; then
+                _warn "Hook is a stale copy (not linked to repo): $hf"
+                _hint "Re-link with: tw doctor --fix"
+            else
+                _fail "Hook broken: $hf"
+                _hint "Repair with: tw doctor --fix"
+            fi
+        done < <(_tw_hook_copy_list)
+
+        # 6b. Each registerable hook actually registered in settings.json
+        local unreg
+        unreg=$(python3 - "$settings_file" "$(_tw_hook_registry)" 2>/dev/null <<'PYEOF'
+import json, sys, os
+settings_file = sys.argv[1]
+registry_text = sys.argv[2]
+try:
+    hooks = json.load(open(settings_file)).get("hooks", {})
+except Exception:
+    hooks = {}
+def registered(event, hook, matcher):
+    for entry in hooks.get(event, []):
+        if (entry.get("matcher", "") or "") != (matcher or ""):
+            continue
+        for h in entry.get("hooks", []):
+            if os.path.basename(h.get("command", "").strip()) == hook:
+                return True
+    return False
+missing = []
+for line in registry_text.splitlines():
+    if not line.strip():
+        continue
+    parts = (line.split("|") + ["", "", "", "", ""])[:5]
+    event, hook, _t, matcher, _s = parts
+    if not registered(event, hook, matcher):
+        missing.append(f"{event}:{hook}")
+print(" ".join(missing))
+PYEOF
+)
+        if [[ -z "$unreg" ]]; then
+            _ok "All hooks registered in settings.json"
         else
-            _fail "Hook missing: $hook"
-            _hint "Install with: tw setup claude"
+            local m
+            for m in $unreg; do
+                _fail "Hook not registered: $m"
+            done
+            _hint "Register with: tw doctor --fix"
         fi
-    done
+    fi
 
     # 7. Roles directory
     local roles_dir="$HOME/.claude/roles"
@@ -8708,67 +8783,100 @@ cmd_setup() {
     esac
 }
 
+# ─── Claude hook install registry ────────────────────────────────────────────
+#
+# Single source of truth for which hooks tw installs and how they register in
+# ~/.claude/settings.json. Consumed by both setup_claude (install) and
+# cmd_doctor (verify/--fix). Hook bodies live in the repo's hooks/ dir and are
+# symlinked into ~/.claude/hooks so a `git pull` keeps them current — same
+# philosophy as the symlinked tw binary, and the reason drift can't recur.
+
+# event|hook_file|timeout|matcher|status_message  (matcher/status may be empty)
+_tw_hook_registry() {
+    cat <<'REGEOF'
+SessionStart|tw-prime.sh|30||Loading tw worker context...
+SessionStart|tw-context.sh|30||Loading tw project context...
+UserPromptSubmit|tw-mail-check.sh|10||
+Notification|tw-notify.sh|5|idle_prompt|
+PreToolUse|tw-port-guard.sh|5|Bash|
+PreCompact|tw-compact.sh|30||Refreshing tw context...
+Stop|tw-worker-stop.sh|10||
+REGEOF
+}
+
+# Every file to install into ~/.claude/hooks: the registered hooks above plus
+# helper scripts they invoke but that aren't themselves registered as hooks.
+_tw_hook_copy_list() {
+    _tw_hook_registry | cut -d'|' -f2
+    echo "tw-mail-check-inject.py"
+}
+
+# Resolve the repo root by following the (possibly symlinked) path to this
+# script. tw is normally symlinked from ~/.local/bin/tw → <repo>/bin/tw, so we
+# must dereference to find the repo's hooks/ dir rather than ~/.local/hooks.
+_tw_repo_dir() {
+    local src="${BASH_SOURCE[0]:-$0}" dir
+    while [[ -L "$src" ]]; do
+        dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    (cd "$dir/.." && pwd)   # bin/tw → repo root
+}
+
 setup_claude() {
     local hooks_dir="$HOME/.claude/hooks"
     local settings_file="$HOME/.claude/settings.json"
+    local repo_dir repo_hooks
+    repo_dir="$(_tw_repo_dir)"
+    repo_hooks="$repo_dir/hooks"
+
+    [[ -d "$repo_hooks" ]] \
+        || die "Cannot find repo hooks dir at $repo_hooks — is tw symlinked from the repo's bin/?"
+
     mkdir -p "$hooks_dir"
 
-    # 1. Create/update tw-context.sh — injects tw prime for non-worker sessions
-    cat > "$hooks_dir/tw-context.sh" << 'HOOKEOF'
-#!/usr/bin/env bash
-# tw-context: SessionStart hook — inject tw prime for any session in a tw project.
-# Skips if already in a tw worker session (tw-prime.sh handles those).
+    # 1. Symlink every hook from the repo into ~/.claude/hooks. Replaces any
+    #    stale real file or wrong symlink, so this also self-heals drift.
+    local f src dst linked=0 missing=0
+    echo "  Installing hooks from $repo_hooks"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        src="$repo_hooks/$f"
+        dst="$hooks_dir/$f"
+        if [[ ! -f "$src" ]]; then
+            echo "  ✗ missing in repo: $f"
+            (( missing++ )) || true
+            continue
+        fi
+        chmod +x "$src" 2>/dev/null || true
+        if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+            continue   # already correct
+        fi
+        rm -f "$dst"
+        ln -s "$src" "$dst"
+        (( linked++ )) || true
+    done < <(_tw_hook_copy_list)
+    echo "  Linked $linked hook(s) → $hooks_dir ($missing missing)"
+    [[ "$missing" -gt 0 ]] && die "some hooks are missing from $repo_hooks"
 
-# Skip if this is a worker session (tw-prime.sh handles it)
-[[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]] && exit 0
-
-# Check if we are in a tw-managed project
-config_file=""
-dir="$PWD"
-while [[ "$dir" != "/" ]]; do
-    [[ -f "$dir/.tw.yml" ]] && { config_file="$dir/.tw.yml"; break; }
-    [[ -f "$dir/.devenv.yml" ]] && { config_file="$dir/.devenv.yml"; break; }
-    dir="$(dirname "$dir")"
-done
-[[ -z "$config_file" ]] && exit 0
-
-tw prime 2>/dev/null
-HOOKEOF
-    chmod +x "$hooks_dir/tw-context.sh"
-    log "Wrote $hooks_dir/tw-context.sh"
-
-    # 2. Create/update tw-compact.sh — re-injects tw prime before compaction
-    cat > "$hooks_dir/tw-compact.sh" << 'HOOKEOF'
-#!/usr/bin/env bash
-# tw-compact: PreCompact hook — re-inject tw prime so context survives compaction.
-
-# For workers, re-inject their specialized context
-if [[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]]; then
-    ~/.claude/hooks/tw-prime.sh 2>/dev/null
-    exit 0
-fi
-
-# For non-workers in a tw project, re-inject tw prime
-config_file=""
-dir="$PWD"
-while [[ "$dir" != "/" ]]; do
-    [[ -f "$dir/.tw.yml" ]] && { config_file="$dir/.tw.yml"; break; }
-    [[ -f "$dir/.devenv.yml" ]] && { config_file="$dir/.devenv.yml"; break; }
-    dir="$(dirname "$dir")"
-done
-[[ -z "$config_file" ]] && exit 0
-
-tw prime 2>/dev/null
-HOOKEOF
-    chmod +x "$hooks_dir/tw-compact.sh"
-    log "Wrote $hooks_dir/tw-compact.sh"
-
-    # 3. Register hooks in settings.json
-    python3 - "$settings_file" "$hooks_dir" << 'PYEOF'
+    # 2. Register all hooks in settings.json (idempotent, matcher-aware).
+    #    Dedup is by (event, matcher, command basename) so a pre-existing
+    #    entry written with an absolute path counts as already registered.
+    python3 - "$settings_file" "$(_tw_hook_registry)" << 'PYEOF'
 import json, sys, os
 
 settings_file = sys.argv[1]
-hooks_dir = sys.argv[2]
+registry_text = sys.argv[2]
+
+reg = []
+for line in registry_text.splitlines():
+    if not line.strip():
+        continue
+    parts = (line.split("|") + ["", "", "", "", ""])[:5]
+    event, hook, timeout, matcher, status = parts
+    reg.append((event, hook, int(timeout), matcher, status))
 
 try:
     with open(settings_file) as f:
@@ -8778,42 +8886,40 @@ except (FileNotFoundError, json.JSONDecodeError):
 
 hooks = settings.setdefault("hooks", {})
 
-def ensure_hook(event, command, timeout=30, status_msg=None):
-    entries = hooks.setdefault(event, [])
-    for entry in entries:
+def already(event, hook, matcher):
+    for entry in hooks.get(event, []):
+        if (entry.get("matcher", "") or "") != (matcher or ""):
+            continue
         for h in entry.get("hooks", []):
-            if h.get("command", "").rstrip() == command:
-                return False
-    hook_def = {"type": "command", "command": command, "timeout": timeout}
-    if status_msg:
-        hook_def["statusMessage"] = status_msg
-    entries.append({"hooks": [hook_def]})
-    return True
+            if os.path.basename(h.get("command", "").strip()) == hook:
+                return True
+    return False
 
 changes = []
-
-if ensure_hook("SessionStart",
-               hooks_dir + "/tw-context.sh", 30,
-               "Loading tw project context..."):
-    changes.append("SessionStart: tw-context.sh")
-
-if ensure_hook("PreCompact",
-               hooks_dir + "/tw-compact.sh", 30,
-               "Refreshing tw context..."):
-    changes.append("PreCompact: tw-compact.sh")
+for event, hook, timeout, matcher, status in reg:
+    if already(event, hook, matcher):
+        continue
+    hook_def = {"type": "command", "command": f"~/.claude/hooks/{hook}", "timeout": timeout}
+    if status:
+        hook_def["statusMessage"] = status
+    entry = {"hooks": [hook_def]}
+    if matcher:
+        entry["matcher"] = matcher
+    hooks.setdefault(event, []).append(entry)
+    changes.append(f"{event}: {hook}")
 
 if changes:
-    with open(settings_file, 'w') as f:
+    with open(settings_file, "w") as f:
         json.dump(settings, f, indent=2)
     for c in changes:
         print("  Registered hook: " + c)
 else:
-    print("  Hooks already registered")
+    print("  All hooks already registered")
 PYEOF
 
     echo ""
-    echo "  Done. tw prime will now auto-inject at session start and before compaction."
-    echo "  Test with: claude (in a directory with .tw.yml)"
+    echo "  Done. All tw hooks installed and registered."
+    echo "  Verify with: tw doctor"
 }
 
 
@@ -10073,7 +10179,7 @@ Agent commands (used by Claude workers):
   tw editor <feature>                   Generate per-feature .code-workspace and open in VS Code
   tw claude <feature>                   Open/attach to god (orchestrator) window
   tw append <feature>                   Append wrap-up text to bead (reads from stdin)
-  tw setup claude                       Install hooks for auto-injecting tw prime
+  tw setup claude                       Install + register all tw Claude hooks (symlinked from repo)
   tw prime                              AI workflow context (inject via hooks)
   tw onboard                            Generate AGENTS.md snippet
   tw prune                              Remove stale sessions after reboot
@@ -10086,7 +10192,7 @@ Agent commands (used by Claude workers):
   tw config service <feature> <n> port <p> Update a service's port
   tw config service <feature> <n> add <p>  Register a new service
   tw config show <feature>                Show runtime config (services + proxies)
-  tw doctor                              Run health checks on tw environment
+  tw doctor [--fix]                      Run health checks (--fix repairs/installs hooks)
   tw daemon start [--interval=180]        Start background health-check daemon
   tw daemon stop                          Stop the daemon
   tw daemon status                        Show daemon status + last heartbeat
