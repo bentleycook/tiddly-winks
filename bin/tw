@@ -1604,6 +1604,44 @@ bd_run() {
     fi
 }
 
+# Transient beads/dolt errors worth retrying. Beads idle-stops its per-repo dolt
+# sql-server; the first call after a long idle can land before the server has
+# finished cold-starting (~30-60s), and beads' circuit breaker fails-fast with a
+# short cooldown. Match only those signatures — bad args / real failures must
+# still fail immediately, never retry.
+_bd_err_is_transient() {
+    grep -qiE 'circuit breaker is open|server appears down|active probe failed|connection refused|dial tcp|bad connection|broken pipe' <<<"$1"
+}
+
+# Like bd_run, but retries transient dolt-server-down / circuit-breaker errors
+# with backoff long enough to cover a cold start, nudging the server awake each
+# round. Use for dispatch-critical WRITES (bead create) so a transient outage
+# can't abort a dispatch and leave the work untracked. Do NOT use for daemon-tick
+# reads — a genuinely-down server would block the tick for the full budget.
+# Captures stdout+stderr combined, prints it, returns the last exit code.
+bd_run_resilient() {
+    local dir="$1"; shift
+    local out rc attempt=0 delay=2
+    local max="${TW_BD_MAX_RETRIES:-6}"
+    while :; do
+        out=$(bd_run "$dir" "$@" 2>&1); rc=$?
+        if [[ $rc -eq 0 ]] || ! _bd_err_is_transient "$out"; then
+            printf '%s\n' "$out"
+            return "$rc"
+        fi
+        attempt=$((attempt + 1))
+        if (( attempt >= max )); then
+            log "beads dolt server still unavailable after ${max} attempts; giving up"
+            printf '%s\n' "$out"
+            return "$rc"
+        fi
+        log "beads dolt server unavailable (attempt ${attempt}/${max}); waking server, retry in ${delay}s"
+        bd_run "$dir" dolt start >/dev/null 2>&1 || true
+        sleep "$delay"
+        (( delay *= 2 )); (( delay > 30 )) && delay=30
+    done
+}
+
 bead_find_open() {
     local title="$1" bd_dir="${2:-}"
     bd_run "$bd_dir" list --status=open 2>/dev/null | grep -F "$title" | head -1 | awk '{print $2}' | tr -d '#' || true
@@ -1961,16 +1999,14 @@ with open(sys.argv[1], 'w') as f:
 
 bead_create() {
     local title="$1" bd_dir="${2:-}"
-    local err_file out rc=0
-    err_file=$(mktemp -t tw-bead-create.XXXXXX)
-    out=$(bd_run "$bd_dir" create --title="$title" --type=task --priority=2 2>"$err_file") || rc=$?
-    local err_out
-    err_out=$(<"$err_file")
-    rm -f "$err_file"
+    local out rc=0
+    # Resilient: retries through a transient dolt cold-start so a worker/task
+    # bead is never silently dropped. stdout+stderr come back combined.
+    out=$(bd_run_resilient "$bd_dir" create --title="$title" --type=task --priority=2) || rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "[tw] error: bd create failed (exit $rc) for title: $title" >&2
         [[ -n "$bd_dir" ]] && echo "[tw]        workspace: $bd_dir" >&2
-        [[ -n "$err_out" ]] && echo "$err_out" >&2
+        [[ -n "$out" ]] && echo "$out" >&2
         return 1
     fi
     local bead_id
@@ -5631,12 +5667,12 @@ _mail_send() {
         "$from" "$target" "$sent_at" "$session_key")
 
     local bead_id
-    bead_id=$(bd create "mail: $subject" \
+    bead_id=$(bd_run_resilient "" create "mail: $subject" \
         -d "${body:-$subject}" \
         -l "tw:mail,mail:to:${target},mail:from:${from},mail:unread" \
         --metadata "$metadata" \
         -p 3 \
-        2>&1 | grep -oE 'issue: [a-z0-9-]+' | head -1 | sed 's/issue: //')
+        | grep -oE 'issue: [a-z0-9-]+' | head -1 | sed 's/issue: //')
 
     if [[ -z "$bead_id" ]]; then
         die "Failed to create mail bead"
@@ -5867,11 +5903,13 @@ print(f'bead_id={shlex.quote(d.get(\"bead_id\", \"\"))}')
     local task_title bd_output bd_status
     task_title=$(printf '%.80s' "$task")
     set +e
-    bd_output=$(cd "$config_dir" && bd create --title="$task_title" \
+    # Resilient: retries a transient dolt cold-start / open circuit breaker so a
+    # dispatch is never aborted with the work left untracked (beads-discipline).
+    bd_output=$(bd_run_resilient "$config_dir" create --title="$task_title" \
         --description="$task" \
         --type=task \
         --priority=2 \
-        ${bead_id:+--parent="$bead_id"} 2>&1)
+        ${bead_id:+--parent="$bead_id"})
     bd_status=$?
     set -e
     if [[ $bd_status -ne 0 ]]; then
