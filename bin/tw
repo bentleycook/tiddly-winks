@@ -8057,7 +8057,7 @@ print(s.get('bead_id', ''))
 - **URLs**: Always use `http://{project}-{feature}.localhost`, NEVER raw `localhost:PORT`
 - **Browser**: Chrome/Firefox only — Safari does NOT resolve `*.localhost`
 - **Services**: Never start services manually — tw manages them via tmux
-- **Beads**: Use `bd` for all issue tracking. `tw start` creates beads automatically.
+- **Beads**: TW uses `bd` for feature memory and TW-managed task beads. Do not create or close bd issues in a generic coding session unless a TW task bead or the user explicitly asks for it.
 - **Workers**: Don't run tasks yourself if a worker exists for it — use `tw send`
 - **Context**: Run `/pass` when context gets large — it saves to bead and opens fresh window
 
@@ -8130,7 +8130,7 @@ bd show <bead-id>                # Load full session history
 - Do NOT use `localhost:PORT` in URLs, docs, or beads — always use proxy URLs
 - Do NOT open *.localhost URLs in Safari — they will not resolve
 - Do NOT start services manually (npm run dev, etc.) — tw manages service lifecycle
-- Do NOT create markdown TODO files — use `bd create` for task tracking
+- Do NOT create bd follow-up issues from generic coding sessions. Use `bd` only for TW-managed task beads or explicit user-requested bead maintenance.
 - Do NOT do worker tasks yourself — delegate via `tw send <feature> <worker> "task"`
 - Do NOT ignore context loss — run `/pass` proactively when context grows large
 - Do NOT use `bd edit` — it opens $EDITOR which blocks agents
@@ -8206,6 +8206,9 @@ tw stop <feature> [--done]       # Stop [and tear down]
 
 > `tw prime` is auto-injected via hooks at session start. Run it manually
 > after compaction or context loss.
+>
+> `bd` is TW runtime state, not a generic issue tracker for every coding worker.
+> Only touch beads when a TW-managed task bead is assigned or the user asks.
 ONBOARD
 }
 

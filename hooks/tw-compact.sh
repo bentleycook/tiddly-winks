@@ -21,5 +21,3 @@ done
 [[ -z "$config_file" ]] && exit 0
 
 tw prime 2>/dev/null
-echo ''
-cat ~/.claude/tw-instructions.md 2>/dev/null
