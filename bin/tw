@@ -9442,14 +9442,26 @@ for name, info in svcs.items():
                 [[ -z "$svc_port" ]] && continue
                 if ! lsof -i :"$svc_port" -sTCP:LISTEN >/dev/null 2>&1; then
                     _daemon_log "DOWN service: $session_key/$svc_name (port $svc_port)"
-                    # Nudge the keeper worker if one exists
-                    if tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -qx "keeper"; then
-                        nudge_enqueue "$session_key" "keeper" \
+                    # Nudge an ops-capable worker to restart it. Generic pools
+                    # don't have a dedicated "keeper" — prefer an ops/keeper
+                    # window, then fall back to any worker window (everything
+                    # that isn't god/main/services infra).
+                    local ops_worker="" _wnames
+                    _wnames=$(tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null)
+                    if grep -qx "ops" <<< "$_wnames"; then
+                        ops_worker="ops"
+                    elif grep -qx "keeper" <<< "$_wnames"; then
+                        ops_worker="keeper"
+                    else
+                        ops_worker=$(grep -vx -e god -e main -e services <<< "$_wnames" | head -1)
+                    fi
+                    if [[ -n "$ops_worker" ]]; then
+                        nudge_enqueue "$session_key" "$ops_worker" \
                             "Service $svc_name is DOWN on port $svc_port. Check the services window and restart it. Run: tw status ${feature}" \
                             30 2>/dev/null || true
-                        send_to_pane "=$tmux_session:keeper" \
+                        send_to_pane "=$tmux_session:$ops_worker" \
                             "You have a new task from the orchestrator. Check your additional context and execute it now." 2>/dev/null || true
-                        _daemon_log "Nudged keeper about $svc_name"
+                        _daemon_log "Nudged $ops_worker about $svc_name"
                     fi
                 fi
             done <<< "$services_json"

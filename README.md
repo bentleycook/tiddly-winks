@@ -314,7 +314,7 @@ tw prune
 
 ## Multi-agent workers
 
-tiddly-winks can spawn multiple Claude agents per feature, each with a dedicated role (frontend, backend, CI watcher, services keeper, etc.).
+tiddly-winks spawns a small **generic worker pool** per feature — interchangeable slots, not dedicated roles. The god dispatches each task with full context at `tw send` time, so specialization (CI watching, service tending, frontend, backend) comes from the *task description*, not the worker's identity. Two workers (`dev`, `ops`) is typical; one of them handles ops duties like restarting a downed service.
 
 ### Configuring workers
 
@@ -322,13 +322,13 @@ Add a `workers` section to `.tw.yml`:
 
 ```yaml
 workers:
-  ci:
-    role: ci-watcher
-  keeper:
-    role: services-keeper
+  - dev
+  - ops
 ```
 
-Role files live at `~/.claude/roles/{role}.md` and define each worker's mission and working style.
+Avoid one worker per concern — separate `ci`/`keeper` agents idle most of the time and each is a full Claude process (~hundreds of MB). Fold them into a single `ops` worker and let the god dispatch CI/services tasks to it on demand. Add more generic workers (`dev-1`, `dev-2`, …) only when a feature has genuinely parallel workstreams.
+
+> Per-worker `role:` is still honored for backward compatibility (role files at `~/.claude/roles/{role}.md`), but new projects should prefer the generic pool above.
 
 ### Worker commands
 
