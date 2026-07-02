@@ -28,8 +28,13 @@ tiddly-winks handles all of this with one command.
 - **Claude window** — dedicated orchestrator tmux window, pre-seeded with context
 - **Bead** — persistent memory: branch names, worktree paths, DB, URLs, wrap-up history, PRs
 
-The bead replaces manual `/wrap-up` → paste. Context loss is a non-event:
-wrap-up appends to the bead, new Claude reads the bead and picks up exactly where you left off.
+The bead makes context loss a non-event: the tw-wrap-up skill appends a
+handoff to the bead, and a new Claude session reads the bead and picks up
+exactly where you left off.
+
+Parallel and delegated agent work happens through Claude's native subagents,
+steered by tw's skills (tw-dispatch, tw-qa, tw-wrap-up, tw-review) — tw
+itself only manages the environment.
 
 ---
 
@@ -173,15 +178,17 @@ services:
     path: ../my-backend-local
 ```
 
-### Set up Claude hooks
+### Set up Claude hooks + skills
 
-Install the tw hooks so Claude gets automatic project context:
+Install the tw hooks and skills so Claude gets automatic project context:
 
 ```bash
 tw setup claude
 ```
 
-This registers hooks that inject bead context, role definitions, and nudge messages into Claude sessions automatically.
+This registers hooks that inject `tw prime` context into Claude sessions
+automatically (session start and pre-compaction), and symlinks the tw skills
+(tw-dispatch, tw-qa, tw-wrap-up, tw-review) into `~/.claude/skills`.
 
 ---
 
@@ -239,20 +246,17 @@ This attaches to the tmux session focused on the orchestrator window with a cont
 
 ### Recovering from context loss
 
-When Claude's context fills up mid-session:
+When Claude's context fills up mid-session, ask it to wrap up (the
+**tw-wrap-up** skill): it writes a structured handoff — done/in-flight/
+decisions/next-steps — to the feature bead. Then:
 
-1. Run `/wrap-up` in Claude — copy the output
-2. In a new terminal:
-   ```bash
-   tw append my-feature   # paste, then Ctrl-D
-   ```
-3. Start a new Claude session:
-   ```bash
-   tw claude my-feature   # paste the printed context block
-   ```
-4. Claude reads the full history from the bead: `bd show MP-42`
+```bash
+tw claude my-feature   # start fresh; paste the printed context block
+```
 
-Or use `/pass` to do this automatically.
+The new session reads the full history from the bead (`bd show MP-42`) and
+resumes from the handoff's next steps. Manual fallback: copy a summary and
+pipe it through `tw append my-feature`.
 
 ### Checking status
 
@@ -312,92 +316,62 @@ tw prune
 
 ---
 
-## Multi-agent workers
+## Agent workflows (skills)
 
-tiddly-winks spawns a small **generic worker pool** per feature — interchangeable slots, not dedicated roles. The god dispatches each task with full context at `tw send` time, so specialization (CI watching, service tending, frontend, backend) comes from the *task description*, not the worker's identity. Two workers (`dev`, `ops`) is typical; one of them handles ops duties like restarting a downed service.
+tiddly-winks no longer runs its own worker agents. Each feature gets one
+orchestrator Claude session (the `god` tmux window); parallel and delegated
+work happens through Claude's **native subagents**, steered by four skills
+that `tw setup claude` installs into `~/.claude/skills`:
 
-### Configuring workers
+| Skill | What it does |
+|-------|--------------|
+| **tw-dispatch** | Delegate/parallelize work via subagents pinned to the feature's worktrees — one concern per agent, services stay tw-managed |
+| **tw-qa** | Human-in-the-loop QA cycle: preflight services + gates, build a click-through checklist from the diff, watch service logs while you test, record outcomes to the bead |
+| **tw-wrap-up** | Write a structured session handoff (done / in-flight / decisions / next steps) to the feature bead |
+| **tw-review** | Fan the workspace's reviewer profiles (`.tw/reviews/*.md`) out to parallel subagents; each posts a tagged `gh pr review` comment |
 
-Add a `workers` section to `.tw.yml`:
-
-```yaml
-workers:
-  - dev
-  - ops
-```
-
-Avoid one worker per concern — separate `ci`/`keeper` agents idle most of the time and each is a full Claude process (~hundreds of MB). Fold them into a single `ops` worker and let the god dispatch CI/services tasks to it on demand. Add more generic workers (`dev-1`, `dev-2`, …) only when a feature has genuinely parallel workstreams.
-
-> Per-worker `role:` is still honored for backward compatibility (role files at `~/.claude/roles/{role}.md`), but new projects should prefer the generic pool above.
-
-### Worker commands
+Generate workspace-specific reviewer profiles once per project:
 
 ```bash
-tw workers my-feature              # Spawn missing workers into the session
-tw workers my-feature --health     # Check worker liveness (alive/dead/missing)
-tw workers my-feature --respawn    # Respawn dead/missing workers
-tw spawn my-feature dev frontend   # Dynamically add a new worker
-tw send my-feature dev "implement the login page" --urgent   # Dispatch a task
-tw handoff my-feature dev          # Cycle a worker (save context, restart fresh)
-tw patrol my-feature               # Full health check: workers, services, stuck detection
+tw review init          # uses Claude to tailor reviewer lenses to your stack
 ```
 
-### How task dispatch works
-
-1. `tw send` writes a nudge file and sets a persistent `current_task` on the worker
-2. It waits for the worker to be idle (inspects tmux pane), then sends a wake message
-3. The `UserPromptSubmit` hook drains the nudge queue and re-injects `current_task` every turn
-4. The task persists until the worker explicitly clears it — no messages get lost
-
-### Worker roles
-
-Workers are seeded with role definitions and identity beads that persist across session restarts. The orchestrator (god window) coordinates work across workers.
+Why native subagents instead of tw-managed workers? Subagent prompts are
+delivered in-band (no tmux pane-scraping), completion is reported by the
+harness (no idle-detection regexes or patrol daemon), and agents exist only
+while working (no idle Claude processes holding memory). The environment —
+worktrees, ports, URLs, DBs, beads — is still tw's job.
 
 ---
 
 ## Reference
 
-### Human commands
+### Commands
 
 ```
 tw init [--force]                     Analyze project and generate .tw.yml
 tw start <feature> [--mode staging]   Create feature space (worktrees, DB, services)
 tw stop <feature> [--done]            Stop session (--done: tear down + close bead)
 tw list [--project=X] [--json]        List active sessions
-tw attach [<N>|<name>] [--claude]     Attach to a session's tmux
+tw attach [<N>|<name>] [--window=X]   Attach to a session's tmux (defaults to Claude window)
 tw status <feature> [--json]          Full status: ports, worktrees, DB, bead
 tw open <feature>                     Open primary URL in browser
 tw editor <feature>                   Generate .code-workspace and open in VS Code
 tw claude <feature>                   Attach to orchestrator window
 tw append <feature>                   Append text to bead (reads from stdin)
 tw prune                              Remove stale sessions after reboot
+tw resume <feature> | --all           Resume feature(s) from bead state after reboot/reset
+tw reconcile [<feature>]              Derive state from reality (filesystem, tmux, beads)
+tw review init [--force]              Generate PR reviewer profiles for the tw-review skill
+tw gates <feature> [--gate=NAME]      Run quality gates
 tw config show <feature>              Show runtime services + proxy routes
 tw config proxy <feature> <sub> <svc> Remap a proxy route (Caddy reloads)
 tw config service <feature> ...       Add/update service ports
-tw doctor                             Run health checks on tw environment
-tw setup claude                       Install Claude hooks for auto-context injection
-tw help                               Show usage
-```
-
-### Agent commands (used by Claude workers)
-
-```
-tw workers <feature>                  Spawn missing worker windows
-tw workers <feature> --health [--json]  Check worker liveness
-tw workers <feature> --respawn        Respawn dead/missing workers
-tw spawn <feature> <name> <role>      Dynamically spawn a new worker
-tw handoff <feature> <worker>         Cycle a worker (save context, restart fresh)
-tw patrol <feature>                   Health check + auto-respawn
-tw send <feature> <worker> "<task>" [--urgent]  Dispatch a task to a worker
-tw hook {set|clear|show} <feature> <worker>     Manage GUPP hooks
-tw nudge enqueue <session> <worker> "<msg>" [ttl]  Raw nudge
-tw nudge drain <session> <worker>     Drain queued nudges
-tw gates <feature> [--gate=NAME]      Run quality gates
+tw doctor [--fix]                     Run health checks on tw environment
+tw setup claude                       Install Claude hooks + skills
 tw prime                              Inject AI workflow context (via hooks)
 tw onboard                            Generate AGENTS.md snippet
-tw daemon start [--interval=180]      Start background health-check daemon
-tw daemon stop                        Stop the daemon
-tw daemon status                      Show daemon status
+tw help                               Show usage
 ```
 
 ---
@@ -421,7 +395,8 @@ tw daemon status                      Show daemon status
 | `services.<name>.window` | no | tmux window name |
 | `services.<name>.db_setup` | no | Script to run after worktree creation |
 | `proxy.<subdomain>` | no | Map subdomain to service for Caddy routing |
-| `workers.<name>.role` | no | Role file name (from `~/.claude/roles/`) |
+| `reviews.<name>.prompt` | no | Reviewer profile path for the tw-review skill |
+| `quality_gates.<name>` | no | Command that must pass before PRs (`tw gates`) |
 
 ### Environment variables
 
@@ -485,19 +460,19 @@ git worktree remove --force worktrees/my-feature/backend
   sessions.json                      active sessions: ports, worktrees, bead IDs
   Caddyfile                          auto-generated from sessions.json
   com.tw.caddy.plist                 generated by install.sh
-  hooked/<session>/<worker>.json     GUPP task hooks per worker
-  nudge/<session>/<worker>/*.msg     ephemeral nudge queue
-  agents/<session>/<worker>.md       worker output files
   logs/caddy.log
 
 <repo>/
   bin/tw                             the CLI (symlinked to ~/.local/bin/tw)
+  hooks/                             Claude hooks (symlinked to ~/.claude/hooks)
+  skills/                            Claude skills (symlinked to ~/.claude/skills)
   install.sh                         idempotent installer
   README.md
 
 <workspace>/
   .tw.yml                            project config (committed)
   .tw.override.yml                   local overrides (gitignored)
+  .tw/reviews/*.md                   reviewer profiles (tw review init)
   worktrees/
     <feature>/
       <service>/                     git worktree, branch {user}/<feature>
@@ -510,4 +485,3 @@ git worktree remove --force worktrees/my-feature/backend
 | Port numbers, URLs, tmux session name | `sessions.json` (ephemeral, rebuilt on start) |
 | Worktree paths, DB name, branch | Both (sessions.json for runtime, bead for history) |
 | Work context, wrap-up history, PRs, PM issue | Bead only (persistent, synced across machines) |
-| Worker tasks, role assignments | `hooked/*.json` (runtime) + identity beads (persistent) |

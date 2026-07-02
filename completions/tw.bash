@@ -35,57 +35,10 @@ except Exception:
 " 2>/dev/null
 }
 
-_tw_workers_for_feature() {
-    local feature="$1"
-    python3 -c "
-import json, yaml, sys, os
-feature = sys.argv[1]
-sf = os.path.expanduser('~/.tiddly-winks/sessions.json')
-try:
-    d = json.load(open(sf))
-    # Find session matching feature
-    session = None
-    for k, v in d.items():
-        if v.get('feature') == feature or k.endswith('-' + feature):
-            session = v
-            session_key = k
-            break
-    if not session:
-        sys.exit(0)
-
-    workers = set()
-    # Static workers from .tw.yml
-    ws = session.get('workspace', '')
-    for cfg in ['.tw.yml', '.devenv.yml']:
-        p = os.path.join(ws, cfg)
-        if os.path.isfile(p):
-            try:
-                yd = yaml.safe_load(open(p))
-                wk = yd.get('workers', {})
-                if isinstance(wk, list):
-                    workers.update(wk)
-                elif isinstance(wk, dict):
-                    workers.update(wk.keys())
-            except Exception:
-                pass
-            break
-
-    # Dynamic workers
-    for dw in session.get('dynamic_workers', []):
-        workers.add(dw.get('name', ''))
-
-    for w in sorted(workers):
-        if w:
-            print(w)
-except Exception:
-    pass
-" "$feature" 2>/dev/null
-}
-
 _tw_subcommands() {
-    echo "init start stop list attach status open editor prune claude append"
-    echo "spawn workers handoff send tasks patrol feed hook signal setup prime"
-    echo "resume reconcile onboard gates daemon config port-owner pane-id doctor nudge help completion"
+    echo "init start stop done list attach status open editor prune prune-worktrees"
+    echo "claude append review setup prime resume reconcile onboard gates config"
+    echo "port-owner pane-id doctor help completion"
 }
 
 _tw_completions() {
@@ -131,85 +84,24 @@ _tw_completions() {
             if [[ $arg_pos -eq 1 ]]; then
                 COMPREPLY=($(compgen -W "$(_tw_features) $(_tw_session_keys)" -- "$cur"))
             else
-                COMPREPLY=($(compgen -W "--claude --window" -- "$cur"))
+                COMPREPLY=($(compgen -W "--window" -- "$cur"))
             fi
             ;;
 
-        stop|status|workers|feed|open|editor|claude|append|patrol|gates|spawn)
+        stop|done|status|open|editor|claude|append|gates)
             if [[ $arg_pos -eq 1 ]]; then
                 COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
-            elif [[ "$subcmd" == "workers" ]]; then
-                # workers takes flags after feature
-                COMPREPLY=($(compgen -W "--health --respawn --json --force --cv" -- "$cur"))
-            elif [[ "$subcmd" == "feed" ]]; then
-                COMPREPLY=($(compgen -W "--problems" -- "$cur"))
             elif [[ "$subcmd" == "stop" ]]; then
                 COMPREPLY=($(compgen -W "--done" -- "$cur"))
-            elif [[ "$subcmd" == "spawn" ]]; then
-                if [[ "$prev" == "--engine" ]]; then
-                    COMPREPLY=($(compgen -W "claude cursor codex" -- "$cur"))
-                elif [[ "$cur" == --* ]]; then
-                    COMPREPLY=($(compgen -W "--engine" -- "$cur"))
-                elif [[ $arg_pos -eq 3 ]]; then
-                    # Third arg to spawn is optional role
-                    local roles_dir="$HOME/.claude/roles"
-                    if [[ -d "$roles_dir" ]]; then
-                        COMPREPLY=($(compgen -W "$(ls "$roles_dir" 2>/dev/null | sed 's/\.md$//')" -- "$cur"))
-                    fi
-                fi
             fi
             ;;
 
-        # tasks <feature>
-        tasks)
+        # review init [--force]
+        review)
             if [[ $arg_pos -eq 1 ]]; then
-                COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
-            fi
-            ;;
-
-        # send <feature> <worker> "<task>" [--engine <name>] [--urgent]
-        send)
-            if [[ "$prev" == "--engine" ]]; then
-                COMPREPLY=($(compgen -W "claude cursor codex" -- "$cur"))
-            elif [[ "$cur" == --* ]]; then
-                COMPREPLY=($(compgen -W "--engine --urgent" -- "$cur"))
-            elif [[ $arg_pos -eq 1 ]]; then
-                COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
-            elif [[ $arg_pos -eq 2 ]]; then
-                # Complete worker names for the selected feature
-                local feature="${words[subcmd_idx+1]}"
-                COMPREPLY=($(compgen -W "$(_tw_workers_for_feature "$feature")" -- "$cur"))
-            fi
-            ;;
-
-        # handoff <feature> <worker>
-        handoff)
-            if [[ $arg_pos -eq 1 ]]; then
-                COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
-            elif [[ $arg_pos -eq 2 ]]; then
-                local feature="${words[subcmd_idx+1]}"
-                COMPREPLY=($(compgen -W "$(_tw_workers_for_feature "$feature")" -- "$cur"))
-            fi
-            ;;
-
-        # hook {set|clear|show} <feature> <worker>
-        hook)
-            if [[ $arg_pos -eq 1 ]]; then
-                COMPREPLY=($(compgen -W "set clear show" -- "$cur"))
-            elif [[ $arg_pos -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$(_tw_features)" -- "$cur"))
-            elif [[ $arg_pos -eq 3 ]]; then
-                local feature="${words[subcmd_idx+2]}"
-                COMPREPLY=($(compgen -W "$(_tw_workers_for_feature "$feature")" -- "$cur"))
-            fi
-            ;;
-
-        # nudge {enqueue|drain} <session> <worker>
-        nudge)
-            if [[ $arg_pos -eq 1 ]]; then
-                COMPREPLY=($(compgen -W "enqueue drain" -- "$cur"))
-            elif [[ $arg_pos -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$(_tw_session_keys)" -- "$cur"))
+                COMPREPLY=($(compgen -W "init" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--force" -- "$cur"))
             fi
             ;;
 
@@ -232,7 +124,7 @@ _tw_completions() {
 
         # config
         config)
-            COMPREPLY=($(compgen -W "--get --set --list" -- "$cur"))
+            COMPREPLY=($(compgen -W "show proxy service --get --set --list" -- "$cur"))
             ;;
 
         # resume <feature> | --all
@@ -240,6 +132,18 @@ _tw_completions() {
             if [[ $arg_pos -eq 1 ]]; then
                 COMPREPLY=($(compgen -W "--all $(_tw_features)" -- "$cur"))
             fi
+            ;;
+
+        # setup claude
+        setup)
+            if [[ $arg_pos -eq 1 ]]; then
+                COMPREPLY=($(compgen -W "claude" -- "$cur"))
+            fi
+            ;;
+
+        # doctor [--fix]
+        doctor)
+            COMPREPLY=($(compgen -W "--fix" -- "$cur"))
             ;;
     esac
 

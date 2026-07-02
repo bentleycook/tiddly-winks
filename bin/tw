@@ -4402,6 +4402,12 @@ tw review init [--force]         # Generate workspace-specific PR reviewer profi
 # Dispatch: use the tw-review skill — it fans reviewer profiles out to parallel subagents
 ```
 
+### Skills (installed to ~/.claude/skills by `tw setup claude`)
+- **tw-dispatch** — delegate/parallelize work via native subagents in the feature's worktrees
+- **tw-qa** — human-in-the-loop QA cycle: preflight services, checklist from diff, watch logs, record outcomes
+- **tw-wrap-up** — save a session handoff to the feature bead
+- **tw-review** — fan .tw/reviews/*.md profiles out to parallel reviewer subagents on a PR
+
 ### Runtime Config (fix proxy/port issues without restarting)
 ```bash
 tw config show <feature>                   # Show current services + proxy routes
