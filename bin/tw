@@ -685,14 +685,6 @@ caddy_reload() {
 
 # ─── Agent Communication ─────────────────────────────────────────────────────
 
-# ── Engine abstraction ──────────────────────────────────────────────
-# Check if a tmux window exists by name, accounting for spinner suffix (e.g., "test ⠼").
-# Usage: tmux_window_exists <tmux_session> <window_name>
-tmux_window_exists() {
-    local tmux_session="$1" wname="$2"
-    tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null \
-        | grep -q "^${wname}\( [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\)\?$"
-}
 
 tw_config_get() {
     local key="$1" default="${2:-}"
@@ -704,6 +696,14 @@ tw_config_get() {
     else
         echo "$default"
     fi
+}
+
+# Command used to launch Claude in the orchestrator (god) window.
+# Precedence: TW_CLAUDE_CMD env > claude_command in ~/.tiddly-winks/config.json > plain claude.
+# Pre-2.0 installs launched via engines.json (typically with
+# --dangerously-skip-permissions); set claude_command to restore that.
+_tw_claude_cmd() {
+    echo "${TW_CLAUDE_CMD:-$(tw_config_get claude_command "claude")}"
 }
 
 tw_config_set() {
@@ -1764,7 +1764,7 @@ for e in json.loads(sys.argv[1]):
     # happens via Claude's native subagents, not tw-managed worker windows.
     tmux new-session -d -s "$tmux_session" -n "god"
     _owned_tmux=1  # WE created this tmux session; rollback may kill it
-    tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' claude" Enter
+    tmux send-keys -t "=$tmux_session:god" "cd '$config_dir' && TW_SESSION='$session_key' $(_tw_claude_cmd)" Enter
 
     # Apply project color theme to tmux session
     session_apply_theme "$tmux_session" "$project" "$feature" "$session_key"
@@ -2264,8 +2264,13 @@ for svc, path in wt.items():
         fi
     fi
 
-    # Clean up any legacy per-worker state from pre-2.0 sessions
-    rm -rf "$HOME/.tiddly-winks/hooked/${session_key}" 2>/dev/null || true
+    # Clean up legacy per-session worker state from pre-2.0 installs
+    local _legacy_dir
+    for _legacy_dir in hooked nudge agents signals health breaker cv patrol-state sync-offsets crash-counts spawn-locks spawn-timestamps rapid-respawns cooldowns; do
+        rm -rf "$HOME/.tiddly-winks/${_legacy_dir}/${session_key}" 2>/dev/null || true
+    done
+    rm -f "$HOME/.tiddly-winks/health/${session_key}.json" \
+          "$HOME/.tiddly-winks/spinner-${session_key}.pid" 2>/dev/null || true
 
     # Only remove from sessions.json if --done; otherwise keep as "stopped"
     if [[ $done_flag -eq 1 ]]; then
@@ -2758,14 +2763,6 @@ EOF
     regen_caddyfile
     caddy_reload
 
-    # Clean up any orphaned spinner PIDs
-    for pid_file in "$TW_DIR"/spinner-*.pid; do
-        [[ -f "$pid_file" ]] || continue
-        kill "$(cat "$pid_file")" 2>/dev/null || true
-        rm -f "$pid_file"
-    done
-
-    [[ $orphan_total -gt 0 ]] && echo "  Reset $orphan_total orphaned task bead(s) total."
     echo "  Prune complete."
 }
 
@@ -3445,7 +3442,7 @@ cmd_claude() {
     if ! tmux list-windows -t "=$tmux_session" -F "#{window_name}" 2>/dev/null | grep -q "^${claude_window}$"; then
         log "Creating god window in $tmux_session"
         tmux new-window -d -t "=$tmux_session" -n "$claude_window"
-        tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' claude" Enter
+        tmux send-keys -t "=$tmux_session:$claude_window" "cd '$config_dir' && TW_SESSION='$session_key' $(_tw_claude_cmd)" Enter
     fi
 
     # Build context block for pasting as first Claude message
@@ -4100,16 +4097,15 @@ Defer these to other reviewers — stay in your lane:
 1. Run: gh pr diff {pr_number}
 2. Run: gh pr view {pr_number}
 3. Focus ONLY on files and changes relevant to your specialty
-4. Post your review:
-   gh pr review {pr_number} --comment --body '**[SPECIALTY_TAG]**
-
-   YOUR_REVIEW_HERE'
+4. Post your review — write the body to a temp file first (avoids shell-quoting breakage):
+   Write your review, starting with the line **[SPECIALTY_TAG]**, to /tmp/tw-review-NAME.md
+   gh pr review {pr_number} --comment --body-file /tmp/tw-review-NAME.md
 ```
 
 IMPORTANT:
 - The {pr_number} placeholder must appear literally (with braces) — it gets filled at dispatch time (each profile is run by a Claude subagent via the tw-review skill)
 - The "What to Ignore" section should reference the OTHER reviewers you're generating by their r-name
-- Keep the "How to Review" section exactly as shown — these are the mechanical steps
+- Keep the "How to Review" section exactly as shown (replace NAME with the reviewer's slug) — these are the mechanical steps
 - The "What to Look For" section is where your project-specific knowledge shines
 - Be concrete: "Check that Prisma migrations include down migrations" not "Check migrations"
 PROMPT_HEREDOC
@@ -4773,8 +4769,14 @@ PYEOF
             [[ -d "$sdir" ]] || continue
             [[ -f "$sdir/SKILL.md" ]] || continue
             sname=$(basename "$sdir")
-            if [[ -L "$HOME/.claude/skills/$sname" ]]; then
+            local sdst="$HOME/.claude/skills/$sname"
+            if [[ -L "$sdst" && "$(readlink "$sdst")" == "${sdir%/}" ]]; then
                 _ok "Skill linked: $sname"
+            elif [[ -L "$sdst" ]]; then
+                _warn "Skill link points elsewhere: $sname -> $(readlink "$sdst")"
+                _hint "Re-link with: tw setup claude"
+            elif [[ -e "$sdst" ]]; then
+                _warn "Skill exists but is not linked to this repo: $sname"
             else
                 _fail "Skill not installed: $sname"
                 _hint "Install with: tw setup claude"
@@ -4796,23 +4798,6 @@ PYEOF
     else
         _fail "~/.local/bin is not in PATH"
         _hint "Add to your shell profile: export PATH=\"\$HOME/.local/bin:\$PATH\""
-    fi
-
-    # 10. Orphaned spinner PIDs
-    local orphan_spinners=0
-    for pid_file in "$TW_DIR"/spinner-*.pid; do
-        [[ -f "$pid_file" ]] || continue
-        local spid
-        spid=$(cat "$pid_file")
-        if ! kill -0 "$spid" 2>/dev/null; then
-            (( orphan_spinners++ )) || true
-            rm -f "$pid_file"
-        fi
-    done
-    if [[ $orphan_spinners -gt 0 ]]; then
-        _warn "$orphan_spinners orphaned spinner PID file(s) cleaned up"
-    else
-        _ok "No orphaned spinner PIDs"
     fi
 
     # 11. Caddy route sync — check that every alive session has matching Caddy routes
@@ -4880,56 +4865,6 @@ for s in d.values():
             fi
         done <<< "$all_wt_paths"
         [[ $stale_wt -eq 0 ]] && _ok "All registered worktree paths exist"
-    fi
-
-    # 13. Orphaned tw workers — claude processes with TW_WORKER env that aren't in a tmux pane
-    local orphan_workers
-    orphan_workers=$(python3 - <<'PYEOF' 2>/dev/null || echo 0
-import subprocess
-
-# Get all tmux pane PIDs
-try:
-    r = subprocess.run(['tmux', 'list-panes', '-a', '-F', '#{pane_pid}'],
-                       capture_output=True, text=True)
-    pane_pids = set(r.stdout.strip().split('\n')) if r.returncode == 0 else set()
-except Exception:
-    pane_pids = set()
-
-# Get all claude PIDs
-try:
-    r = subprocess.run(['pgrep', '-f', 'claude.*--dangerously-skip-permissions'],
-                       capture_output=True, text=True)
-    claude_pids = [p.strip() for p in r.stdout.strip().split('\n') if p.strip()]
-except Exception:
-    claude_pids = []
-
-orphans = 0
-for cpid in claude_pids:
-    # Check if this is a tw worker (parent shell has TW_WORKER in env)
-    try:
-        r = subprocess.run(['ps', '-p', cpid, '-o', 'ppid='], capture_output=True, text=True)
-        ppid = r.stdout.strip()
-        if not ppid:
-            continue
-        # Check parent's environment for TW_WORKER
-        r = subprocess.run(['ps', '-p', ppid, '-E', '-o', 'command='],
-                           capture_output=True, text=True)
-        if 'TW_WORKER' not in r.stdout and 'TW_SESSION' not in r.stdout:
-            continue  # Not a tw-managed process, skip
-        # It's a tw worker — check if parent is a live tmux pane
-        if ppid not in pane_pids:
-            orphans += 1
-    except Exception:
-        continue
-
-print(orphans)
-PYEOF
-    )
-    if [[ "$orphan_workers" -gt 0 ]] 2>/dev/null; then
-        _warn "$orphan_workers orphaned tw worker process(es) found (not in any tmux pane)"
-        _hint "Inspect with: ps aux | grep 'TW_WORKER.*claude'"
-    else
-        _ok "No orphaned tw worker processes"
     fi
 
     # 14. Port conflicts — check if any session's ports are held by unexpected processes
@@ -5123,26 +5058,21 @@ setup_claude() {
     echo "  Linked $linked hook(s) → $hooks_dir ($missing missing)"
     [[ "$missing" -gt 0 ]] && die "some hooks are missing from $repo_hooks"
 
-    # 1b. Remove retired worker-orchestration hooks: dead symlinks in
-    #     ~/.claude/hooks and their settings.json registrations.
-    local retired removed=0
-    while IFS= read -r retired; do
-        [[ -z "$retired" ]] && continue
-        if [[ -e "$hooks_dir/$retired" || -L "$hooks_dir/$retired" ]]; then
-            rm -f "$hooks_dir/$retired"
-            (( removed++ )) || true
-        fi
-    done < <(_tw_retired_hooks)
-    [[ "$removed" -gt 0 ]] && echo "  Removed $removed retired worker hook(s)"
-    python3 - "$settings_file" "$(_tw_retired_hooks)" 2>/dev/null <<'PYEOF' || true
+    # 1b. Remove retired worker-orchestration hooks. Unregister from
+    #     settings.json FIRST, then delete the files — if the settings edit
+    #     fails (e.g. malformed JSON), the files stay put so Claude never
+    #     ends up with registrations pointing at deleted hooks.
+    if ! python3 - "$settings_file" "$(_tw_retired_hooks)" <<'PYEOF' 2>/dev/null
 import json, sys, os
 settings_file = sys.argv[1]
 retired = {l.strip() for l in sys.argv[2].splitlines() if l.strip()}
 try:
     with open(settings_file) as f:
         settings = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    sys.exit(0)
+except FileNotFoundError:
+    sys.exit(0)          # nothing registered anywhere — safe to proceed
+except json.JSONDecodeError:
+    sys.exit(1)          # malformed — signal caller to keep hook files
 hooks = settings.get("hooks", {})
 changed = False
 for event in list(hooks.keys()):
@@ -5163,6 +5093,19 @@ if changed:
         json.dump(settings, f, indent=2)
     print("  Unregistered retired worker hooks from settings.json")
 PYEOF
+    then
+        echo "  ⚠ Could not update $settings_file (malformed JSON?) — leaving retired hook files in place" >&2
+    else
+        local retired removed=0
+        while IFS= read -r retired; do
+            [[ -z "$retired" ]] && continue
+            if [[ -e "$hooks_dir/$retired" || -L "$hooks_dir/$retired" ]]; then
+                rm -f "$hooks_dir/$retired"
+                (( removed++ )) || true
+            fi
+        done < <(_tw_retired_hooks)
+        [[ "$removed" -gt 0 ]] && echo "  Removed $removed retired worker hook(s)"
+    fi
 
     # 2. Register all hooks in settings.json (idempotent, matcher-aware).
     #    Dedup is by (event, matcher, command basename) so a pre-existing
@@ -5237,7 +5180,11 @@ PYEOF
             if [[ -L "$sdst" && "$(readlink "$sdst")" == "$ssrc" ]]; then
                 continue   # already correct
             fi
-            rm -rf "$sdst"
+            if [[ -e "$sdst" && ! -L "$sdst" ]]; then
+                echo "  ⚠ Skipping skill '$sname': $sdst exists and is not a symlink (user-owned — remove it to adopt the tw version)" >&2
+                continue
+            fi
+            rm -f "$sdst"
             ln -s "$ssrc" "$sdst"
             (( slinked++ )) || true
         done
@@ -5266,15 +5213,8 @@ _tw_install_keybindings() {
     tmux bind-key G display-popup -E -w 60 -h 20 \
         "tmux list-sessions -F '#{session_name}' | grep -E '^[a-z]+-[a-z]' | fzf --reverse --header='Switch tw session' | xargs -I{} tmux switch-client -t ={}"
 
-    # n/p = next/prev worker window (skips god, main, services)
-    tmux bind-key n run-shell "tw win-next"
-    tmux bind-key p run-shell "tw win-prev"
-
-    # g = worker menu with state
-    tmux bind-key g run-shell "tw win-menu"
-
     tmux set-environment -g TW_BINDINGS_INSTALLED 1
-    log "Installed tw tmux keybindings (N/P/G/n/p/g)"
+    log "Installed tw tmux keybindings (N/P/G)"
 }
 
 # Navigate to next tw session
@@ -5324,109 +5264,8 @@ cmd_tmux_prev() {
     [[ -n "$target" ]] && tmux switch-client -t "=$target"
 }
 
-# Navigate to next worker window (skips god, main, services)
-cmd_win_next() {
-    local session current_win
-    session=$(tmux display-message -p '#{session_name}')
-    current_win=$(tmux display-message -p '#{window_name}')
-    # Strip spinner suffix
-    current_win="${current_win%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
 
-    local workers=()
-    while IFS= read -r wname; do
-        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
-        case "$base" in
-            god|main|services|[0-9]*) continue ;;
-        esac
-        workers+=("$base")
-    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
 
-    [[ ${#workers[@]} -eq 0 ]] && return 0
-
-    local found=0 target=""
-    for w in "${workers[@]}"; do
-        if [[ $found -eq 1 ]]; then
-            target="$w"
-            break
-        fi
-        [[ "$w" == "$current_win" ]] && found=1
-    done
-    # Wrap around or jump to first worker if current is non-worker
-    [[ -z "$target" ]] && target="${workers[0]}"
-    tmux select-window -t "=$session:$target" 2>/dev/null || true
-}
-
-# Navigate to previous worker window (skips god, main, services)
-cmd_win_prev() {
-    local session current_win
-    session=$(tmux display-message -p '#{session_name}')
-    current_win=$(tmux display-message -p '#{window_name}')
-    current_win="${current_win%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
-
-    local workers=()
-    while IFS= read -r wname; do
-        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
-        case "$base" in
-            god|main|services|[0-9]*) continue ;;
-        esac
-        workers+=("$base")
-    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
-
-    [[ ${#workers[@]} -eq 0 ]] && return 0
-
-    local prev="" target=""
-    for w in "${workers[@]}"; do
-        if [[ "$w" == "$current_win" ]]; then
-            target="$prev"
-            break
-        fi
-        prev="$w"
-    done
-    # Wrap around to last worker
-    [[ -z "$target" ]] && target="${workers[-1]}"
-    tmux select-window -t "=$session:$target" 2>/dev/null || true
-}
-
-# Display a tmux menu of workers with state indicators
-cmd_win_menu() {
-    local session session_key feature
-    session=$(tmux display-message -p '#{session_name}')
-
-    # Derive session_key and feature from tmux session name
-    session_key="$session"
-    local project
-    project=$(sessions_get_key "$session_key" "project" 2>/dev/null || true)
-    [[ -z "$project" ]] && return 0
-    feature="${session_key#"${project}-"}"
-
-    # Build menu entries from worker windows with health state
-    local menu_args=()
-    while IFS= read -r wname; do
-        local base="${wname%% [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]}"
-        case "$base" in
-            god|main|services|[0-9]*) continue ;;
-        esac
-        # Check if spinning (active) based on window name having spinner char
-        local state="idle"
-        if [[ "$wname" =~ [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] ]]; then
-            state="active"
-        fi
-        local icon="○"
-        [[ "$state" == "active" ]] && icon="●"
-        menu_args+=("$icon $base" "" "select-window -t =$session:$base")
-    done < <(tmux list-windows -t "=$session" -F "#{window_name}" 2>/dev/null)
-
-    if [[ ${#menu_args[@]} -eq 0 ]]; then
-        tmux display-message "No worker windows"
-        return 0
-    fi
-
-    # Add god window at the bottom separated by a line
-    menu_args+=("" "" "")
-    menu_args+=("◆ god" "" "select-window -t =$session:god")
-
-    tmux display-menu -T "Workers: $feature" -x C -y C "${menu_args[@]}"
-}
 
 cmd_completion() {
     # Find the completion script relative to this script's location
@@ -5737,9 +5576,6 @@ case "$subcommand" in
     doctor)  cmd_doctor "$@" ;;
     tmux-next)     cmd_tmux_next ;;
     tmux-prev)     cmd_tmux_prev ;;
-    win-next)      cmd_win_next ;;
-    win-prev)      cmd_win_prev ;;
-    win-menu)      cmd_win_menu ;;
     reconcile) cmd_reconcile "$@" ;;
     status-bar) cmd_status_bar "$@" ;;
     help|--help|-h) usage ;;
