@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 # tw-context: SessionStart hook — inject tw prime for any session in a tw project.
-# Skips if already in a tw worker session (tw-prime.sh handles those).
-
-# Skip if this is a worker session (tw-prime.sh handles it)
-[[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]] && exit 0
 
 # Skip entirely if user opted out
 [[ -n "${TW_SKIP:-}" ]] && exit 0

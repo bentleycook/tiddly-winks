@@ -17,7 +17,7 @@ Secret leakage, input injection, and privilege boundaries. This project uses:
 - **Secret redaction gaps** — new code that logs, stores in beads, or sends to AI context must pass through `scrub_secrets()`; check for new API key patterns not covered by existing regexes
 - **Command injection via feature/worker names** — names flow into `tmux send-keys`, file paths, Caddyfile entries, and shell commands; verify they're validated/sanitized (no semicolons, backticks, `$(...)`, spaces, or path traversal `../`)
 - **Caddyfile injection** — feature names become hostnames in Caddy config; a crafted name could inject Caddy directives
-- **tmux send-keys injection** — task descriptions passed via `tw send` end up in `tmux send-keys`; check for shell metacharacter escaping
+- **tmux send-keys injection** — any text tw pastes into a pane (orchestrator launch, context blocks) flows through `tmux send-keys`; check for shell metacharacter escaping
 - **YAML deserialization** — must use `yaml.safe_load()`, never `yaml.load()` or `yaml.unsafe_load()`
 - **Env file sourcing** — `source ~/.tiddly-winks/.env` executes arbitrary code; verify the file isn't world-writable
 - **LaunchDaemon template** — changes to `system/caddy.plist.template` affect a root-level process; review for privilege escalation paths
@@ -37,8 +37,6 @@ Defer these to other reviewers — stay in your lane:
 1. Run: gh pr diff {pr_number}
 2. Run: gh pr view {pr_number}
 3. Focus ONLY on files and changes relevant to your specialty
-4. Post your review:
-   gh pr review {pr_number} --comment --body '**[SECURITY]**
-
-   YOUR_REVIEW_HERE'
-5. Signal completion: tw signal {feature} {worker_name} done
+4. Post your review — write the body to a temp file first (avoids shell-quoting breakage):
+   Write your review, starting with the line **[SECURITY]**, to /tmp/tw-review-security.md
+   gh pr review {pr_number} --comment --body-file /tmp/tw-review-security.md

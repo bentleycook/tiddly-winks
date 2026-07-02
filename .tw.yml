@@ -4,17 +4,8 @@ issue_tracker:
   type: github
   repo: bentleycook/tiddly-winks
 
-# Generic worker pool — workers are interchangeable slots.
-# Task context is injected at dispatch time via `tw send`, not baked in.
-# Supported formats:
-#   workers: [dev-1, dev-2]              — name-only list
-#   workers: {dev: {}, ops: {}}          — dict without roles
-#   workers: {ci: {role: ci-watcher}}    — dict with initial context (legacy)
-#   pool_size: 3                         — generates dev-1..dev-N
-workers:
-  - dev
-  - ops
-
+# Reviewer profiles consumed by the tw-review skill (parallel subagents).
+# Regenerate with: tw review init --force
 reviews:
   shell-correctness:
     prompt: .tw/reviews/shell-correctness.md

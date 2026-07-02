@@ -89,15 +89,13 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     warn "Add to ~/.zshrc or ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-# ─── Claude hooks ─────────────────────────────────────────────────────────────
-# Symlink every tw hook into ~/.claude/hooks and register them in
-# ~/.claude/settings.json. Without this the orchestrator can queue nudges that
-# workers never drain (the wake-up keystroke lands but tw-mail-check.sh isn't
-# wired), so it must be part of install — not a manual step. Invoked via the
-# symlink we just created so it resolves the repo's hooks/ dir.
-info "Installing Claude hooks..."
+# ─── Claude hooks + skills ────────────────────────────────────────────────────
+# Symlink every tw hook into ~/.claude/hooks (registering them in
+# ~/.claude/settings.json) and every tw skill into ~/.claude/skills. Invoked
+# via the symlink we just created so it resolves the repo's hooks/ dir.
+info "Installing Claude hooks and skills..."
 if "$BIN_DIR/tw" setup claude; then
-    ok "Claude hooks installed + registered"
+    ok "Claude hooks + skills installed + registered"
 else
     warn "Hook setup failed — run 'tw doctor --fix' after fixing PATH"
 fi

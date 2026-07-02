@@ -37,8 +37,6 @@ Defer these to other reviewers — stay in your lane:
 1. Run: gh pr diff {pr_number}
 2. Run: gh pr view {pr_number}
 3. Focus ONLY on files and changes relevant to your specialty
-4. Post your review:
-   gh pr review {pr_number} --comment --body '**[SHELL]**
-
-   YOUR_REVIEW_HERE'
-5. Signal completion: tw signal {feature} {worker_name} done
+4. Post your review — write the body to a temp file first (avoids shell-quoting breakage):
+   Write your review, starting with the line **[SHELL]**, to /tmp/tw-review-shell-correctness.md
+   gh pr review {pr_number} --comment --body-file /tmp/tw-review-shell-correctness.md

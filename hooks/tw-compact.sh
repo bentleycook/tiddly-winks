@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 # tw-compact: PreCompact hook — re-inject tw prime so context survives compaction.
 
-# For workers, re-inject their specialized context
-if [[ -n "${TW_SESSION:-}" && -n "${TW_WORKER:-}" ]]; then
-    ~/.claude/hooks/tw-prime.sh 2>/dev/null
-    exit 0
-fi
-
 # Skip entirely if user opted out
 [[ -n "${TW_SKIP:-}" ]] && exit 0
 
-# For non-workers in a tw project, re-inject tw prime
+# In a tw project, re-inject tw prime
 config_file=""
 dir="$PWD"
 while [[ "$dir" != "/" ]]; do

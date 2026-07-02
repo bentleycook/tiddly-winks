@@ -9,10 +9,10 @@ manager. For current TW workflow context, run:
 tw prime
 ```
 
-`tw` uses beads internally for feature memory, worker identities, mail, and
-TW-managed task dispatch. Generic coding agents should not create, update, or
-close `bd` issues unless they are explicitly working inside a TW-managed task
-that names a task bead, or the user directly asks for bead maintenance.
+`tw` uses beads internally for feature memory. Generic coding agents should
+not create, update, or close `bd` issues unless the user directly asks for
+bead maintenance. Parallel or delegated work uses Claude-native subagents
+(see the tw-dispatch skill) — tw does not manage worker agents.
 
 Quick reference:
 
